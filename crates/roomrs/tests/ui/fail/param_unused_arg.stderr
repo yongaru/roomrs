@@ -1,0 +1,5 @@
+error: 메서드 인자 done 가 SQL에서 사용되지 않습니다 (:done 없음)
+  --> tests/ui/fail/param_unused_arg.rs:14:19
+   |
+14 |     fn all(&self, done: bool) -> roomrs::Result<Vec<Todo>>;
+   |                   ^^^^

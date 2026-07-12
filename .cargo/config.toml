@@ -1,0 +1,14 @@
+# cargo xtask 별칭 — 크로스 빌드 등 개발 태스크 (docs/cross-build.md)
+[alias]
+xtask = "run -q -p xtask --"
+
+# roomrs 리포 자체 테스트에서 #[database] 생성 export 테스트 비활성 (명세 §7.4 옵트아웃) —
+# 테스트 하네스 DB들이 migrations/schema/ 에 스냅샷 파일을 만들지 않게 한다.
+# export 로직 자체는 schema_snapshot.rs 가 env를 "1"로 되돌려 직접 검증한다.
+#
+# 주의(M-15): cargo [env]는 force = true 가 아니면 이미 설정된 프로세스 env를
+# 덮지 않는다. 즉 `ROOMRS_SCHEMA_EXPORT=1 cargo test ...` 처럼 프로세스 env로
+# 넘기면 이 옵트아웃을 우회해 생성 export 테스트를 실제로 돌릴 수 있다.
+# CI test job이 이 방식으로 생성 테스트를 1회 실증한다 (.github/workflows/ci.yml).
+[env]
+ROOMRS_SCHEMA_EXPORT = "0"

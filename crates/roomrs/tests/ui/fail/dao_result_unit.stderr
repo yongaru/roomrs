@@ -1,0 +1,5 @@
+error: DAO 메서드는 Result<()>를 반환할 수 없습니다 — write 영향 행 수는 Result<u64>를 사용하세요
+ --> tests/ui/fail/dao_result_unit.rs:6:22
+  |
+6 |     fn update(&self) -> roomrs::Result<()>;
+  |                      ^

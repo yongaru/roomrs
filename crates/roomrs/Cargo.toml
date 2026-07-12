@@ -1,0 +1,67 @@
+# roomrs — 파사드 크레이트: 공개 API 재수출만 담당, 로직 없음
+[package]
+name = "roomrs"
+description = "Room-style local SQLite persistence library for Rust"
+keywords = ["sqlite", "orm", "room", "database", "persistence"]
+categories = ["database"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+roomrs-core = { workspace = true }
+roomrs-macros = { workspace = true }
+roomrs-async = { workspace = true, optional = true }
+
+[dev-dependencies]
+trybuild = { workspace = true }
+tempfile = { workspace = true }
+# 실행기 3종 매트릭스 (명세 §15 M1b)
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+smol = "2"
+futures = "0.3"
+# log 파사드 통합 시연·테스트 (지시서 logging-log-crate) —
+# 예제는 tracing-log 브리지로 roomrs 내부 log 레코드를 수집한다
+log = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-log = "0.2"
+
+[features]
+default = ["bundled", "async", "live", "time", "uuid", "json"]
+# SQLite 번들 빌드 — cipher 사용 시 default-features=false로 끄고 cipher를 켠다
+bundled = ["roomrs-core/bundled"]
+# 런타임 무관 비동기 파사드. 끄면 순수 동기
+async = ["dep:roomrs-async", "roomrs-core/stream"]
+# tokio 통합 최적화 (async 포함)
+tokio = ["async", "roomrs-async/tokio"]
+# 라이브 쿼리 / 무효화 (명세 §9)
+live = ["roomrs-core/live", "roomrs-async?/live"]
+# 교차 프로세스 무효화 (live 필요)
+multi-instance = ["live", "roomrs-core/multi-instance"]
+# 타입 컨버터 (명세 §11 — rusqlite 위임)
+time = ["roomrs-core/time"]
+uuid = ["roomrs-core/uuid"]
+json = ["roomrs-core/json"]
+# SQLCipher 암호화 — bundled와 상호 배타 (기본 feature 끄고 사용)
+cipher = ["roomrs-core/cipher"]
+
+# 예제 feature 요구 — 순수 동기 빌드에서 제외
+[[example]]
+name = "todo_async"
+required-features = ["async"]
+
+[[example]]
+name = "live_query"
+required-features = ["live"]
+
+[[example]]
+name = "pagination"
+required-features = ["live"]
+
+[[example]]
+name = "multi_process"
+required-features = ["multi-instance"]

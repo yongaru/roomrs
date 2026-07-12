@@ -1,0 +1,5 @@
+error: LiveQuery는 Result로 감싸지 않고 직접 반환해야 합니다
+ --> tests/ui/fail/dao_result_live_query.rs:6:39
+  |
+6 |     fn watch(&self) -> roomrs::Result<roomrs::LiveQuery<Vec<i64>>>;
+  |                                       ^^^^^^

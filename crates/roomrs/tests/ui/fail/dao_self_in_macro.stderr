@@ -1,0 +1,5 @@
+error: 트랜잭션 본문의 매크로 호출 안에서는 self 를 사용할 수 없습니다 — 지역 변수로 추출하세요
+  --> tests/ui/fail/dao_self_in_macro.rs:20:21
+   |
+20 |         Ok(matches!(self.find(id)?, Some(_)))
+   |                     ^^^^

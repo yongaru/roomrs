@@ -1,0 +1,5 @@
+error: SQL 파라미터 :id 에 대응하는 메서드 인자가 없습니다
+  --> tests/ui/fail/param_missing_arg.rs:13:13
+   |
+13 |     #[query("SELECT * FROM todos WHERE id = :id")]
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

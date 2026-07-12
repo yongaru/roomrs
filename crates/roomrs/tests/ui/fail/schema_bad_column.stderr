@@ -1,0 +1,5 @@
+error: 테이블 "todos"에 없는 컬럼 참조: "nonexistent" (명세 §7.2)
+  --> tests/ui/fail/schema_bad_column.rs:14:13
+   |
+14 |     #[query("SELECT id, nonexistent FROM todos")]
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

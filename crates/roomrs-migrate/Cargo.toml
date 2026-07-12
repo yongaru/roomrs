@@ -1,0 +1,19 @@
+# roomrs-migrate — SchemaSnapshot 모델 · diff · 코드젠 (매크로·런타임 공유 크레이트)
+[package]
+name = "roomrs-migrate"
+description = "Schema snapshot model, diff and codegen for roomrs (internal crate)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 스냅샷 바이너리 내장용 압축 (명세 §8.4, 결정 21c)
+miniz_oxide = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }

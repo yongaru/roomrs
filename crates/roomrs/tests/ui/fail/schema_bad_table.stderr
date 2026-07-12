@@ -1,0 +1,5 @@
+error: 스냅샷에 없는 테이블 참조: "missing_table" (명세 §7.2)
+  --> tests/ui/fail/schema_bad_table.rs:14:13
+   |
+14 |     #[query("SELECT * FROM missing_table")]
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

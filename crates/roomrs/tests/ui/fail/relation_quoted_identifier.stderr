@@ -1,0 +1,5 @@
+error: SQL 식별자에는 큰따옴표를 사용할 수 없습니다
+  --> tests/ui/fail/relation_quoted_identifier.rs:14:81
+   |
+14 |     #[relation(entity = Child, parent_key = "id", entity_key = "id", junction = "bad\"table", junction_parent_key = "parent_id", jun...
+   |                                                                                 ^^^^^^^^^^^^

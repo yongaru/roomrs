@@ -1,0 +1,5 @@
+error: #[insert] 메서드는 엔티티 참조 인자 1개만 받아야 합니다: fn add(&self, e: &T) -> Result<i64>
+  --> tests/ui/fail/dao_insert_bad_sig.rs:15:5
+   |
+15 |     fn add(&self) -> roomrs::Result<i64>;
+   |     ^^

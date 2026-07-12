@@ -1,0 +1,13 @@
+# xtask — 개발 태스크 러너 (배포 안 함)
+[package]
+name = "xtask"
+description = "Development task runner (not published)"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

@@ -1,0 +1,5 @@
+error: version은 1 이상이어야 합니다 (0 = 신규 DB 마커)
+  --> tests/ui/fail/database_version_zero.rs:12:1
+   |
+12 | struct Db;
+   | ^^^^^^

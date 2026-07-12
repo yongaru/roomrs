@@ -1,0 +1,36 @@
+# roomrs 워크스페이스 루트 — 버전·에디션·라이선스는 여기서 통일 관리한다
+[workspace]
+resolver = "3"
+members = [
+    "crates/roomrs",
+    "crates/roomrs-core",
+    "crates/roomrs-async",
+    "crates/roomrs-macros",
+    "crates/roomrs-migrate",
+    "crates/roomrs-cli",
+    "examples/mobile-ffi",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yongaru/roomrs"
+authors = ["김용일(Kim Yong-il) <akira76@gmail.com>"]
+
+# 내부 크레이트 버전은 여기 한 곳에서만 갱신한다
+[workspace.dependencies]
+roomrs-core = { path = "crates/roomrs-core", version = "0.1.0" }
+roomrs-async = { path = "crates/roomrs-async", version = "0.1.0" }
+roomrs-macros = { path = "crates/roomrs-macros", version = "0.1.0" }
+roomrs-migrate = { path = "crates/roomrs-migrate", version = "0.1.0" }
+
+syn = { version = "2", features = ["full", "visit-mut"] }
+quote = "1"
+proc-macro2 = "1"
+thiserror = "2"
+log = "0.4"
+trybuild = "1"
+tempfile = "3"
