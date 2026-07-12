@@ -1,0 +1,5 @@
+error: parent_key "user id" 는 유효한 러스트 식별자여야 합니다 — SQL 컬럼명이 필드명과 다르면 entity_column 을 사용하세요
+  --> tests/ui/fail/relation_bad_key_ident.rs:23:5
+   |
+23 |     #[relation(entity = Post, parent_key = "user id", entity_key = "user_id")]
+   |     ^

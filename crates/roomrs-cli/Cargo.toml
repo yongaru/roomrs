@@ -1,0 +1,20 @@
+# roomrs-cli — roomrs migrate generate / check
+[package]
+name = "roomrs-cli"
+description = "CLI for roomrs: migration generation and schema checks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "roomrs"
+path = "src/main.rs"
+
+[dependencies]
+roomrs-migrate = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

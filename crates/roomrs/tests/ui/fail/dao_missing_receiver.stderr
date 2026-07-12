@@ -1,0 +1,5 @@
+error: DAO 메서드 수신자는 &self여야 합니다
+ --> tests/ui/fail/dao_missing_receiver.rs:6:13
+  |
+6 |     fn find(id: i64) -> roomrs::Result<i64>;
+  |             ^^

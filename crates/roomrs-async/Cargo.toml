@@ -1,0 +1,22 @@
+# roomrs-async — 비동기 파사드: 런타임 무관 Future + tokio 통합(선택)
+[package]
+name = "roomrs-async"
+description = "Runtime-agnostic async facade for roomrs (internal crate)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+roomrs-core = { workspace = true }
+futures-channel = "0.3"
+log = { workspace = true }
+tokio = { version = "1", features = ["rt"], optional = true }
+
+[features]
+# tokio 통합 — 자체 워커 풀 대신 spawn_blocking (명세 §2.4)
+tokio = ["dep:tokio"]
+# 라이브 쿼리 — AsyncHandle watch 표면 (명세 §5.6)
+live = ["roomrs-core/live", "roomrs-core/stream"]

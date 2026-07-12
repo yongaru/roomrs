@@ -1,0 +1,5 @@
+error: DAO 메서드에는 #[query]/#[insert]/#[update]/#[delete] 중 하나가 필요합니다
+ --> tests/ui/fail/dao_missing_sql_attr.rs:6:5
+  |
+6 |     fn orphan(&self) -> roomrs::Result<i64>;
+  |     ^^

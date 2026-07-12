@@ -1,0 +1,5 @@
+error: SQL 파라미터 :@id 에 대응하는 메서드 인자가 없습니다
+ --> tests/ui/fail/dao_unsupported_parameter.rs:5:13
+  |
+5 |     #[query("SELECT @id, $name, ?1")]
+  |             ^^^^^^^^^^^^^^^^^^^^^^^

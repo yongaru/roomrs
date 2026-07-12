@@ -1,0 +1,5 @@
+error: SQL 식별자에는 큰따옴표를 사용할 수 없습니다
+ --> tests/ui/fail/entity_quoted_identifier.rs:3:18
+  |
+3 | #[entity(table = "bad\"table")]
+  |                  ^^^^^^^^^^^^

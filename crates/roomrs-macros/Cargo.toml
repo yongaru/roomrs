@@ -1,0 +1,25 @@
+# roomrs-macros — proc-macro: #[entity] #[dao] #[query] #[database] …
+[package]
+name = "roomrs-macros"
+description = "Procedural macros for roomrs (internal crate)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+roomrs-migrate = { workspace = true }
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+# 정적 SQL 검증 (명세 §7.2) — SQLite 방언
+sqlparser = "0.52"
+
+[dev-dependencies]
+# 유닛 테스트용 임시 디렉터리 (L-15 마이그레이션 스캔 검증)
+tempfile = { workspace = true }

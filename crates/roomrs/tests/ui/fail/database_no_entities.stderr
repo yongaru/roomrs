@@ -1,0 +1,5 @@
+error: entities(...)에 엔티티를 1개 이상 지정해야 합니다
+ --> tests/ui/fail/database_no_entities.rs:5:1
+  |
+5 | struct Db;
+  | ^^^^^^

@@ -1,0 +1,5 @@
+error: on_conflict = "ignore"는 0행일 수 있어 Result<i64> rowid 반환을 지원하지 않습니다
+  --> tests/ui/fail/dao_insert_ignore_rowid.rs:12:32
+   |
+12 |     fn add(&self, item: &Item) -> roomrs::Result<i64>;
+   |                                ^

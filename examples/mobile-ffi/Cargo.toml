@@ -1,0 +1,20 @@
+# mobile-ffi — 모바일 바인딩용 extern "C" 패턴 예제 (명세 §13, M7)
+# Android/iOS는 이 cdylib을 JNI/Swift에서 로드한다. uniffi 본격 바인딩은 후속.
+[package]
+name = "roomrs-mobile-ffi-example"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+roomrs = { path = "../../crates/roomrs" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

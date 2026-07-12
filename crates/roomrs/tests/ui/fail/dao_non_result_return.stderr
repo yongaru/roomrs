@@ -1,0 +1,5 @@
+error: DAO 메서드는 Result<...>를 반환해야 합니다
+ --> tests/ui/fail/dao_non_result_return.rs:7:24
+  |
+7 |     fn count(&self) -> i64;
+  |                        ^^^

@@ -1,0 +1,5 @@
+error: default 값 "nan" 은 SQLite DEFAULT 로 표현할 수 없습니다 — 유한 숫자만 지원
+ --> tests/ui/fail/entity_default_nan.rs:8:24
+  |
+8 |     #[column(default = "nan")]
+  |                        ^^^^^

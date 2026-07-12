@@ -1,0 +1,41 @@
+# roomrs-core — Database · 자체 풀 · 에러 · SqlType · Tracker · 노티파이어 · 마이그레이션 런너
+[package]
+name = "roomrs-core"
+description = "Core runtime for roomrs (internal crate)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+roomrs-migrate = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+rusqlite = { version = "0.38", features = ["hooks"] }
+serde_json = { version = "1", optional = true }
+time = { version = "0.3", optional = true }
+uuid = { version = "1", optional = true }
+# visitor: 서브쿼리 포함 의존 테이블 추출(H-2)에 AST 방문자 사용
+sqlparser = { version = "0.52", optional = true, features = ["visitor"] }
+futures-core = { version = "0.3", optional = true }
+
+[features]
+default = []
+# SQLite 번들 빌드 (명세 §0 15) — cipher와 상호 배타(libsqlite3-sys가 강제)
+bundled = ["rusqlite/bundled"]
+# 라이브 쿼리/무효화 (명세 §9) — 런타임 SQL 테이블 추출에 sqlparser 사용
+live = ["dep:sqlparser"]
+# 교차 프로세스 무효화 (명세 §9.5) — 인스턴스 식별 함수 roomrs_src() 등록에
+# rusqlite functions 필요 (H-2)
+multi-instance = ["live", "rusqlite/functions"]
+# LiveQuery::into_stream (명세 §5.6) — 파사드 async feature가 켠다
+stream = ["dep:futures-core"]
+# 타입 컨버터 — rusqlite ToSql/FromSql 위임 (명세 §11)
+time = ["rusqlite/time", "dep:time"]
+uuid = ["rusqlite/uuid", "dep:uuid"]
+json = ["dep:serde_json"]
+# SQLCipher 암호화 (명세 §0 14) — bundled와 상호 배타.
+# 사용: roomrs를 default-features=false로 두고 cipher + 나머지 feature 명시
+cipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]

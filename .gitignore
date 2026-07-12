@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+
+# 테스트/로컬 DB 산출물 — 리포에 커밋 금지 (지침 §5)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# 로컬 설정·작업공간
+.env
+.env.*
+.claude/worktrees/
+.claude/settings.local.json
+
+# IDE
+.agents/
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db

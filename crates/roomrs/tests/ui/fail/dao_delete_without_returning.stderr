@@ -1,0 +1,5 @@
+error: #[update]/#[delete]의 비-u64 반환에는 SQL RETURNING 절이 필요합니다
+ --> tests/ui/fail/dao_delete_without_returning.rs:6:31
+  |
+6 |     fn delete(&self, id: i64) -> roomrs::Result<Option<i64>>;
+  |                               ^

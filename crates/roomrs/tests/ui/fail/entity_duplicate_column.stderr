@@ -1,0 +1,5 @@
+error: 컬럼명 중복: "title" — 필드 title 와 충돌합니다 (#[column(name)] 확인)
+  --> tests/ui/fail/entity_duplicate_column.rs:10:5
+   |
+10 |     subject: String,
+   |     ^^^^^^^

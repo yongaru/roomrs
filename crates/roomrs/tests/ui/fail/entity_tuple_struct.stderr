@@ -1,0 +1,5 @@
+error: #[entity]는 named 필드 구조체에만 사용할 수 있습니다
+ --> tests/ui/fail/entity_tuple_struct.rs:5:1
+  |
+5 | struct Tup(i64, String);
+  | ^^^^^^

@@ -1,0 +1,5 @@
+error: entities(...)에 같은 엔티티를 중복 지정할 수 없습니다
+ --> tests/ui/fail/database_duplicate_entity.rs:9:27
+  |
+9 | #[database(entities(Item, Item), version = 1)]
+  |                           ^^^^

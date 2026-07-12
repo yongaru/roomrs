@@ -1,0 +1,5 @@
+error: #[query] SELECT 는 u64/usize 반환을 지원하지 않습니다 — i64 를 사용하세요 (영향 행 수 반환은 INSERT/UPDATE/DELETE SQL 전용)
+ --> tests/ui/fail/dao_query_select_u64.rs:8:21
+  |
+8 |     fn count(&self) -> roomrs::Result<u64>;
+  |                     ^
