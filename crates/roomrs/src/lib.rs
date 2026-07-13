@@ -21,7 +21,10 @@ pub use roomrs_core::{RelationView, in_placeholders, load_children, load_junctio
 
 // 라이브 쿼리 (명세 §5.6, §9)
 #[cfg(feature = "live")]
-pub use roomrs_core::{LiveQuery, SubscriptionGuard, WatchContext};
+pub use roomrs_core::{
+    InvalidationFilter, InvalidationFilterBuilder, InvalidationGroupBuilder, LiveQuery,
+    SubscriptionGuard, WatchContext,
+};
 
 // 매크로
 pub use roomrs_macros::{Relation, dao, database, entity, migrations_dir};

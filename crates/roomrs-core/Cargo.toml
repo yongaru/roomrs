@@ -13,7 +13,7 @@ authors.workspace = true
 roomrs-migrate = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
-rusqlite = { version = "0.38", features = ["hooks"] }
+rusqlite = { version = "0.38", features = ["hooks", "preupdate_hook"] }
 serde_json = { version = "1", optional = true }
 time = { version = "0.3", optional = true }
 uuid = { version = "1", optional = true }

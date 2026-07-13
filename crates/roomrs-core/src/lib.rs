@@ -35,7 +35,10 @@ pub use error::{Error, Result};
 pub use handle::WatchContext;
 pub use handle::{SqlContext, SyncHandle, Tx};
 #[cfg(feature = "live")]
-pub use live::{LiveQuery, SubscriptionGuard};
+pub use live::{
+    InvalidationFilter, InvalidationFilterBuilder, InvalidationGroupBuilder, LiveQuery,
+    SubscriptionGuard,
+};
 pub use migration::{Migration, MigrationStep};
 pub use query::{Col, Execute, Expr, IntoDbValue, Order, Query, SelectBuilder, col};
 pub use relation::{RelationView, in_placeholders, load_children, load_junction};
