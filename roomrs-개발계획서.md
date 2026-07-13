@@ -486,7 +486,16 @@ pub trait Migration {
 
 ### 9.5 멀티 프로세스 무효화 — 로드맵
 
-현재는 지원하지 않는다. SQLite trigger·변경 로그·폴러는 write 경로의 영구 부하와 스키마 잔재를 만들므로 제거한다. 후속 IPC 브로커는 roomrs 커넥션의 commit 성공 뒤 테이블/행 변경 이벤트를 프로세스 간 전파하고, 수신 프로세스의 Tracker에 전달한다. roomrs 밖의 raw SQLite writer는 IPC 참여 전까지 감지 대상이 아니다.
+| 단계 | 상태 | 내용 |
+|---|---|---|
+| 단일 프로세스 테이블 무효화 | **구현됨** | commit 성공 뒤 영향 테이블을 Tracker에 방출 |
+| 단일 프로세스 행 필터 | **구현됨** | `preupdate_hook` OLD/NEW와 `InvalidationFilter`로 관련 변경만 재조회 |
+| SQLite trigger·변경 로그·poller | **제거됨** | write 경로 영구 부하·스키마 잔재·외부 writer 호환 문제로 미사용 |
+| IPC 이벤트 브로커 | **미구현** | commit 성공 뒤 테이블/행 변경 이벤트를 프로세스 간 전파 |
+| IPC 수신 Tracker 연동 | **미구현** | 수신 프로세스가 기존 필터·디바운스·재조회 흐름을 재사용 |
+| raw SQLite writer 감지 | **미구현** | IPC 프로토콜에 참여하지 않는 writer는 감지하지 않음 |
+
+현재는 단일 프로세스까지만 지원한다. IPC 브로커 구현 시 roomrs 커넥션의 commit 성공 뒤 이벤트를 전송하고, 수신 프로세스의 Tracker에 전달한다.
 
 ### 9.6 노티파이어 스레드
 (동일 — DB당 1개, 수신→디바운스→재조회→sync 채널/콜백 + 런타임 중립 async 채널 팬아웃. **재조회 전용 커넥션 1개 고정**(일반 풀과 경합 없음). rebind 재조회도 이 스레드로 라우팅[C-8].)
