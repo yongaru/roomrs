@@ -486,14 +486,19 @@ pub trait Migration {
 
 ### 9.5 멀티 프로세스 무효화 — 로드맵
 
-| 단계 | 상태 | 내용 |
-|---|---|---|
-| 단일 프로세스 테이블 무효화 | **구현됨** | commit 성공 뒤 영향 테이블을 Tracker에 방출 |
-| 단일 프로세스 행 필터 | **구현됨** | `preupdate_hook` OLD/NEW와 `InvalidationFilter`로 관련 변경만 재조회 |
-| SQLite trigger·변경 로그·poller | **제거됨** | write 경로 영구 부하·스키마 잔재·외부 writer 호환 문제로 미사용 |
-| IPC 이벤트 브로커 | **미구현** | commit 성공 뒤 테이블/행 변경 이벤트를 프로세스 간 전파 |
-| IPC 수신 Tracker 연동 | **미구현** | 수신 프로세스가 기존 필터·디바운스·재조회 흐름을 재사용 |
-| raw SQLite writer 감지 | **미구현** | IPC 프로토콜에 참여하지 않는 writer는 감지하지 않음 |
+| 중요도 | 단계 | 상태 | 내용 |
+|---|---|---|---|
+| P0 | 단일 프로세스 테이블 무효화 | **구현됨** | commit 성공 뒤 영향 테이블을 Tracker에 방출 |
+| P0 | 단일 프로세스 행 필터 | **구현됨** | `preupdate_hook` OLD/NEW와 `InvalidationFilter`로 관련 변경만 재조회 |
+| P0 | legacy trigger·로그 정리 | **미구현** | 구버전 `__roomrs_inv_*` trigger·로그 테이블을 탐지·삭제해 `roomrs_src()` 부재로 인한 write 실패를 막는 hotfix |
+| P1 | Filter API 대칭 | **미구현** | `watch_one/all/optional_filtered`, async, DAO macro까지 filtered watch API 확장 |
+| P1 | 필터 스키마 검증 | **미구현** | 구독 등록 때 filter table·column 존재를 검증해 오타에 의한 조용한 미통지를 차단 |
+| P1 | 대량 변경 보호 | **미구현** | row event 임계치 초과 시 테이블 전체 무효화로 전환해 메모리·노티파이어 지연을 제한 |
+| P2 | 무효화 관측성 | **미구현** | filter 매칭·table fallback·debounce/drop 통계를 trace/debug로 제공 |
+| P3 | IPC 이벤트 브로커 | **미구현** | roomrs 커넥션 commit 성공 뒤 테이블/행 변경 이벤트를 프로세스 간 전파 |
+| P3 | IPC 수신 Tracker 연동 | **미구현** | 수신 프로세스가 기존 필터·디바운스·재조회 흐름을 재사용 |
+| P4 | raw SQLite writer 감지 | **미구현** | IPC 프로토콜에 참여하지 않는 writer 관찰. SQLite 확장·WAL 감시 등 별도 설계 필요 |
+| — | SQLite trigger·변경 로그·poller | **제거됨** | write 경로 영구 부하·스키마 잔재·외부 writer 호환 문제로 미사용 |
 
 현재는 단일 프로세스까지만 지원한다. IPC 브로커 구현 시 roomrs 커넥션의 commit 성공 뒤 이벤트를 전송하고, 수신 프로세스의 Tracker에 전달한다.
 
