@@ -13,9 +13,9 @@
 
 ## 완료 기준
 
-- 공개 6개 crate 0.2.2의 crates.io API `readme_file`이 `README.md`다.
+- 공개 6개 crate 0.2.2의 crates.io README endpoint가 `200 OK`와 README 본문을 반환한다.
 
 ## 검증 명령
 
 - `cargo package --workspace`
-- crates.io API version metadata 조회
+- crates.io README endpoint 조회
