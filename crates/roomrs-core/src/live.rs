@@ -5,6 +5,7 @@
 //! 재조회·콜백은 레지스트리/콜백 락 밖에서 실행된다 — 콜백 내 재진입(구독 생성·해지) 허용.
 
 use crate::error::{Error, Result};
+use crate::query::IntoDbValue;
 use crate::row::FromRow;
 use rusqlite::types::Value;
 use rusqlite::{Connection, ToSql};
@@ -13,6 +14,175 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
+
+// ─────────────────── 행 무효화 필터 ───────────────────
+
+/// Row-level invalidation condition for a live query.
+///
+/// This is not a SQL query builder. It determines only whether a changed row
+/// can affect a subscription result. Predicates within a group are ANDed and
+/// groups are ORed.
+#[derive(Debug, Clone)]
+pub struct InvalidationFilter {
+    table: String,
+    groups: Vec<InvalidationGroup>,
+}
+
+/// Builder for [`InvalidationFilter`].
+#[derive(Debug, Clone)]
+pub struct InvalidationFilterBuilder {
+    table: String,
+    groups: Vec<InvalidationGroup>,
+}
+
+/// Builder for an AND predicate group.
+#[derive(Debug, Clone, Default)]
+pub struct InvalidationGroupBuilder {
+    predicates: Vec<InvalidationPredicate>,
+}
+
+#[derive(Debug, Clone)]
+struct InvalidationGroup {
+    predicates: Vec<InvalidationPredicate>,
+}
+
+#[derive(Debug, Clone)]
+enum InvalidationPredicate {
+    Eq { column: String, value: Value },
+    Neq { column: String, value: Value },
+    IsNull { column: String },
+    IsNotNull { column: String },
+}
+
+/// Hook이 수집한 변경 행. `None`은 INSERT의 OLD 또는 DELETE의 NEW다.
+#[derive(Debug, Clone)]
+pub(crate) struct TableChange {
+    pub(crate) table: String,
+    pub(crate) old: Option<HashMap<String, Value>>,
+    pub(crate) new: Option<HashMap<String, Value>>,
+}
+
+impl InvalidationFilter {
+    /// Starts a row invalidation filter for a table.
+    pub fn table(table: impl Into<String>) -> InvalidationFilterBuilder {
+        InvalidationFilterBuilder {
+            table: table.into(),
+            groups: Vec::new(),
+        }
+    }
+
+    /// Returns target table name.
+    pub fn table_name(&self) -> &str {
+        &self.table
+    }
+
+    /// 변경 전 또는 후 행이 조건을 만족하면 true.
+    fn matches_change(&self, change: &TableChange) -> bool {
+        self.table.eq_ignore_ascii_case(&change.table)
+            && [change.old.as_ref(), change.new.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|row| self.matches_row(row))
+    }
+
+    /// OR 그룹 중 하나가 행과 일치하면 true.
+    fn matches_row(&self, row: &HashMap<String, Value>) -> bool {
+        self.groups
+            .iter()
+            .any(|group| group.predicates.iter().all(|p| p.matches(row)))
+    }
+}
+
+impl InvalidationFilterBuilder {
+    /// Adds an AND group. Subsequent groups are ORed with prior groups.
+    pub fn where_group(
+        mut self,
+        build: impl FnOnce(InvalidationGroupBuilder) -> InvalidationGroupBuilder,
+    ) -> Self {
+        self.groups.push(InvalidationGroup {
+            predicates: build(InvalidationGroupBuilder::default()).predicates,
+        });
+        self
+    }
+
+    /// Adds an AND group ORed with prior groups.
+    pub fn or_where_group(
+        self,
+        build: impl FnOnce(InvalidationGroupBuilder) -> InvalidationGroupBuilder,
+    ) -> Self {
+        self.where_group(build)
+    }
+
+    /// Validates and builds filter.
+    pub fn build(self) -> Result<InvalidationFilter> {
+        if self.table.trim().is_empty() {
+            return Err(Error::Config(
+                "무효화 필터 테이블명은 비어 있을 수 없습니다".into(),
+            ));
+        }
+        if self.groups.is_empty() || self.groups.iter().any(|g| g.predicates.is_empty()) {
+            return Err(Error::Config(
+                "무효화 필터에는 비어 있지 않은 조건 그룹이 필요합니다".into(),
+            ));
+        }
+        Ok(InvalidationFilter {
+            table: self.table,
+            groups: self.groups,
+        })
+    }
+}
+
+impl InvalidationGroupBuilder {
+    /// Matches rows whose column equals value.
+    pub fn eq(mut self, column: impl Into<String>, value: impl IntoDbValue) -> Self {
+        self.predicates.push(InvalidationPredicate::Eq {
+            column: column.into(),
+            value: value.into_db_value(),
+        });
+        self
+    }
+
+    /// Matches rows whose column differs from value. NULL never matches.
+    pub fn neq(mut self, column: impl Into<String>, value: impl IntoDbValue) -> Self {
+        self.predicates.push(InvalidationPredicate::Neq {
+            column: column.into(),
+            value: value.into_db_value(),
+        });
+        self
+    }
+
+    /// Matches rows whose column is NULL.
+    pub fn is_null(mut self, column: impl Into<String>) -> Self {
+        self.predicates.push(InvalidationPredicate::IsNull {
+            column: column.into(),
+        });
+        self
+    }
+
+    /// Matches rows whose column is not NULL.
+    pub fn is_not_null(mut self, column: impl Into<String>) -> Self {
+        self.predicates.push(InvalidationPredicate::IsNotNull {
+            column: column.into(),
+        });
+        self
+    }
+}
+
+impl InvalidationPredicate {
+    /// SQL WHERE의 NULL 3값 논리를 따라 predicate 하나를 평가한다.
+    fn matches(&self, row: &HashMap<String, Value>) -> bool {
+        match self {
+            Self::Eq { column, value } => row
+                .get(column)
+                .is_some_and(|v| value != &Value::Null && v != &Value::Null && v == value),
+            Self::Neq { column, value } => row
+                .get(column)
+                .is_some_and(|v| value != &Value::Null && v != &Value::Null && v != value),
+            Self::IsNull { column } => matches!(row.get(column), Some(Value::Null)),
+            Self::IsNotNull { column } => row.get(column).is_some_and(|v| v != &Value::Null),
+        }
+    }
+}
 
 /// poison 복구 락 — 콜백 panic 후에도 트래커/구독 상태는 계속 동작해야 한다 (H-4).
 /// poison은 panic 직후에만 발생하므로 warn 로그가 스팸이 되지 않는다
@@ -327,6 +497,8 @@ pub(crate) enum Msg {
     ),
     /// 테이블 집합 무효화 (None = 전체 — 파싱 실패 보수 경로)
     Invalidate(Option<HashSet<String>>),
+    /// preupdate hook이 수집한 행 변경 무효화.
+    Changes(Vec<TableChange>),
     /// 특정 구독 전체 재조회 (초기 emit·rebind·watching)
     Refresh(u64),
     /// 새 콜백 전용 — 캐시 값 전달, 기존 구독자 재-emit 없음 (L-7)
@@ -349,6 +521,8 @@ type RefreshFn = Arc<dyn Fn(&Connection, RefreshKind) + Send + Sync>;
 struct SubEntry {
     /// 의존 테이블 (None = 미상 — UnknownDependencies 상태)
     tables: Option<HashSet<String>>,
+    /// 명시 행 필터. 없으면 기존 테이블 단위 무효화다.
+    filter: Option<InvalidationFilter>,
     /// 노티파이어 전용 커넥션으로 재조회 + 팬아웃
     refresh: RefreshFn,
     /// DB 종료 통지 — 대기 중인 recv가 깨어나 Closed 에러를 받게 한다 (M-7)
@@ -431,6 +605,7 @@ impl Tracker {
             let mut tables: HashSet<String> = HashSet::new();
             let mut refresh_ids: HashSet<u64> = HashSet::new();
             let mut new_ids: HashSet<u64> = HashSet::new();
+            let mut changes: Vec<TableChange> = Vec::new();
 
             // 디바운스 — 대기 중 메시지 전부 병합 (명세 §9.3)
             let mut msg = Some(first);
@@ -444,6 +619,7 @@ impl Tracker {
                     }
                     Some(Msg::Invalidate(None)) => all = true,
                     Some(Msg::Invalidate(Some(ts))) => tables.extend(ts),
+                    Some(Msg::Changes(cs)) => changes.extend(cs),
                     Some(Msg::Refresh(id)) => {
                         refresh_ids.insert(id);
                     }
@@ -478,7 +654,19 @@ impl Tracker {
                                         .as_ref()
                                         .expect("직전 검사")
                                         .iter()
-                                        .any(|t| tables.contains(t))));
+                                        .any(|t| tables.contains(t))
+                                    || changes.iter().any(|change| {
+                                        e.filter.as_ref().map_or_else(
+                                            || {
+                                                e.tables.as_ref().expect("직전 검사").iter().any(
+                                                    |table| {
+                                                        table.eq_ignore_ascii_case(&change.table)
+                                                    },
+                                                )
+                                            },
+                                            |filter| filter.matches_change(change),
+                                        )
+                                    })));
                         if full {
                             Some((Arc::clone(&e.refresh), RefreshKind::Full))
                         } else if new_ids.contains(id) {
@@ -517,6 +705,7 @@ impl Tracker {
     pub(crate) fn register(
         &self,
         tables: Option<HashSet<String>>,
+        filter: Option<InvalidationFilter>,
         refresh: RefreshFn,
         close: Box<dyn Fn() + Send + Sync>,
     ) -> u64 {
@@ -525,6 +714,7 @@ impl Tracker {
             id,
             SubEntry {
                 tables,
+                filter,
                 refresh,
                 close,
             },
@@ -548,6 +738,13 @@ impl Tracker {
     pub(crate) fn invalidate(&self, tables: Option<HashSet<String>>) {
         log::debug!("invalidation emitted: tables={tables:?}");
         let _ = self.tx.send(Msg::Invalidate(tables));
+    }
+
+    /// preupdate hook 변경을 commit 성공 뒤 전달한다.
+    pub(crate) fn invalidate_changes(&self, changes: Vec<TableChange>) {
+        if !changes.is_empty() {
+            let _ = self.tx.send(Msg::Changes(changes));
+        }
     }
 
     /// 특정 구독 재조회 요청 (초기 emit / rebind[C-8] / watching)
@@ -730,6 +927,18 @@ impl<T: Clone + Send + 'static> LiveQuery<T> {
         tables: Option<HashSet<String>>,
         run: impl Fn(&Connection, &str, &OwnedParams) -> Result<T> + Send + Sync + 'static,
     ) -> Self {
+        Self::new_filtered(tracker, sql, params, tables, None, run)
+    }
+
+    /// 내부 생성 — 명시 행 필터를 가진 watch_* 전용.
+    pub(crate) fn new_filtered(
+        tracker: Arc<Tracker>,
+        sql: String,
+        params: OwnedParams,
+        tables: Option<HashSet<String>>,
+        filter: Option<InvalidationFilter>,
+        run: impl Fn(&Connection, &str, &OwnedParams) -> Result<T> + Send + Sync + 'static,
+    ) -> Self {
         let params = Arc::new(Mutex::new(params));
         let unknown = tables.is_none();
         let validate_names = tables.clone();
@@ -826,7 +1035,7 @@ impl<T: Clone + Send + 'static> LiveQuery<T> {
             })
         };
 
-        let id = tracker.register(tables, refresh, close);
+        let id = tracker.register(tables, filter, refresh, close);
         let lq = LiveQuery {
             id,
             tracker,

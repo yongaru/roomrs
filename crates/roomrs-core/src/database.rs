@@ -14,22 +14,31 @@ type QueryLogger = Box<dyn Fn(&str, Duration) + Send + Sync>;
 
 #[cfg(feature = "live")]
 thread_local! {
-    /// 현재 스레드의 중첩 SQL 실행별 update_hook 수집 버퍼.
-    static HOOK_CAPTURES: std::cell::RefCell<Vec<std::collections::HashSet<String>>> =
+    /// 현재 스레드의 중첩 SQL 실행별 preupdate_hook 수집 버퍼.
+    static HOOK_CAPTURES: std::cell::RefCell<Vec<HookCaptureFrame>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// 현재 실행 중인 가장 안쪽 SQL의 hook 테이블을 기록한다.
+/// preupdate_hook 수집 프레임.
 #[cfg(feature = "live")]
-pub(crate) fn record_hook_table(table: &str) {
+#[derive(Default)]
+pub(crate) struct HookCaptureFrame {
+    pub(crate) tables: std::collections::HashSet<String>,
+    pub(crate) changes: Vec<crate::live::TableChange>,
+}
+
+/// 현재 실행 중인 가장 안쪽 SQL의 행 변경을 기록한다.
+#[cfg(feature = "live")]
+pub(crate) fn record_hook_change(change: crate::live::TableChange) {
     HOOK_CAPTURES.with(|captures| {
         if let Some(current) = captures.borrow_mut().last_mut() {
-            current.insert(table.to_string());
+            current.tables.insert(change.table.clone());
+            current.changes.push(change);
         }
     });
 }
 
-/// update_hook capture 프레임을 unwind에서도 제거하는 RAII guard.
+/// preupdate_hook capture 프레임을 unwind에서도 제거하는 RAII guard.
 #[cfg(feature = "live")]
 pub(crate) struct HookCapture {
     depth: usize,
@@ -41,6 +50,61 @@ impl Drop for HookCapture {
     fn drop(&mut self) {
         HOOK_CAPTURES.with(|captures| captures.borrow_mut().truncate(self.depth));
     }
+}
+
+/// 스키마 컬럼 메타를 사용해 preupdate hook을 설치한다.
+#[cfg(feature = "live")]
+pub(crate) fn install_preupdate_hook(
+    conn: &Connection,
+    columns: Arc<std::collections::HashMap<String, Vec<String>>>,
+) -> Result<()> {
+    use rusqlite::hooks::PreUpdateCase;
+    use rusqlite::types::Value;
+
+    conn.preupdate_hook(Some(
+        move |_action, _db: &str, table: &str, change: &PreUpdateCase| {
+            let Some(column_names) = columns.get(&table.to_ascii_lowercase()) else {
+                return;
+            };
+            let read_old = |accessor: &rusqlite::hooks::PreUpdateOldValueAccessor| {
+                let mut row = std::collections::HashMap::new();
+                for (index, name) in column_names.iter().enumerate() {
+                    let Ok(value) = accessor.get_old_column_value(index as i32) else {
+                        return None;
+                    };
+                    row.insert(name.clone(), Value::from(value));
+                }
+                Some(row)
+            };
+            let read_new = |accessor: &rusqlite::hooks::PreUpdateNewValueAccessor| {
+                let mut row = std::collections::HashMap::new();
+                for (index, name) in column_names.iter().enumerate() {
+                    let Ok(value) = accessor.get_new_column_value(index as i32) else {
+                        return None;
+                    };
+                    row.insert(name.clone(), Value::from(value));
+                }
+                Some(row)
+            };
+            let (old, new) = match change {
+                PreUpdateCase::Insert(new) => (None, read_new(new)),
+                PreUpdateCase::Delete(old) => (read_old(old), None),
+                PreUpdateCase::Update {
+                    old_value_accessor,
+                    new_value_accessor,
+                } => (read_old(old_value_accessor), read_new(new_value_accessor)),
+                PreUpdateCase::Unknown => return,
+            };
+            if old.is_some() || new.is_some() {
+                record_hook_change(crate::live::TableChange {
+                    table: table.to_string(),
+                    old,
+                    new,
+                });
+            }
+        },
+    ))?;
+    Ok(())
 }
 
 /// pool 재오픈에 필요한 connection 로컬 설정 소유본.
@@ -381,6 +445,9 @@ pub struct DatabaseInner {
     /// 무효화 트래커 + 노티파이어 (feature live, 명세 §9)
     #[cfg(feature = "live")]
     pub(crate) tracker: Arc<crate::live::Tracker>,
+    /// preupdate hook이 행 값을 이름으로 복원할 때 사용하는 컬럼 순서.
+    #[cfg(feature = "live")]
+    pub(crate) hook_columns: Arc<std::collections::HashMap<String, Vec<String>>>,
     /// 노티파이어 스레드 join 핸들 — drop 시 join으로 커넥션 잔류 방지 (M-5)
     #[cfg(feature = "live")]
     notifier_join: Option<std::thread::JoinHandle<()>>,
@@ -441,7 +508,7 @@ impl DatabaseInner {
     }
 
     /// 훅 수집분 회수
-    pub(crate) fn take_hook_tables(&self) -> std::collections::HashSet<String> {
+    pub(crate) fn take_hook_capture(&self) -> HookCaptureFrame {
         HOOK_CAPTURES.with(|captures| captures.borrow_mut().pop().unwrap_or_default())
     }
 
@@ -459,15 +526,29 @@ impl DatabaseInner {
     /// (L-2). PRAGMA는 상태 변경 여부를 확실히 구분할 수 없어 전체 무효화한다.
     /// 읽기 전용 문장은 훅 수집분(트리거 write)만 방출한다.
     pub(crate) fn emit_after_write(&self, sql: &str) {
-        let hooks = self.take_hook_tables();
+        let capture = self.take_hook_capture();
+        let changed_tables: std::collections::HashSet<String> = capture
+            .changes
+            .iter()
+            .map(|change| change.table.clone())
+            .collect();
+        if !capture.changes.is_empty() {
+            self.tracker.invalidate_changes(capture.changes);
+        }
         match crate::live::extract_write_tables(sql) {
             crate::live::WriteTables::ReadOnly => {
-                if !hooks.is_empty() {
-                    self.tracker.invalidate(Some(hooks));
+                let tables: std::collections::HashSet<String> = capture
+                    .tables
+                    .difference(&changed_tables)
+                    .cloned()
+                    .collect();
+                if !tables.is_empty() {
+                    self.tracker.invalidate(Some(tables));
                 }
             }
             crate::live::WriteTables::Tables(mut t) => {
-                t.extend(hooks);
+                t.extend(capture.tables);
+                t.retain(|table| !changed_tables.contains(table));
                 if !t.is_empty() {
                     self.tracker.invalidate(Some(t));
                 }
@@ -805,15 +886,29 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
         }
 
         // 라이브 쿼리 기반 구축 (feature live, 명세 §9) —
-        // 노티파이어 전용 커넥션 + update_hook(보조 경로) 설치
+        // 노티파이어 전용 커넥션 + preupdate_hook 행 변경 수집 설치
+        #[cfg(feature = "live")]
+        let hook_columns = Arc::new(
+            schema
+                .tables
+                .iter()
+                .map(|table| {
+                    (
+                        table.name.to_ascii_lowercase(),
+                        table
+                            .columns
+                            .iter()
+                            .map(|column| column.name.to_string())
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
         #[cfg(feature = "live")]
         let (tracker, notifier_join) = {
             let notifier_conn = self.open_conn(mem_name.as_deref(), &schema, false)?;
             for conn in &connections {
-                let _prev =
-                    conn.update_hook(Some(move |_action, _db: &str, table: &str, _rowid: i64| {
-                        record_hook_table(table);
-                    }));
+                install_preupdate_hook(conn, Arc::clone(&hook_columns))?;
             }
             crate::live::Tracker::start(notifier_conn)?
         };
@@ -827,6 +922,8 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
             encryption_key: self.encryption_key.clone(),
         };
         let connection_settings = reconnect_settings;
+        #[cfg(feature = "live")]
+        let connection_hook_columns = Arc::clone(&hook_columns);
         #[cfg(feature = "multi-instance")]
         let connection_mi_src = mi_src_id.clone();
         let connection_reopen: Arc<dyn Fn() -> Result<Connection> + Send + Sync> =
@@ -848,11 +945,7 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
                 }
                 #[cfg(feature = "live")]
                 {
-                    let _prev = conn.update_hook(Some(
-                        move |_action, _db: &str, table: &str, _rowid: i64| {
-                            record_hook_table(table);
-                        },
-                    ));
+                    install_preupdate_hook(&conn, Arc::clone(&connection_hook_columns))?;
                 }
                 Ok(conn)
             });
@@ -870,6 +963,8 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
             query_logger: self.query_logger.take(),
             #[cfg(feature = "live")]
             tracker,
+            #[cfg(feature = "live")]
+            hook_columns: Arc::clone(&hook_columns),
             #[cfg(feature = "live")]
             notifier_join: Some(notifier_join),
             #[cfg(feature = "multi-instance")]
@@ -930,7 +1025,7 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
                 .initialize(Arc::clone(cb), self.in_memory)?;
         }
 
-        // on_open이 roomrs 함수나 update_hook을 교체했더라도 일반 풀의
+        // on_open이 roomrs hook을 교체했더라도 일반 풀의
         // connection-local 상태가 최종 승자가 되도록 전부 재설치한다.
         db.inner.pool.connections.for_each_idle(|_conn| {
             #[cfg(feature = "multi-instance")]
@@ -946,10 +1041,7 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
             }
             #[cfg(feature = "live")]
             {
-                let _previous =
-                    _conn.update_hook(Some(move |_action, _db: &str, table: &str, _rowid: i64| {
-                        record_hook_table(table);
-                    }));
+                install_preupdate_hook(_conn, Arc::clone(&hook_columns))?;
             }
             Ok::<(), Error>(())
         })?;

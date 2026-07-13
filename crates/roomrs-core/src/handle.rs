@@ -203,7 +203,7 @@ impl<'db> SyncHandle<'db> {
     /// tables may be missed. Use the handle's SQL methods when live-query
     /// invalidation must be guaranteed.
     ///
-    /// Installing an SQLite `update_hook` replaces roomrs' live-query hook on
+    /// Installing an SQLite `preupdate_hook` replaces roomrs' live-query hook on
     /// that connection. With the `live` feature, call [`Self::rearm_hooks`]
     /// afterwards.
     pub fn with_connection<R>(&self, f: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
@@ -213,9 +213,11 @@ impl<'db> SyncHandle<'db> {
         let out = f(guard.conn());
         #[cfg(feature = "live")]
         {
-            let hooks = self.inner.take_hook_tables();
-            if !hooks.is_empty() {
-                self.inner.tracker.invalidate(Some(hooks));
+            let capture = self.inner.take_hook_capture();
+            if !capture.changes.is_empty() {
+                self.inner.tracker.invalidate_changes(capture.changes);
+            } else if !capture.tables.is_empty() {
+                self.inner.tracker.invalidate(Some(capture.tables));
             }
         }
         out
@@ -228,11 +230,7 @@ impl<'db> SyncHandle<'db> {
     #[cfg(feature = "live")]
     pub fn rearm_hooks(&self) -> Result<()> {
         self.inner.pool.connections.for_each_connection(|conn| {
-            let _previous =
-                conn.update_hook(Some(move |_action, _db: &str, table: &str, _rowid: i64| {
-                    crate::database::record_hook_table(table);
-                }));
-            Ok(())
+            crate::database::install_preupdate_hook(conn, Arc::clone(&self.inner.hook_columns))
         })
     }
 }
@@ -243,7 +241,7 @@ impl<'db> SyncHandle<'db> {
 #[cfg(feature = "live")]
 pub(crate) mod watch_impl {
     use super::*;
-    use crate::live::{LiveQuery, OwnedParams, extract_tables};
+    use crate::live::{InvalidationFilter, LiveQuery, OwnedParams, extract_tables};
     use rusqlite::ToSql;
     use std::collections::HashSet;
 
@@ -341,6 +339,33 @@ pub(crate) mod watch_impl {
         )
     }
 
+    pub(crate) fn watch_scalar_filtered<T: FromSql + Clone + Send + 'static>(
+        inner: &Arc<DatabaseInner>,
+        sql: &str,
+        params: Result<OwnedParams>,
+        filter: InvalidationFilter,
+    ) -> LiveQuery<T> {
+        let tables = Some(HashSet::from([filter.table_name().to_string()]));
+        let tracker = Arc::clone(&inner.tracker);
+        match params {
+            Ok(p) => LiveQuery::new_filtered(
+                tracker,
+                sql.to_string(),
+                p,
+                tables,
+                Some(filter),
+                crate::live::query_scalar_owned::<T>,
+            ),
+            Err(e) => LiveQuery::new(
+                tracker,
+                sql.to_string(),
+                OwnedParams::None,
+                Some(HashSet::new()),
+                move |_, _, _| Err(Error::Config(e.to_string())),
+            ),
+        }
+    }
+
     /// DAO 힌트 테이블 목록 → 집합 (빈 목록 = 런타임 추출 위임)
     pub(crate) fn tables_from_hint(hint: &[&str]) -> Option<HashSet<String>> {
         if hint.is_empty() {
@@ -390,6 +415,20 @@ impl SyncHandle<'_> {
         params: &[&dyn rusqlite::ToSql],
     ) -> crate::live::LiveQuery<T> {
         watch_impl::watch_scalar(self.inner, sql, watch_impl::params_from_dyn(params), None)
+    }
+
+    pub fn watch_scalar_filtered<T: FromSql + Clone + Send + 'static>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        filter: crate::live::InvalidationFilter,
+    ) -> crate::live::LiveQuery<T> {
+        watch_impl::watch_scalar_filtered(
+            self.inner,
+            sql,
+            watch_impl::params_from_dyn(params),
+            filter,
+        )
     }
 }
 
@@ -713,6 +752,7 @@ struct TxPending {
     /// 파싱 실패 발생 = 전체 무효화 필요
     all: bool,
     tables: std::collections::HashSet<String>,
+    changes: Vec<crate::live::TableChange>,
 }
 
 #[cfg(feature = "live")]
@@ -720,14 +760,15 @@ impl Tx<'_> {
     /// write 문장 1건의 무효화 대상 누적 — 문장 파싱 ∪ 훅 (현재 savepoint 레벨에).
     /// 읽기 전용 문장은 문장 기반 누적을 하지 않는다 (L-2) — 훅 수집분만 병합
     fn collect_write(&self, sql: &str) {
-        let hooks = self.inner.take_hook_tables();
+        let capture = self.inner.take_hook_capture();
         let mut levels = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // begin이 기본 레벨 1개를 보장 — 비어 있으면 방어적으로 무시
         let Some(p) = levels.last_mut() else { return };
-        p.tables.extend(hooks);
+        p.tables.extend(capture.tables);
+        p.changes.extend(capture.changes);
         match crate::live::extract_write_tables(sql) {
             crate::live::WriteTables::ReadOnly => {}
             crate::live::WriteTables::Tables(t) => p.tables.extend(t),
@@ -738,13 +779,14 @@ impl Tx<'_> {
     /// 부분 실패 배치 등 결과를 알 수 없는 write — 훅 수집 ∪ 전체 무효화를
     /// 현재 레벨에 보수 누적한다 (R2-3). 커밋되지 않으면 방출되지 않으므로 무해
     fn collect_write_all(&self) {
-        let hooks = self.inner.take_hook_tables();
+        let capture = self.inner.take_hook_capture();
         let mut levels = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(p) = levels.last_mut() else { return };
-        p.tables.extend(hooks);
+        p.tables.extend(capture.tables);
+        p.changes.extend(capture.changes);
         p.all = true;
     }
 
@@ -758,14 +800,26 @@ impl Tx<'_> {
         );
         let mut all = false;
         let mut tables = std::collections::HashSet::new();
+        let mut changes = Vec::new();
         for l in levels {
             all |= l.all;
             tables.extend(l.tables);
+            changes.extend(l.changes);
         }
         if all {
             self.inner.tracker.invalidate(None);
-        } else if !tables.is_empty() {
-            self.inner.tracker.invalidate(Some(tables));
+        } else {
+            let changed_tables: std::collections::HashSet<String> = changes
+                .iter()
+                .map(|change: &crate::live::TableChange| change.table.clone())
+                .collect();
+            if !changes.is_empty() {
+                self.inner.tracker.invalidate_changes(changes);
+            }
+            tables.retain(|table| !changed_tables.contains(table));
+            if !tables.is_empty() {
+                self.inner.tracker.invalidate(Some(tables));
+            }
         }
     }
 }
@@ -881,6 +935,7 @@ impl Tx<'_> {
                     if let Some(parent) = levels.last_mut() {
                         parent.all |= level.all;
                         parent.tables.extend(level.tables);
+                        parent.changes.extend(level.changes);
                     }
                 }
                 self.guard
