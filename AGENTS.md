@@ -161,9 +161,9 @@ examples/  xtask/
 3. 적대적 리뷰 루프
 4. 버전·CHANGELOG·README·명세·작업지시서 갱신
 5. 커밋·기본 브랜치 push·릴리스 태그 push
-6. `cargo package`/`cargo publish --dry-run` 검증 후 crates.io 순차 배포
+6. `cargo package`/`cargo publish --dry-run` 검증으로 crates.io 배포 직전 상태까지 완료
 
-사용자가 검증 전용·문서 전용·배포 제외·push 금지처럼 범위를 제한하면 그 제한을 따른다. crates.io 배포 권한 또는 registry 인증이 없으면, 배포 직전까지 완료하고 정확한 차단 사유를 보고한다.
+crates.io 실제 배포는 사용자가 명시적으로 요청할 때만 수행한다. 사용자가 검증 전용·문서 전용·배포 제외·push 금지처럼 범위를 제한하면 그 제한을 따른다.
 
 ### 9.1 시맨틱 버전 (v1.0 이전: `0.MINOR.PATCH`)
 
