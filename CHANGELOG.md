@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-14
+
+### Added
+
+- 단일 프로세스 라이브 쿼리용 `InvalidationFilter` 공개 계약과 `preupdate_hook` 기반 행 필터 무효화 설계를 문서화했습니다.
+
 ## [0.1.0] - 2026-07-13
 
 ### Added
@@ -27,5 +33,6 @@
 - bundled SQLite를 기본 제공하고 선택적 SQLCipher(`cipher`) 및 데스크톱·모바일 크로스 빌드를 지원합니다.
 - Rust 1.85와 Edition 2024를 지원하며 MIT OR Apache-2.0 듀얼 라이선스로 배포합니다.
 
-[Unreleased]: https://github.com/yongaru/roomrs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/yongaru/roomrs/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/yongaru/roomrs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yongaru/roomrs/releases/tag/v0.1.0
