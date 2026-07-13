@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-14
+
+### Fixed
+
+- 공개 6개 crate의 README를 package 내부 파일로 제공해 crates.io 표시 metadata가 인식되도록 수정했습니다.
+
 ## [0.2.1] - 2026-07-14
 
 ### Fixed
@@ -60,7 +66,8 @@
 - bundled SQLite를 기본 제공하고 선택적 SQLCipher(`cipher`) 및 데스크톱·모바일 크로스 빌드를 지원합니다.
 - Rust 1.85와 Edition 2024를 지원하며 MIT OR Apache-2.0 듀얼 라이선스로 배포합니다.
 
-[Unreleased]: https://github.com/yongaru/roomrs/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/yongaru/roomrs/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/yongaru/roomrs/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/yongaru/roomrs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/yongaru/roomrs/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/yongaru/roomrs/compare/v0.1.1...v0.1.2
