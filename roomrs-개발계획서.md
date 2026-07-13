@@ -25,7 +25,7 @@
 | 3 | 쿼리 정의 | **Room식 raw SQL 매크로** (`#[query("...")]`) | 동적 쿼리는 쿼리빌더/런타임 경로 |
 | 3b | 직접 쿼리 | **DAO/엔티티 없이 raw 쿼리 1급** (execute/단건/Option/스칼라/Vec + 라이브) | §5.7 |
 | 4 | SQL 검증 | **하이브리드**: 정적=**커밋된 스키마 스냅샷 파일 대조**, 동적=런타임(prepare) | 메커니즘 §7. 파서 실패=스킵+경고, `unchecked` 해치 |
-| 5 | 라이브 쿼리 | **핵심 필수** — 단일 구체 타입 `LiveQuery<T>` | 주 경로=문장 기반 무효화, 보조=update_hook(§9.2) |
+| 5 | 라이브 쿼리 | **핵심 필수** — 단일 구체 타입 `LiveQuery<T>` | 주 경로=문장 기반 무효화, 보조=`preupdate_hook` 행 필터(§9.2) |
 | 5b | 멀티 인스턴스 무효화 | **테이블별 옵트인** `#[entity(multi_instance)]` (feature `multi-instance`) | 교차 프로세스 write 알림(§9.5) |
 | 5c | 알림 콜백 모델 | **recv + subscribe 콜백 + Iterator / Stream** — 동기·비동기 핸들 양쪽 | 전용 노티파이어 스레드(§9.6) |
 | 6 | 마이그레이션 | **자동 + 반자동(직접 SQL) + 수동 코드** 3경로 | diff 초안 · `Migration::sql` · trait(§8) |
@@ -71,6 +71,7 @@
 | 35 | 스냅샷 모델 파사드 | `SchemaSnapshot`·`TableSnapshot`·`ColumnSnapshot`을 `roomrs`에서 재수출 | 내부 크레이트 직접 의존 불필요 |
 | 36 | 쿼리빌더 LIKE ESCAPE | `like_escaped(pattern, escape: char)` — 패턴과 단일 Unicode escape 문자를 모두 파라미터 바인딩 | `%`·`_` 리터럴 검색 지원. §5.8 |
 | 37 | 풀 API | `connections`·`with_connection`만 제공 | 통합 풀의 단일 커넥션 모델을 노출. §10 |
+| 38 | 행 필터 무효화 | `InvalidationFilter`: 단일 테이블·AND/OR 그룹·`eq`/`neq`/NULL predicate | 단일 프로세스 `preupdate_hook`가 OLD/NEW를 매칭. 복잡 query 자동 분석 금지. §5.6/§9.2 |
 
 ---
 
@@ -308,12 +309,29 @@ impl<T> LiveQuery<T> {
     pub fn rebind(&self, params: &[&dyn ToSql]) -> Result<()>; // 같은 SQL, 바인딩 교체(§5.6b)
     pub fn watching(self, tables: &[&str]) -> Self;        // 의존 명시(직접 쿼리용)
 }
+
+pub struct InvalidationFilter { /* 단일 테이블 행 필터 */ }
+impl InvalidationFilter {
+    pub fn table(name: &str) -> Self;
+    pub fn where_group(self, f: impl FnOnce(FilterGroup) -> FilterGroup) -> Self;
+    pub fn or_where_group(self, f: impl FnOnce(FilterGroup) -> FilterGroup) -> Self;
+    pub fn build(self) -> Result<Self>;
+}
+
+impl FilterGroup {
+    pub fn eq(self, column: &str, value: impl Into<Value>) -> Self;
+    pub fn neq(self, column: &str, value: impl Into<Value>) -> Self;
+    pub fn is_null(self, column: &str) -> Self;
+    pub fn is_not_null(self, column: &str) -> Self;
+}
 ```
 - DAO의 `watch_*`, 직접 쿼리의 `db.run_*().watch_*` 모두 이 타입을 반환. `run_async()` 경로는 관례상 `into_stream()` 소비를 안내하지만 타입은 동일.
 - `rebind` 는 SQL이 고정된 DAO watch에도 유효(바인딩 파라미터가 있는 경우).
 - **수명 계약**: guard drop은 신규 콜백 시작을 차단한다. 이미 실행 중인 콜백은 최대 1건 완료될 수 있다. 재조회는 노티파이어 스레드로 라우팅되며 epoch로 이전 세대 결과를 폐기한다.
 - **값 전달 계약[결정 30]**: 수신 대기열은 keep-latest 단일 슬롯이다. 생산자가 소비자보다 빠르면 미소비 중간 상태를 최신 상태로 덮어쓴다. `recv`/`try_recv`/`into_stream` 모두 같은 계약을 따른다.
 - `let _ = q.subscribe(…)` 는 즉시 drop되어 구독이 끝난다. 구독 guard를 변수나 구조체 필드에 보관해야 한다.
+- **행 필터 구독**: 직접 쿼리와 DAO는 `watch_*_filtered(..., filter)` 경로로 `InvalidationFilter`를 받는다. group 내부 predicate는 AND, group 사이는 OR다. `eq`/`neq`의 NULL 의미는 SQL과 같아 `is_null`/`is_not_null`을 별도로 쓴다. INSERT는 NEW, DELETE는 OLD, UPDATE는 OLD 또는 NEW가 filter에 매칭될 때만 재조회한다.
+- filter 없는 기존 `watch_*`는 의존 테이블 단위 무효화를 유지한다. JOIN·subquery·함수 등 복잡 query 자동 분석은 하지 않는다. 필요한 테이블마다 명시 filter를 제공하지 않으면 해당 테이블은 보수적으로 전체 무효화한다.
 
 ### 5.6b 페이지네이션 패턴
 guard를 화면 struct 필드에 보관하고, 페이지 이동은 `rebind`, 쿼리 변경은 재구독, 총건수는 `watch_scalar(COUNT)`를 사용한다. 앱 수명 구독은 `guard.detach()`를 사용한다.
@@ -452,14 +470,15 @@ pub trait Migration {
 ### 9.1 요구
 (동일 — 구독 즉시 1회 emit, 의존 테이블 write 시 재조회 emit.)
 
-### 9.2 인-프로세스 무효화 — **주 경로: 문장 기반, 보조: update_hook**
+### 9.2 인-프로세스 무효화 — **주 경로: 문장 기반, 보조: preupdate_hook**
 
 모든 일반 커넥션에 동일한 무효화 상태와 hook을 설치한다. SQL의 read/write 의미를 라우팅에 사용하지 않는다.
 - **주 경로 — 문장 기반 무효화**: 각 실행 문장의 대상 테이블을 (정적 쿼리=`DEPENDS_ON` 메타, 동적/직접 쿼리=런타임 파싱, 빌더=엔티티 메타) 로 확정 → **트랜잭션 commit이 성공적으로 반환된 후** 영향 테이블 집합을 방출. hook의 알려진 누락(WHERE 없는 `DELETE`의 truncate 최적화, WITHOUT ROWID)과 무관하게 정확하다.
 - **비-DML 문장 = 전체 무효화**: DML(SELECT/INSERT/UPDATE/DELETE)과 확실한 읽기 전용 문장 외에는 대상 테이블 특정을 시도하지 않고 **전체 무효화**로 처리한다.
-- **보조 경로 — update_hook(모든 일반 커넥션에 설치)**: 어느 checkout에서 발생하든 사용자 SQL의 **간접 write**(사용자 정의 트리거가 다른 테이블 수정 등)를 포착. update_hook 이벤트는 해당 커넥션의 문장 기반 집합에 **합집합**으로 병합.
+- **보조 경로 — preupdate_hook(모든 일반 커넥션에 설치)**: 어느 checkout에서 발생하든 사용자 SQL의 **간접 write**(사용자 정의 트리거가 다른 테이블 수정 등)를 포착. filter가 참조한 OLD/NEW 컬럼값만 소유 복사해 transaction pending에 기록하고, filter 매칭 구독만 재조회한다. filter 없는 구독은 테이블 단위 집합에 병합한다.
+- **hook callback 경계**: hook 안에서 SQLite API 재진입·재조회·통지를 하지 않는다. 최상위 transaction commit API 성공 반환 뒤에만 pending 변경을 Tracker에 방출한다. rollback·savepoint rollback은 해당 pending 변경을 폐기한다.
 - **commit_hook 미사용**: commit_hook은 디스크 확정 전에 호출되므로 **commit API가 성공 반환한 뒤** 방출한다. 롤백 시 수집분은 폐기한다.
-- **탈출구 경고[B-7]**: `db.run_sync().with_connection()` 으로 사용자가 자기 update_hook을 등록하면 그 커넥션의 roomrs hook이 **교체**되어(커넥션당 1개) 간접 write 감지가 조용히 죽는다 — API 문서에 굵은 경고 + 전체 일반 커넥션에 hook을 재설치하는 `db.rearm_hooks()` 복구 제공.
+- **탈출구 경고[B-7]**: `db.run_sync().with_connection()` 으로 사용자가 자기 preupdate_hook을 등록하면 그 커넥션의 roomrs hook이 **교체**되어(커넥션당 1개) 행 필터 감지가 조용히 죽는다 — API 문서에 굵은 경고 + 전체 일반 커넥션에 hook을 재설치하는 `db.rearm_hooks()` 복구 제공.
 
 ### 9.3 InvalidationTracker
 (동일 — 테이블→구독 역인덱스, 디바운스 병합, 정적=컴파일 타임 `DEPENDS_ON`, 동적=런타임 수집.)
