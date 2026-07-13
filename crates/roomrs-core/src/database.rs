@@ -179,12 +179,6 @@ pub(crate) fn escape_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// SQL 문자열 리터럴 이스케이프 — `'` 배증 후 따옴표로 감싼다 (M-8)
-#[cfg(feature = "multi-instance")]
-pub(crate) fn escape_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
 /// 컬럼 메타 — `#[entity]` 생성, 스냅샷 대조·생성에 사용 (명세 §7)
 #[derive(Debug, Clone, Copy)]
 pub struct ColumnMeta {
@@ -203,8 +197,6 @@ pub struct TableMeta {
     pub columns: &'static [ColumnMeta],
     /// 테이블·인덱스 DDL
     pub ddl: &'static [&'static str],
-    /// 교차 프로세스 무효화 옵트인 (명세 §9.5)
-    pub multi_instance: bool,
 }
 
 /// 테이블 스키마 정의 — `#[database]` 매크로가 엔티티 메타에서 구성
@@ -451,9 +443,6 @@ pub struct DatabaseInner {
     /// 노티파이어 스레드 join 핸들 — drop 시 join으로 커넥션 잔류 방지 (M-5)
     #[cfg(feature = "live")]
     notifier_join: Option<std::thread::JoinHandle<()>>,
-    /// 멀티 인스턴스 상태 (명세 §9.5) — 마이그레이션 후 설치되므로 OnceLock
-    #[cfg(feature = "multi-instance")]
-    pub(crate) mi: std::sync::OnceLock<Arc<crate::multi_instance::MiState>>,
 }
 
 /// 종료 로그 — live 미사용 빌드에도 close 로그를 남긴다 (지시서 logging-log-crate)
@@ -471,13 +460,7 @@ impl Drop for DatabaseInner {
     /// 마지막 Arc가 노티파이어 스레드 자신(구독 콜백 등)에서 drop되면 self-join이
     /// 교착이므로 그 경우엔 join을 생략하고 분리한다 (H-3)
     fn drop(&mut self) {
-        log::info!("database closing — shutting down notifier and pollers");
-        // MI 폴러 먼저 — 트래커로 무효화를 보내는 쪽부터 정리
-        #[cfg(feature = "multi-instance")]
-        if let Some(mi) = self.mi.get() {
-            mi.shutdown();
-            mi.join_poller();
-        }
+        log::info!("database closing — shutting down notifier");
         // 트래커 종료 — 레지스트리 청산으로 대기 중 recv를 깨운다 (M-7)
         self.tracker.shutdown();
         if let Some(h) = self.notifier_join.take() {
@@ -510,15 +493,6 @@ impl DatabaseInner {
     /// 훅 수집분 회수
     pub(crate) fn take_hook_capture(&self) -> HookCaptureFrame {
         HOOK_CAPTURES.with(|captures| captures.borrow_mut().pop().unwrap_or_default())
-    }
-
-    /// 경고 전달 — 라이브러리는 stderr에 직접 출력하지 않는다 (L-5).
-    /// query_logger 훅이 설정돼 있으면 그리로 전달, 없으면 무시.
-    #[cfg(feature = "multi-instance")]
-    pub(crate) fn log_warn(&self, msg: &str) {
-        if let Some(logger) = &self.query_logger {
-            logger(msg, Duration::ZERO);
-        }
     }
 
     /// 단문 write 성공 후 무효화 방출 — 문장 파싱 ∪ 훅 (명세 §9.2).
@@ -615,10 +589,6 @@ pub struct DatabaseBuilder<T: DatabaseSpec> {
     destructive_fallback: bool,
     #[cfg(feature = "cipher")]
     encryption_key: Option<String>,
-    #[cfg(feature = "multi-instance")]
-    multi_instance: bool,
-    #[cfg(feature = "multi-instance")]
-    mi_poll_interval: Duration,
     on_create: Option<ConnCallback>,
     on_open: Option<ConnCallback>,
     query_logger: Option<QueryLogger>,
@@ -643,10 +613,6 @@ impl<T: DatabaseSpec> Default for DatabaseBuilder<T> {
             destructive_fallback: false,
             #[cfg(feature = "cipher")]
             encryption_key: None,
-            #[cfg(feature = "multi-instance")]
-            multi_instance: false,
-            #[cfg(feature = "multi-instance")]
-            mi_poll_interval: Duration::from_millis(250),
             on_create: None,
             on_open: None,
             query_logger: None,
@@ -744,37 +710,6 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
         self
     }
 
-    /// 교차 프로세스 무효화 활성 (명세 §9.5, 기본 off) — 옵트인 엔티티에만 적용.
-    ///
-    /// 주의: 설치되는 트리거는 커넥션별 함수 `roomrs_src()`를 호출한다 (H-2).
-    /// roomrs(`multi-instance` feature)가 아닌 커넥션(예: sqlite3 CLI)이 옵트인
-    /// 테이블에 write하면 함수 부재로 실패한다 — 모든 writer가 roomrs여야 한다.
-    ///
-    /// 혼합 배포 금지 (M-1): v2 MI 로그 형식은 2.0 이전 roomrs 인스턴스와
-    /// 호환되지 않는다 — 같은 DB 파일을 공유하는 모든 프로세스를 함께 올릴 것.
-    ///
-    /// # Compatibility — v2 multi-instance log format (M-1)
-    ///
-    /// The v2 log format (`__roomrs_inv_log` with a `src` column, triggers
-    /// calling `roomrs_src()`) is **incompatible with pre-2.0 roomrs
-    /// instances sharing the same database file**. When a 2.x instance opens
-    /// the file it rewrites the log table and triggers; writes to opt-in
-    /// tables from a still-running pre-2.0 instance then fail with
-    /// `no such function: roomrs_src`. Old binaries cannot be fixed from
-    /// here — upgrade every process that shares the file to 2.x together.
-    #[cfg(feature = "multi-instance")]
-    pub fn enable_multi_instance_invalidation(mut self, enable: bool) -> Self {
-        self.multi_instance = enable;
-        self
-    }
-
-    /// MI 폴링 주기 (기본 250ms)
-    #[cfg(feature = "multi-instance")]
-    pub fn mi_poll_interval(mut self, d: Duration) -> Self {
-        self.mi_poll_interval = d;
-        self
-    }
-
     /// 파괴적 마이그레이션 폴백 (명세 §8, 기본 off) —
     /// 체인이 불충분하면 **모든 테이블을 삭제**하고 현재 스키마로 재생성한다.
     pub fn fallback_to_destructive_migration(mut self, enable: bool) -> Self {
@@ -849,39 +784,11 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
         // 통합 풀 커넥션 오픈 + 공통 PRAGMA (명세 §10)
         let first_conn = self.open_conn(mem_name.as_deref(), &schema, false)?;
 
-        // 인스턴스 식별 함수 등록 (H-2) — MI 트리거가 `roomrs_src()`로 write 주체를
-        // 기록한다. MI 미활성이어도 등록: 다른 인스턴스가 설치한 트리거가
-        // 이 커넥션의 write에서 발화할 수 있다.
-        #[cfg(feature = "multi-instance")]
-        let mi_src_id = crate::multi_instance::generate_instance_id();
-        #[cfg(feature = "multi-instance")]
-        {
-            let id = mi_src_id.clone();
-            first_conn.create_scalar_function(
-                "roomrs_src",
-                0,
-                rusqlite::functions::FunctionFlags::SQLITE_UTF8
-                    | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-                move |_| Ok(id.clone()),
-            )?;
-        }
-
         // 일반 작업 커넥션 — 모두 read/write 가능 (명세 §10)
         let mut connections = Vec::with_capacity(self.connections);
         connections.push(first_conn);
         for _ in 1..self.connections {
             let conn = self.open_conn(mem_name.as_deref(), &schema, false)?;
-            #[cfg(feature = "multi-instance")]
-            {
-                let id = mi_src_id.clone();
-                conn.create_scalar_function(
-                    "roomrs_src",
-                    0,
-                    rusqlite::functions::FunctionFlags::SQLITE_UTF8
-                        | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-                    move |_| Ok(id.clone()),
-                )?;
-            }
             connections.push(conn);
         }
 
@@ -924,25 +831,12 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
         let connection_settings = reconnect_settings;
         #[cfg(feature = "live")]
         let connection_hook_columns = Arc::clone(&hook_columns);
-        #[cfg(feature = "multi-instance")]
-        let connection_mi_src = mi_src_id.clone();
         let connection_reopen: Arc<dyn Fn() -> Result<Connection> + Send + Sync> =
             Arc::new(move || {
                 let conn = connection_settings.open(false)?;
                 // 사용자 callback이 같은 이름의 함수/hook을 교체할 수 있으므로
                 // roomrs connection-local 상태는 initialize 뒤 마지막에 설치한다.
                 connection_settings.initialize(&conn)?;
-                #[cfg(feature = "multi-instance")]
-                {
-                    let id = connection_mi_src.clone();
-                    conn.create_scalar_function(
-                        "roomrs_src",
-                        0,
-                        rusqlite::functions::FunctionFlags::SQLITE_UTF8
-                            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-                        move |_| Ok(id.clone()),
-                    )?;
-                }
                 #[cfg(feature = "live")]
                 {
                     install_preupdate_hook(&conn, Arc::clone(&connection_hook_columns))?;
@@ -967,8 +861,6 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
             hook_columns: Arc::clone(&hook_columns),
             #[cfg(feature = "live")]
             notifier_join: Some(notifier_join),
-            #[cfg(feature = "multi-instance")]
-            mi: std::sync::OnceLock::new(),
         };
         let db = Database {
             inner: Arc::new(inner),
@@ -977,41 +869,7 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
         // 마이그레이션 — 풀 구성 후 Tx 기반으로 실행 (명세 §8)
         self.run_migration(&db, &schema)?;
 
-        // 멀티 인스턴스 (명세 §9.5) — 테이블 생성 후 트리거 설치 + 폴러 기동
-        #[cfg(feature = "multi-instance")]
-        if self.multi_instance {
-            let mi_tables: std::collections::HashSet<String> = schema
-                .tables
-                .iter()
-                .filter(|t| t.multi_instance)
-                .map(|t| t.name.to_string())
-                .collect();
-            if !mi_tables.is_empty() {
-                db.run_sync().with_connection(|c| {
-                    if self.migrate == MigrationPolicy::Validate {
-                        crate::multi_instance::validate(c, schema.version, &mi_tables)
-                    } else {
-                        crate::multi_instance::install(c, schema.version, &mi_tables)
-                    }
-                })?;
-                // 폴러 커넥션 — 로그 정리(DELETE)를 위해 읽기 전용 아님.
-                // 내부 로그 테이블만 건드리는 짧은 write다.
-                let poller_conn = self.open_conn(mem_name.as_deref(), &schema, false)?;
-                if let Some(cb) = &self.on_open {
-                    Self::apply_on_open(&poller_conn, cb, false, false)?;
-                }
-                let state = crate::multi_instance::start_poller(
-                    poller_conn,
-                    Arc::clone(&db.inner.tracker),
-                    self.mi_poll_interval,
-                    mi_tables,
-                    mi_src_id.clone(),
-                )?;
-                let _ = db.inner.mi.set(state);
-            }
-        }
-
-        // 기존 계약대로 마이그레이션·MI 설치가 끝난 뒤 모든 풀 연결을 초기화한다.
+        // 마이그레이션 완료 뒤 모든 풀 연결을 초기화한다.
         if let Some(cb) = &self.on_open {
             {
                 db.inner
@@ -1028,17 +886,6 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
         // on_open이 roomrs hook을 교체했더라도 일반 풀의
         // connection-local 상태가 최종 승자가 되도록 전부 재설치한다.
         db.inner.pool.connections.for_each_idle(|_conn| {
-            #[cfg(feature = "multi-instance")]
-            {
-                let id = mi_src_id.clone();
-                _conn.create_scalar_function(
-                    "roomrs_src",
-                    0,
-                    rusqlite::functions::FunctionFlags::SQLITE_UTF8
-                        | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-                    move |_| Ok(id.clone()),
-                )?;
-            }
             #[cfg(feature = "live")]
             {
                 install_preupdate_hook(_conn, Arc::clone(&hook_columns))?;
@@ -1557,72 +1404,6 @@ mod tests {
         std::fs::remove_file(file).unwrap();
     }
 
-    #[cfg(feature = "multi-instance")]
-    struct ReopenDb(Database);
-
-    #[cfg(feature = "multi-instance")]
-    impl DatabaseSpec for ReopenDb {
-        const VERSION: u32 = 1;
-        const DB_NAME: &'static str = "reopen_db";
-
-        fn schema() -> SchemaDef {
-            SchemaDef {
-                version: 1,
-                ddl: vec!["CREATE TABLE items(id INTEGER PRIMARY KEY)"],
-                tables: vec![TableMeta {
-                    name: "items",
-                    columns: &[],
-                    ddl: &["CREATE TABLE items(id INTEGER PRIMARY KEY)"],
-                    multi_instance: true,
-                }],
-            }
-        }
-
-        fn from_database(db: Database) -> Self {
-            Self(db)
-        }
-    }
-
-    /// 실제 guard 복구가 on_open·MI 함수·live hook을 모두 재설치한다.
-    #[cfg(feature = "multi-instance")]
-    #[test]
-    fn pool_reopen_restores_connection_local_state() {
-        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let callback_opens = Arc::clone(&opens);
-        let db = DatabaseBuilder::<ReopenDb>::default()
-            .in_memory()
-            .enable_multi_instance_invalidation(true)
-            .on_open(move |_| {
-                callback_opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
-            })
-            .build()
-            .unwrap()
-            .0;
-        let before = opens.load(std::sync::atomic::Ordering::SeqCst);
-        db.inner
-            .pool
-            .connections
-            .force_restore_failure
-            .store(true, std::sync::atomic::Ordering::Release);
-        drop(db.inner.pool.connections.acquire().unwrap());
-        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), before + 1);
-
-        let _hook_capture = db.inner.begin_hook_capture();
-        let guard = db.inner.pool.connections.acquire().unwrap();
-        let src: String = guard
-            .conn()
-            .query_row("SELECT roomrs_src()", [], |row| row.get(0))
-            .unwrap();
-        assert!(!src.is_empty());
-        guard
-            .conn()
-            .execute("INSERT INTO items(id) VALUES (1)", [])
-            .unwrap();
-        drop(guard);
-        assert!(db.inner.take_hook_tables().contains("items"));
-    }
-
     /// 다른 Rust path가 같은 SQLite TABLE을 가리키면 schema 단계에서 거부한다.
     #[test]
     fn duplicate_entity_table_names_are_rejected() {
@@ -1634,13 +1415,11 @@ mod tests {
                     name: "items",
                     columns: &[],
                     ddl: &[],
-                    multi_instance: false,
                 },
                 TableMeta {
                     name: "ITEMS",
                     columns: &[],
                     ddl: &[],
-                    multi_instance: false,
                 },
             ],
         };

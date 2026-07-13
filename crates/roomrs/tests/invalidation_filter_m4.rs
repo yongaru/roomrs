@@ -150,3 +150,39 @@ fn filtered_watch_waits_for_commit_and_discards_rollback() {
             .is_none()
     );
 }
+
+/// UPSERT의 conflict UPDATE도 OLD/NEW 행으로 필터를 판정한다.
+#[test]
+fn filtered_watch_matches_upsert_conflict_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::builder()
+        .sqlite(dir.path().join("invalidation-filter-upsert.db"))
+        .build()
+        .unwrap();
+    let handle = db.run_sync();
+    handle
+        .execute(
+            "INSERT INTO store_prefs(id, data_path, profile_id, value) VALUES (10, 'other', 1, 'old')",
+            params![],
+        )
+        .unwrap();
+    let filter = InvalidationFilter::table("store_prefs")
+        .where_group(|group| group.eq("data_path", "aa.bb.dd"))
+        .build()
+        .unwrap();
+    let query: LiveQuery<i64> = handle.watch_scalar_filtered(
+        "SELECT count(*) FROM store_prefs WHERE data_path = 'aa.bb.dd'",
+        params![],
+        filter,
+    );
+    assert_eq!(next(&query), 0);
+
+    handle
+        .execute(
+            "INSERT INTO store_prefs(id, data_path, profile_id, value) VALUES (10, 'aa.bb.dd', 1, 'new') \
+             ON CONFLICT(id) DO UPDATE SET data_path = excluded.data_path, value = excluded.value",
+            params![],
+        )
+        .unwrap();
+    assert_eq!(next(&query), 1);
+}

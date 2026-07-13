@@ -13,7 +13,7 @@ authors.workspace = true
 roomrs-migrate = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
-rusqlite = { version = "0.38", features = ["hooks", "preupdate_hook"] }
+rusqlite = { version = "0.38", features = ["hooks"] }
 serde_json = { version = "1", optional = true }
 time = { version = "0.3", optional = true }
 uuid = { version = "1", optional = true }
@@ -26,10 +26,7 @@ default = []
 # SQLite 번들 빌드 (명세 §0 15) — cipher와 상호 배타(libsqlite3-sys가 강제)
 bundled = ["rusqlite/bundled"]
 # 라이브 쿼리/무효화 (명세 §9) — 런타임 SQL 테이블 추출에 sqlparser 사용
-live = ["dep:sqlparser"]
-# 교차 프로세스 무효화 (명세 §9.5) — 인스턴스 식별 함수 roomrs_src() 등록에
-# rusqlite functions 필요 (H-2)
-multi-instance = ["live", "rusqlite/functions"]
+live = ["dep:sqlparser", "rusqlite/preupdate_hook"]
 # LiveQuery::into_stream (명세 §5.6) — 파사드 async feature가 켠다
 stream = ["dep:futures-core"]
 # 타입 컨버터 — rusqlite ToSql/FromSql 위임 (명세 §11)

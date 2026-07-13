@@ -253,24 +253,6 @@ pub(crate) mod watch_impl {
         tables: Option<HashSet<String>>,
         run: impl Fn(&Connection, &str, &OwnedParams) -> Result<T> + Send + Sync + 'static,
     ) -> LiveQuery<T> {
-        // 미옵트인 구독 경고 (명세 §9.5) — 조용한 미알림 완화.
-        // 기존 query_logger 훅 경로는 유지하고 log 파사드에도 병행 방출한다 (L-5)
-        #[cfg(feature = "multi-instance")]
-        if let (Some(mi), Some(ts)) = (inner.mi.get(), &tables) {
-            for t in ts {
-                if !mi.tables.contains(t) {
-                    log::warn!(
-                        "table \"{t}\" is not multi_instance opt-in — \
-                         cross-process writes will not be observed (spec §9.5)"
-                    );
-                    inner.log_warn(&format!(
-                        "[roomrs 경고] 테이블 \"{t}\"은 multi_instance 옵트인이 아닙니다 — \
-                         교차 프로세스 write 알림을 받지 못합니다 (명세 §9.5)"
-                    ));
-                }
-            }
-        }
-
         let tracker = Arc::clone(&inner.tracker);
         match params {
             Ok(p) => LiveQuery::new(tracker, sql, p, tables, run),

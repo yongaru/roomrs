@@ -68,7 +68,6 @@ fn snap_of<E: Entity>(version: u32) -> roomrs::SchemaSnapshot {
             name: E::TABLE,
             columns: E::COLUMNS_META,
             ddl: E::DDL,
-            multi_instance: E::MULTI_INSTANCE,
         }],
     }
     .to_snapshot()

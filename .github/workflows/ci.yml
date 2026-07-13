@@ -26,8 +26,7 @@ jobs:
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # multi-instance 예제(multi_process)까지 컴파일 보장 — 로컬 게이트와 동일 조합 (M-26)
-      - run: cargo clippy --workspace --all-targets --features "tokio,multi-instance" -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features tokio -- -D warnings
       # 순수 동기 빌드 — SQLite는 번들 유지 (H-7).
       # --workspace 로 돌리면 feature 통합(unification) 함정에 걸린다: 멤버
       # examples/mobile-ffi 가 roomrs를 default feature로 의존해 default가
@@ -36,7 +35,7 @@ jobs:
       # 컴파일된다 (roomrs-core·macros·migrate는 의존성으로 함께 빌드됨).
       - run: cargo build -p roomrs --no-default-features --features bundled
       # cipher는 bundled와 상호 배타 — all-features 대신 명시 목록
-      - run: cargo build --workspace --features "tokio,multi-instance"
+      - run: cargo build --workspace --features tokio
 
   # 테스트 — 데스크톱 3 OS 매트릭스 (명세 §13)
   test:
@@ -51,7 +50,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - run: cargo test --workspace --features "tokio,multi-instance"
+      - run: cargo test --workspace --features tokio
       # 비-tokio 실행기 테스트(executor_smol · executor_futures · cancelled_future_is_safe)는
       # cfg(not(feature = "tokio")) — default features 조합에서만 컴파일된다 (H-12)
       - run: cargo test --workspace
@@ -120,4 +119,4 @@ jobs:
           toolchain: "1.85"
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
       # cipher는 bundled와 상호 배타 — all-features 대신 명시 목록
-      - run: cargo build --workspace --features "tokio,multi-instance"
+      - run: cargo build --workspace --features tokio

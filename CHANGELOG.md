@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-14
+
+### Added
+
+- 단일 프로세스 라이브 쿼리용 `InvalidationFilter`와 AND/OR 조건 그룹, `eq`, `neq`, `is_null`, `is_not_null` 조건을 추가했습니다.
+- `watch_scalar_filtered`가 SQLite `preupdate_hook`의 OLD/NEW 행을 이용해 관련 변경만 재조회합니다. commit 전 변경은 보류하고 rollback 변경은 버립니다.
+
+### Removed
+
+- `multi-instance` feature, `#[entity(multi_instance)]`, 멀티프로세스 trigger·변경 로그·poller와 관련 예제를 제거했습니다. 교차 프로세스 무효화는 향후 IPC 브로커 로드맵으로 보류합니다.
+
 ## [0.1.2] - 2026-07-14
 
 ### Added
@@ -43,7 +54,8 @@
 - bundled SQLite를 기본 제공하고 선택적 SQLCipher(`cipher`) 및 데스크톱·모바일 크로스 빌드를 지원합니다.
 - Rust 1.85와 Edition 2024를 지원하며 MIT OR Apache-2.0 듀얼 라이선스로 배포합니다.
 
-[Unreleased]: https://github.com/yongaru/roomrs/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/yongaru/roomrs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/yongaru/roomrs/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/yongaru/roomrs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/yongaru/roomrs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yongaru/roomrs/releases/tag/v0.1.0

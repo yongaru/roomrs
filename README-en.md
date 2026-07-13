@@ -16,7 +16,7 @@
 
 roomrs is a Rust library for working with local SQLite databases. If you have used Room on Android, it will feel immediately familiar — **entities are structs, DAOs are traits, SQL lives in macro strings**, and the macros generate the rest.
 
-Why build it? The Rust ecosystem has excellent general-purpose ORMs (diesel, SeaORM), but nothing that delivers the whole Room experience in one package: **live queries** (subscriptions that automatically re-notify when data changes), **multi-instance invalidation** (detecting writes from other processes), **compile-time SQL validation**, and a single codebase that covers desktop and mobile. roomrs fills that gap. It does not try to be a general-purpose ORM — the goal is to do **one thing well: SQLite-only local persistence**.
+Why build it? The Rust ecosystem has excellent general-purpose ORMs (diesel, SeaORM), but nothing that delivers the whole Room experience in one package: **live queries** (subscriptions that automatically re-notify when data changes), **compile-time SQL validation**, and a single codebase that covers desktop and mobile. roomrs fills that gap. It does not try to be a general-purpose ORM — the goal is to do **one thing well: SQLite-only local persistence**.
 
 A concept map for Room users:
 
@@ -29,7 +29,6 @@ A concept map for Room users:
 | `@Relation` / `@Embedded` | `#[relation]` / `#[embedded]` (parent marker for relation views — flattening entity columns is not supported yet, planned for v1.x) |
 | `@TypeConverter` | rusqlite `ToSql`/`FromSql` delegation + `#[json]` |
 | `Flow<List<T>>` | `LiveQuery<Vec<T>>` |
-| `enableMultiInstanceInvalidation()` | `#[entity(multi_instance)]` + builder switch |
 | `Migration(1, 2) { execSQL(...) }` | `Migration::sql(1, 2, "...")` |
 | `fallbackToDestructiveMigration()` | `.fallback_to_destructive_migration(true)` |
 | `suspend fun` | `async fn` on `db.run_async()` |
@@ -41,7 +40,7 @@ A concept map for Room users:
 
 - **Predictable SQLite concurrency — a unified read/write pool.** All N general-purpose connections can read and write, and a checkout guard gives one operation exclusive use of one connection. WAL and `busy_timeout` coordinate lock contention within and across processes; `SQLITE_BUSY` can still be returned when the timeout expires.
 - **Live queries.** A query that returns `LiveQuery<T>` automatically re-runs and emits fresh results whenever a dependent table changes. Both synchronous consumption (`recv`/`iter`/`subscribe` callbacks) and asynchronous consumption (`Stream`) are supported.
-- **Multi-instance invalidation.** Writes made by *other processes* to the same database file are detected and delivered to your live queries. Because it carries trigger and log-table overhead, it is opt-in per table.
+- **Row-filtered invalidation.** `InvalidationFilter` compares preupdate-hook OLD/NEW rows so unrelated changes do not re-query a subscription. It observes roomrs connections in one process only.
 - **Compile-time SQL validation.** The SQL inside `#[query("...")]` is checked against a committed schema snapshot. Referencing a table or column that does not exist is a compile error. Parameter consistency (`:name` ↔ arguments) is also verified at compile time.
 - **Versioned schema snapshots + binary-embedded auto-migration.** Each schema version is committed as a `[db_name].[version].json` file, and all versions are compressed and embedded into your binary. With `.auto_migrate(true)`, version gaps with no registered migration step are filled automatically from the embedded snapshot diff — but only with **safe operations** (CREATE TABLE, nullable ADD COLUMN, CREATE INDEX, RENAME COLUMN from a valid rename hint). Destructive changes are never executed automatically; you get a clear error instead.
 - **Runtime-agnostic async.** The async API returns plain std `Future`s (`+ Send`), so you can await them on tokio, async-std, smol, or `futures::executor` alike. The tokio-optimized integration is an optional feature.
@@ -144,6 +143,8 @@ The full set of examples lives in [crates/roomrs/examples/](crates/roomrs/exampl
 ### Live queries
 
 Declare a return type of `LiveQuery<T>` and that query becomes a "subscription". You receive the current value immediately, and a re-queried result every time a dependent table is written to.
+
+For direct SQL subscriptions, `InvalidationFilter` limits re-queries to relevant row changes. Predicates inside a group are ANDed and groups are ORed. Complex SQL conditions are not inferred automatically; use table-level subscriptions when the filter cannot express the condition.
 
 ```rust
 use roomrs::LiveQuery;
@@ -265,30 +266,9 @@ Automatic execution is limited to **safe operations** (CREATE TABLE, nullable AD
 .fallback_to_destructive_migration(true) // drop + recreate when the chain is insufficient — data loss!
 ```
 
-### Multi-instance invalidation
+### Multi-process invalidation
 
-Detect writes from other processes through your live queries. Because triggers log every write, it is **opt-in per table**. Requires the `multi-instance` feature.
-
-```rust
-#[entity(table = "events", multi_instance)] // cross-process tracking for this table only
-#[derive(Debug, Clone)]
-struct Event {
-    #[pk(autoincrement)]
-    id: i64,
-    tag: String,
-}
-
-let db = Db::builder()
-    .sqlite("shared.db")
-    .enable_multi_instance_invalidation(true)
-    .mi_poll_interval(std::time::Duration::from_millis(250)) // polling interval (default 250ms)
-    .build()?;
-
-// Now when another process writes to `events`, this process's LiveQuery receives an emit
-let live = db.run_sync().event_dao().watch_count();
-```
-
-Your own process's writes are deduplicated via an instance identifier so you never get double notifications; one limitation is that writes from external writers that bypass roomrs carry no identifier and cannot be distinguished. A working two-process demo: `cargo run --example multi_process --features multi-instance`.
+This is not currently supported. The SQLite trigger, change-log, and polling design has been removed. A future IPC broker will forward post-commit events from roomrs connections to Trackers in other processes. Raw SQLite writers are not observable until they participate in that IPC protocol.
 
 ### Type converters
 
@@ -319,7 +299,6 @@ struct Profile {
 | `query_builder` | Dynamic condition building · schema validation · sync/async handle symmetry |
 | `live_query` | `LiveQuery` subscription callback + tracing log bridge |
 | `pagination` | Page moves via `rebind` + automatic refresh on writes |
-| `multi_process` | Detecting writes from a separate process (`--features multi-instance`) |
 | `bench` | Simple throughput measurement (`--release`) |
 
 For the mobile FFI pattern (cdylib, `extern "C"`) and its stable negative error-code contract, see [examples/mobile-ffi/](examples/mobile-ffi/).
@@ -334,20 +313,19 @@ For the mobile FFI pattern (cdylib, `extern "C"`) and its stable negative error-
 | `async` | on | Runtime-agnostic async facade. Turn off for pure sync |
 | `tokio` | off | tokio-optimized integration (implies `async`) — falls back to the built-in worker pool outside a tokio runtime |
 | `live` | on | Live queries / invalidation |
-| `multi-instance` | off | Cross-process invalidation (implies `live`) — used together with per-entity opt-in |
 | `time`, `uuid`, `json` | on | Type converters |
 | `cipher` | off | SQLCipher encryption |
 
 A minimal pure-sync build:
 
 ```toml
-roomrs = { version = "0.1.0", default-features = false, features = ["bundled"] }
+roomrs = { version = "0.2", default-features = false, features = ["bundled"] }
 ```
 
 > **`bundled` and `cipher` are mutually exclusive** (enforced by libsqlite3-sys). To use SQLCipher, disable default features and list `cipher` plus whatever else you need:
 >
 > ```toml
-> roomrs = { version = "0.1.0", default-features = false, features = ["cipher", "async", "live", "time", "uuid", "json"] }
+> roomrs = { version = "0.2", default-features = false, features = ["cipher", "async", "live", "time", "uuid", "json"] }
 > ```
 
 ---
@@ -389,7 +367,7 @@ roomrs/
 
 Dependencies flow in one direction only: `roomrs → {core, async, macros}`, `macros → migrate`, `async → core`, `core → migrate`. The snapshot model (`roomrs-migrate`) is shared between the macros (compile time) and the runtime, which is what lets compile-time validation and runtime staleness detection operate on the same types.
 
-The heart of the concurrency model is a unified read/write mini pool of **N general-purpose connections**. Every general-purpose connection can read and write, and a checkout guard gives one operation exclusive use of one connection. `query` and `execute` differ by whether the caller consumes result rows, not by connection permissions, so `INSERT ... RETURNING`, CTEs, and writable PRAGMAs run without SQL routing. A transaction keeps the same checked-out connection and starts with `BEGIN IMMEDIATE`. WAL and `busy_timeout` coordinate lock contention. The primary invalidation path is statement-based (determine the target tables of each executed SQL statement → emit after a successful commit), with update_hook installed on every general-purpose connection as a secondary path that catches indirect writes from triggers.
+The heart of the concurrency model is a unified read/write mini pool of **N general-purpose connections**. Every general-purpose connection can read and write, and a checkout guard gives one operation exclusive use of one connection. `query` and `execute` differ by whether the caller consumes result rows, not by connection permissions, so `INSERT ... RETURNING`, CTEs, and writable PRAGMAs run without SQL routing. A transaction keeps the same checked-out connection and starts with `BEGIN IMMEDIATE`. WAL and `busy_timeout` coordinate lock contention. The primary invalidation path is statement-based (determine the target tables of each executed SQL statement → emit after a successful commit), with `preupdate_hook` installed on every general-purpose connection as a secondary path for indirect trigger writes and row-filter matching.
 
 ---
 
@@ -461,9 +439,9 @@ cargo test --workspace
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --features "tokio,multi-instance" -- -D warnings
+cargo clippy --workspace --all-targets --features tokio -- -D warnings
 cargo test --workspace
-cargo test --workspace --features "tokio,multi-instance"
+cargo test --workspace --features tokio
 ```
 
 ### Conventions

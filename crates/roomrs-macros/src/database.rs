@@ -313,7 +313,6 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                         name: <#entities as ::roomrs::Entity>::TABLE,
                         columns: <#entities as ::roomrs::Entity>::COLUMNS_META,
                         ddl: <#entities as ::roomrs::Entity>::DDL,
-                        multi_instance: <#entities as ::roomrs::Entity>::MULTI_INSTANCE,
                     },)*
                 ];
                 ::roomrs::SchemaDef { version: #version, ddl, tables }

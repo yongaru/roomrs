@@ -39,8 +39,6 @@ pub trait Entity: FromRow {
     const COLUMNS: &'static str;
     /// 컬럼 메타 — 스냅샷 생성·해시 대조용 (명세 §7)
     const COLUMNS_META: &'static [crate::database::ColumnMeta];
-    /// 교차 프로세스 무효화 옵트인 (명세 §9.5) — 기본 off
-    const MULTI_INSTANCE: bool = false;
 }
 
 /// INSERT 지원 메타. `#[entity]` 생성물 (명세 §12c — autoincrement PK 항상 생략).

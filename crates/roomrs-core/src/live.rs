@@ -1,6 +1,6 @@
 //! 라이브 쿼리 엔진 (명세 §5.6, §9) — feature `live`
 //!
-//! 주 경로: 문장 기반 무효화(commit 성공 후 방출) · 보조: update_hook 합집합.
+//! 주 경로: 문장 기반 무효화(commit 성공 후 방출) · 보조: preupdate_hook 행 매칭.
 //! 노티파이어 스레드가 디바운스·재조회·팬아웃을 담당한다.
 //! 재조회·콜백은 레지스트리/콜백 락 밖에서 실행된다 — 콜백 내 재진입(구독 생성·해지) 허용.
 
@@ -272,7 +272,7 @@ pub(crate) fn extract_tables(sql: &str) -> Option<HashSet<String>> {
                 from.iter().all(|t| table_factor(&t.relation, &mut out))
             }
             Statement::Pragma { .. } => true, // PRAGMA — 테이블 영향 없음
-            // DDL(CREATE/ALTER/DROP 등)·기타 문장 — update_hook도 발화하지 않으므로
+            // DDL(CREATE/ALTER/DROP 등)·기타 문장 — preupdate_hook도 발화하지 않으므로
             // 테이블 추출 실패로 처리해 보수적 전체 무효화를 유도한다 (M-3)
             _ => false,
         };
@@ -382,7 +382,7 @@ pub(crate) fn extract_write_tables(sql: &str) -> WriteTables {
                     return WriteTables::Unknown;
                 }
             }
-            // DDL 등 — update_hook 미발화 가능, 보수적 전체 무효화 (M-3)
+            // DDL 등 — preupdate_hook 미발화 가능, 보수적 전체 무효화 (M-3)
             _ => return WriteTables::Unknown,
         }
     }
