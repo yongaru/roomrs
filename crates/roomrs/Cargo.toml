@@ -10,7 +10,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-
 [dependencies]
 roomrs-core = { workspace = true }
 roomrs-macros = { workspace = true }
@@ -40,8 +39,6 @@ async = ["dep:roomrs-async", "roomrs-core/stream"]
 tokio = ["async", "roomrs-async/tokio"]
 # 라이브 쿼리 / 무효화 (명세 §9)
 live = ["roomrs-core/live", "roomrs-async?/live"]
-# 교차 프로세스 무효화 (live 필요)
-multi-instance = ["live", "roomrs-core/multi-instance"]
 # 타입 컨버터 (명세 §11 — rusqlite 위임)
 time = ["roomrs-core/time"]
 uuid = ["roomrs-core/uuid"]
@@ -61,7 +58,3 @@ required-features = ["live"]
 [[example]]
 name = "pagination"
 required-features = ["live"]
-
-[[example]]
-name = "multi_process"
-required-features = ["multi-instance"]

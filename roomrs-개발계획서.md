@@ -1,10 +1,10 @@
-# roomrs — 0.1.0 기능 명세 (Agent Spec) · **SQLite 전용 · 동기+비동기**
+# roomrs — 0.2.0 기능 명세 (Agent Spec) · **SQLite 전용 · 동기+비동기**
 
 > Android **Room** 과 동일한 개발 경험을 목표로 하는 Rust용 **로컬 SQLite 퍼시스턴스** 라이브러리.
 > 백엔드: **SQLite(번들 최신) 전용 — 다른 DB 지원 없음**. API: **동기 1급 + 비동기(런타임 무관 std Future + tokio 통합)**. 기반: **rusqlite** 동기 코어 + **자체 통합 미니 풀(N)**.
 >
 > 본 문서는 **에이전트/구현자 실행용 명세**다. 사람용 개요는 `README.md` 참조.
-> 제품 버전: **0.1.0**.
+> 제품 버전: **0.2.0**.
 >
 > **범위 확정**: roomrs는 **SQLite만** 지원한다. 다른 DB 백엔드는 지원하지 않으며 계획에도 없다.
 >
@@ -26,7 +26,7 @@
 | 3b | 직접 쿼리 | **DAO/엔티티 없이 raw 쿼리 1급** (execute/단건/Option/스칼라/Vec + 라이브) | §5.7 |
 | 4 | SQL 검증 | **하이브리드**: 정적=**커밋된 스키마 스냅샷 파일 대조**, 동적=런타임(prepare) | 메커니즘 §7. 파서 실패=스킵+경고, `unchecked` 해치 |
 | 5 | 라이브 쿼리 | **핵심 필수** — 단일 구체 타입 `LiveQuery<T>` | 주 경로=문장 기반 무효화, 보조=`preupdate_hook` 행 필터(§9.2) |
-| 5b | 멀티 인스턴스 무효화 | **테이블별 옵트인** `#[entity(multi_instance)]` (feature `multi-instance`) | 교차 프로세스 write 알림(§9.5) |
+| 5b | 멀티 프로세스 무효화 | **현재 미지원**, IPC 브로커를 후속 로드맵으로 보류 | 단일 프로세스 `preupdate_hook` 필터만 제공(§9.5) |
 | 5c | 알림 콜백 모델 | **recv + subscribe 콜백 + Iterator / Stream** — 동기·비동기 핸들 양쪽 | 전용 노티파이어 스레드(§9.6) |
 | 6 | 마이그레이션 | **자동 + 반자동(직접 SQL) + 수동 코드** 3경로 | diff 초안 · `Migration::sql` · trait(§8) |
 | 6b | 마이그레이션 보조 | **rename 힌트**(`renamed_from`) + **`fallback_to_destructive_migration`**(옵트인) | |
@@ -109,7 +109,6 @@
 | `@TypeConverter` | `impl SqlType` / `#[json]` | |
 | `@Relation`, `@Embedded` | `#[relation]`, `#[embedded]` | |
 | `Flow<List<T>>` | `LiveQuery<Vec<T>>` (단일 구체 타입) | §5.6 |
-| `enableMultiInstanceInvalidation()` | `#[entity(multi_instance)]` + builder 스위치 | 테이블별 옵트인(§9.5) |
 | `Migration(1,2){execSQL}` | `Migration::sql(1,2,"…")` / SQL 파일 | §8.2 |
 | `@RenameColumn/@RenameTable` | `renamed_from = "…"` | §8.3 |
 | `fallbackToDestructiveMigration()` | `.fallback_to_destructive_migration(true)` | 기본 off |
@@ -150,7 +149,7 @@ roomrs/
 └─ xtask/
 ```
 - `roomrs-migrate`의 스냅샷 모델은 **매크로(컴파일 타임)와 런타임이 공유**한다 — §7의 스냅샷 대조가 이 공유 타입 위에서 동작.
-- SQL/DDL 렌더·update_hook·멀티인스턴스 소스는 roomrs-core에 통합.
+- SQL/DDL 렌더·preupdate_hook 소스는 roomrs-core에 통합.
 - 파사드 예외(결정 로그 외 명기): `roomrs` 크레이트는 재수출 전용이되, **feature 스위치 매크로 `__if_async!` 1종만 예외**로 정의한다(자기 feature 상태로 생성 코드를 분기해야 하므로 파사드에만 둘 수 있음).
 
 ---
@@ -175,7 +174,7 @@ roomrs/
 ┌──────▼────────────────────────────▼──────────┐
 │ 자체 통합 미니 풀: 커넥션 N                    │
 │   전부 read/write 가능 · checkout 독점         │
-│   전부 update_hook · MI 함수 설치              │
+│   전부 preupdate_hook 설치                     │
 └──────┬────────────────────────────────────────┘
    rusqlite → libsqlite3-sys (bundled 최신 / bundled-sqlcipher)
 ```
@@ -257,7 +256,6 @@ let db = AppDb::builder()
     .connections(4)                       // 통합 풀 크기
     .busy_timeout(Duration::from_secs(5)) // 프로세스 내·외부 writer 경합 대기
     .queue_timeout(Duration::from_secs(2)) // 통합 풀 checkout 제한
-    .enable_multi_instance_invalidation(true)   // feature `multi-instance` + 옵트인 엔티티만(§9.5)
     .migrate(MigrationPolicy::Auto)
     .on_create(|conn| Ok(()))             // 최초 생성 1회
     .on_open(|conn| Ok(()))               // 오픈 시마다
@@ -486,18 +484,9 @@ pub trait Migration {
 ### 9.4 백프레셔/정합성
 (동일 — 최신값 우선, 최종 일관성 명시.)
 
-### 9.5 멀티 인스턴스(교차 프로세스) 무효화 — **테이블별 옵트인**
+### 9.5 멀티 프로세스 무효화 — 로드맵
 
-```rust
-#[entity(table = "orders", multi_instance)]   // 이 테이블만 교차 프로세스 추적
-struct Order { … }
-// + builder: .enable_multi_instance_invalidation(true)  (feature `multi-instance`)
-```
-- **옵트인인 이유(비용 정직 공개)**: 트리거는 FOR EACH ROW라 1만 행 bulk insert에 로그 UPDATE 1만 회가 추가되고, DELETE 트리거 존재만으로 truncate 최적화가 꺼지며, 모든 write 트랜잭션이 로그 테이블 페이지를 건드려 경합 지점이 하나 는다. 필요한 테이블에만 지불하라.
-- **미표시 테이블**: 교차 프로세스 알림 없음(인-프로세스는 §9.2로 항상 동작). 구독 시 "이 테이블은 multi_instance 아님" **런타임 경고 1회** 로그로 조용한 미알림 완화.
-- **트리거 버전 태깅**: 트리거 이름에 스키마 버전 포함(`__roomrs_inv_v3_orders_i` 등) — 구버전 라이브러리·외부 도구와의 스큐 감지, 마이그레이션이 구버전 트리거 정리. 외부 도구가 테이블을 drop/recreate하면 트리거가 소실됨 — `Validate` 정책이 트리거 존재도 검사.
-- **이중 통지 dedupe**: 로그 테이블의 **인스턴스 식별자(`src`) 컬럼**을 커넥션별 `roomrs_src()` 함수로 채운다. 폴러는 전 행의 `last_seen`을 전진시키되 `src != 자기 id`만 방출한다. roomrs를 거치지 않는 외부 writer는 src가 없어 식별할 수 없다.
-- 감지는 현재 변경 로그 **폴링** 방식이다. 파일 워처·하이브리드 감지와 Room IPC 브로커는 후속 옵션이다.
+현재는 지원하지 않는다. SQLite trigger·변경 로그·폴러는 write 경로의 영구 부하와 스키마 잔재를 만들므로 제거한다. 후속 IPC 브로커는 roomrs 커넥션의 commit 성공 뒤 테이블/행 변경 이벤트를 프로세스 간 전파하고, 수신 프로세스의 Tracker에 전달한다. roomrs 밖의 raw SQLite writer는 IPC 참여 전까지 감지 대상이 아니다.
 
 ### 9.6 노티파이어 스레드
 (동일 — DB당 1개, 수신→디바운스→재조회→sync 채널/콜백 + 런타임 중립 async 채널 팬아웃. **재조회 전용 커넥션 1개 고정**(일반 풀과 경합 없음). rebind 재조회도 이 스레드로 라우팅[C-8].)
@@ -510,7 +499,7 @@ struct Order { … }
 - **독점 checkout**: guard 하나가 커넥션 하나를 소유해 한 시점에 한 작업만 사용한다. 풀 공유는 같은 `Connection`의 동시 접근을 뜻하지 않는다. FIFO 티켓 + 큐 타임아웃 + 공정성을 적용하고, 사용 가능한 커넥션이 없으면 반납까지 기다린다.
 - **트랜잭션**: checkout한 같은 커넥션을 commit/rollback까지 고정하고 **`BEGIN IMMEDIATE`** 로 시작한다.
 - 공통 PRAGMA: `journal_mode=WAL`, `foreign_keys=ON`, `synchronous=NORMAL`, 설정된 `busy_timeout`. 여러 프로세스는 각자 풀을 열며 `busy_timeout` 만료 뒤 `SQLITE_BUSY`가 반환될 수 있다.
-- 모든 일반 커넥션 오픈·재오픈 시 암호화 키·공통 PRAGMA·`on_open`·MI 함수·live update_hook을 동일하게 설치한다. 반납 복구(열린 트랜잭션 rollback 등)가 실패한 커넥션은 즉시 폐기하고 동일 factory로 **1회** 재오픈한다. 재오픈도 실패하면 풀을 fatal 상태로 닫고 이후 checkout에 명시 오류를 반환한다.
+- 모든 일반 커넥션 오픈·재오픈 시 암호화 키·공통 PRAGMA·`on_open`·live preupdate_hook을 동일하게 설치한다. 반납 복구(열린 트랜잭션 rollback 등)가 실패한 커넥션은 즉시 폐기하고 동일 factory로 **1회** 재오픈한다. 재오픈도 실패하면 풀을 fatal 상태로 닫고 이후 checkout에 명시 오류를 반환한다.
 - 탈출구: `db.run_sync().with_connection(|c| …)`. 해당 커넥션의 hook 교체 경고는 §9.2. **주의: 클로저 안에서 같은 DB 를 재획득(중첩 checkout)하지 말 것 — 풀 교착 위험.**
 
 ## 11. 타입 컨버터
@@ -529,12 +518,10 @@ struct Order { … }
 | `async` | on | 런타임 무관 비동기 파사드. 끄면 순수 동기 |
 | `tokio` | off | tokio 통합 최적화(`async` 포함) |
 | `live` | on | 라이브 쿼리/무효화 |
-| `multi-instance` | off | 교차 프로세스 무효화(+ 엔티티별 옵트인 §9.5) |
 | `time`, `uuid` | **on** | 기본 예시가 기본 설정에서 컴파일되도록 승격[C-4] |
 | `json` | on | `#[json]` |
 | `cipher` | off | SQLCipher |
 
-- 부록/본문 예시 중 `multi-instance` 등 비기본 feature 필요 코드는 주석으로 명시[C-5].
 
 ## 15. 0.1.0 기능 범위
 
@@ -589,7 +576,6 @@ struct Db;
 
 fn main() -> roomrs::Result<()> {
     let db = Db::builder().sqlite("todo.db")
-        // .enable_multi_instance_invalidation(true)   // feature "multi-instance" + #[entity(multi_instance)] 필요
         .migrate(MigrationPolicy::Auto).build()?;
     let id = db.run_sync().todo_dao().add(&Todo{ id: 0 /*무시됨*/, title: "spec".into(), done: false })?;
     for t in db.run_sync().todo_dao().by_done(false)? { println!("- {}", t.title); }

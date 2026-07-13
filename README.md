@@ -16,7 +16,7 @@
 
 roomrs는 로컬 SQLite 데이터베이스를 다루는 Rust 라이브러리입니다. Android에서 Room을 써 본 분이라면 바로 익숙할 방식 그대로 — **엔티티는 구조체, DAO는 trait, SQL은 매크로 문자열**로 선언하면 나머지는 매크로가 생성합니다.
 
-왜 만들었을까요? Rust 생태계에는 훌륭한 범용 ORM(diesel, SeaORM)이 있지만, Room이 제공하던 것들 — **라이브 쿼리**(데이터가 바뀌면 자동으로 다시 알려주는 구독), **멀티 인스턴스 무효화**(다른 프로세스의 write까지 감지), **컴파일 타임 SQL 검증**, 그리고 데스크톱·모바일을 하나의 코드로 커버하는 로컬 퍼시스턴스 경험 — 을 한 번에 주는 라이브러리는 없었습니다. roomrs는 그 빈자리를 채웁니다. 범용 ORM이 되려 하지 않고, **SQLite 전용 로컬 퍼시스턴스 한 가지를 제대로** 하는 것이 목표입니다.
+왜 만들었을까요? Rust 생태계에는 훌륭한 범용 ORM(diesel, SeaORM)이 있지만, Room이 제공하던 것들 — **라이브 쿼리**(데이터가 바뀌면 자동으로 다시 알려주는 구독), **컴파일 타임 SQL 검증**, 그리고 데스크톱·모바일을 하나의 코드로 커버하는 로컬 퍼시스턴스 경험 — 을 한 번에 주는 라이브러리는 없었습니다. roomrs는 그 빈자리를 채웁니다. 범용 ORM이 되려 하지 않고, **SQLite 전용 로컬 퍼시스턴스 한 가지를 제대로** 하는 것이 목표입니다.
 
 Room 사용자를 위한 개념 대응표:
 
@@ -29,7 +29,6 @@ Room 사용자를 위한 개념 대응표:
 | `@Relation` / `@Embedded` | `#[relation]` / `#[embedded]`(관계 뷰의 부모 마커 — 엔티티 컬럼 평탄화는 아직 지원하지 않으며 v1.x에서 예정) |
 | `@TypeConverter` | rusqlite `ToSql`/`FromSql` 위임 + `#[json]` |
 | `Flow<List<T>>` | `LiveQuery<Vec<T>>` |
-| `enableMultiInstanceInvalidation()` | `#[entity(multi_instance)]` + 빌더 스위치 |
 | `Migration(1, 2) { execSQL(...) }` | `Migration::sql(1, 2, "...")` |
 | `fallbackToDestructiveMigration()` | `.fallback_to_destructive_migration(true)` |
 | `suspend fun` | `db.run_async()`의 `async fn` |
@@ -41,7 +40,7 @@ Room 사용자를 위한 개념 대응표:
 
 - **예측 가능한 SQLite 동시성 — 통합 read/write 풀.** 일반 커넥션 N개는 모두 읽기와 쓰기가 가능하며, checkout guard가 커넥션 하나를 작업 동안 독점합니다. WAL과 `busy_timeout`이 프로세스 안팎의 잠금 경합을 조정하며, 제한 시간이 지나면 `SQLITE_BUSY`가 반환될 수 있습니다.
 - **라이브 쿼리.** `LiveQuery<T>`를 반환하는 쿼리는 의존 테이블이 바뀔 때마다 자동으로 재조회 결과를 보내 줍니다. 동기(`recv`/`iter`/`subscribe` 콜백)와 비동기(`Stream`) 소비를 모두 지원합니다.
-- **멀티 인스턴스 무효화.** 다른 프로세스가 같은 DB 파일에 쓴 것까지 감지해서 라이브 쿼리에 알려 줍니다. 트리거·로그 테이블 비용이 있으므로 테이블별 옵트인입니다.
+- **행 필터 무효화.** `InvalidationFilter`가 `preupdate_hook`의 OLD/NEW 행을 확인해 관계없는 변경의 재조회를 막습니다. 단일 프로세스 roomrs 커넥션만 관찰합니다.
 - **컴파일 타임 SQL 검증.** `#[query("...")]`의 SQL을 커밋된 스키마 스냅샷과 대조합니다. 존재하지 않는 테이블·컬럼을 참조하면 컴파일 에러가 납니다. 파라미터(`:name` ↔ 인자) 정합성도 컴파일 타임에 확인합니다.
 - **버전별 스키마 스냅샷 + 바이너리 내장 자동 마이그레이션.** 스키마의 각 버전이 `[db이름].[버전].json` 파일로 커밋되고, 전 버전이 압축되어 바이너리에 내장됩니다. `.auto_migrate(true)`를 켜면 마이그레이션 스텝을 등록하지 않은 구간을 내장 스냅샷 diff의 **안전 연산**(CREATE TABLE, nullable ADD COLUMN, CREATE INDEX, 유효한 rename 힌트의 RENAME COLUMN)으로 자동 실행합니다. 파괴적 변경은 절대 자동 실행하지 않고 명확한 에러로 안내합니다.
 - **런타임 무관 비동기.** 비동기 API는 순수 std `Future`(+`Send`)를 반환하므로 tokio, async-std, smol, `futures::executor` 어디서든 그대로 await할 수 있습니다. tokio 최적화 통합은 선택 feature입니다.
@@ -144,6 +143,8 @@ fn main() -> roomrs::Result<()> {
 ### 라이브 쿼리
 
 반환 타입을 `LiveQuery<T>`로 선언하면 그 쿼리는 "구독"이 됩니다. 구독 즉시 현재 값이 한 번 오고, 이후 의존 테이블에 write가 일어날 때마다 재조회 결과가 옵니다.
+
+직접 SQL 구독은 `InvalidationFilter`로 조건과 관련 있는 행 변경만 재조회할 수 있습니다. 그룹 안 조건은 AND, 그룹 사이는 OR입니다. 복잡한 SQL 조건을 자동 분석하지 않으므로, 필터로 표현하기 어려우면 테이블 단위 구독을 사용하세요.
 
 ```rust
 use roomrs::LiveQuery;
@@ -265,30 +266,9 @@ let db = AppDb::builder()
 .fallback_to_destructive_migration(true) // 체인 불충분 시 전체 drop + 재생성 — 데이터 소실 주의
 ```
 
-### 멀티 인스턴스 무효화
+### 멀티 프로세스 무효화
 
-다른 프로세스의 write까지 라이브 쿼리로 감지합니다. 트리거가 write마다 로그를 남기는 비용이 있으므로 **테이블별 옵트인**입니다. feature `multi-instance`가 필요합니다.
-
-```rust
-#[entity(table = "events", multi_instance)] // 이 테이블만 교차 프로세스 추적
-#[derive(Debug, Clone)]
-struct Event {
-    #[pk(autoincrement)]
-    id: i64,
-    tag: String,
-}
-
-let db = Db::builder()
-    .sqlite("shared.db")
-    .enable_multi_instance_invalidation(true)
-    .mi_poll_interval(std::time::Duration::from_millis(250)) // 폴링 주기 (기본 250ms)
-    .build()?;
-
-// 이제 다른 프로세스가 events에 write하면 이 프로세스의 LiveQuery가 emit을 받는다
-let live = db.run_sync().event_dao().watch_count();
-```
-
-자기 프로세스의 write가 이중 통지되지 않도록 인스턴스 식별자로 dedupe하며, roomrs를 거치지 않는 외부 writer의 write는 식별자가 없어 구분할 수 없다는 제약이 있습니다. 동작하는 2-프로세스 데모는 `cargo run --example multi_process --features multi-instance`로 확인할 수 있습니다.
+현재 지원하지 않습니다. 기존 SQLite trigger·변경 로그·폴러 방식은 제거했습니다. 향후 IPC 브로커가 roomrs 커넥션의 commit 이후 이벤트를 다른 프로세스의 Tracker로 전달할 예정입니다. raw SQLite writer는 IPC 참여 전까지 감지하지 않습니다.
 
 ### 타입 컨버터
 
@@ -319,7 +299,6 @@ struct Profile {
 | `query_builder` | 동적 조건 조립 · 스키마 검증 · 동기/비동기 핸들 대칭 |
 | `live_query` | `LiveQuery` 구독 콜백 + tracing 로그 브리지 |
 | `pagination` | `rebind` 페이지 이동 + write 자동 갱신 |
-| `multi_process` | 별도 프로세스 write 감지 (`--features multi-instance`) |
 | `bench` | 간이 처리량 측정 (`--release`) |
 
 모바일 FFI(cdylib, `extern "C"`) 패턴과 안정적인 음수 에러 코드 규약은 [examples/mobile-ffi/](examples/mobile-ffi/)를 참고하세요.
@@ -334,20 +313,19 @@ struct Profile {
 | `async` | on | 런타임 무관 비동기 파사드. 끄면 순수 동기 |
 | `tokio` | off | tokio 통합 최적화(`async` 포함) — tokio 런타임 밖에서는 자체 워커 풀로 폴백 |
 | `live` | on | 라이브 쿼리 / 무효화 |
-| `multi-instance` | off | 교차 프로세스 무효화(`live` 포함) — 엔티티별 옵트인과 함께 사용 |
 | `time`, `uuid`, `json` | on | 타입 컨버터 |
 | `cipher` | off | SQLCipher 암호화 |
 
 순수 동기 최소 빌드:
 
 ```toml
-roomrs = { version = "0.1.0", default-features = false, features = ["bundled"] }
+roomrs = { version = "0.2", default-features = false, features = ["bundled"] }
 ```
 
 > **`bundled`와 `cipher`는 상호 배타입니다** (libsqlite3-sys가 강제). SQLCipher를 쓰려면 기본 feature를 끄고 `cipher`와 필요한 feature를 명시하세요:
 >
 > ```toml
-> roomrs = { version = "0.1.0", default-features = false, features = ["cipher", "async", "live", "time", "uuid", "json"] }
+> roomrs = { version = "0.2", default-features = false, features = ["cipher", "async", "live", "time", "uuid", "json"] }
 > ```
 
 ---
@@ -389,7 +367,7 @@ roomrs/
 
 의존 방향은 한쪽으로만 흐릅니다: `roomrs → {core, async, macros}`, `macros → migrate`, `async → core`, `core → migrate`. 스냅샷 모델(`roomrs-migrate`)을 매크로(컴파일 타임)와 런타임이 공유하기 때문에 컴파일 타임 검증과 런타임 스테일 감지가 같은 타입 위에서 동작합니다.
 
-동시성의 핵심은 **일반 커넥션 N개로 구성된 통합 read/write 미니 풀**입니다. 모든 일반 커넥션에서 읽기와 쓰기가 가능하고, checkout guard가 한 커넥션을 한 작업에 독점 대여합니다. `query`와 `execute`는 읽기·쓰기 권한이 아니라 결과 행을 소비하는지 여부로 구분하므로 `INSERT ... RETURNING`, CTE, 쓰기 PRAGMA도 SQL 라우팅 없이 실행됩니다. 트랜잭션은 checkout한 같은 커넥션을 유지하며 `BEGIN IMMEDIATE`로 시작합니다. WAL과 `busy_timeout`이 잠금 경합을 조정합니다. 무효화의 주 경로는 문장 기반(실행 SQL의 대상 테이블 확정 → commit 성공 후 방출)이고, 모든 일반 커넥션에 설치된 update_hook은 트리거 간접 write를 잡는 보조 경로입니다.
+동시성의 핵심은 **일반 커넥션 N개로 구성된 통합 read/write 미니 풀**입니다. 모든 일반 커넥션에서 읽기와 쓰기가 가능하고, checkout guard가 한 커넥션을 한 작업에 독점 대여합니다. `query`와 `execute`는 읽기·쓰기 권한이 아니라 결과 행을 소비하는지 여부로 구분하므로 `INSERT ... RETURNING`, CTE, 쓰기 PRAGMA도 SQL 라우팅 없이 실행됩니다. 트랜잭션은 checkout한 같은 커넥션을 유지하며 `BEGIN IMMEDIATE`로 시작합니다. WAL과 `busy_timeout`이 잠금 경합을 조정합니다. 무효화의 주 경로는 문장 기반(실행 SQL의 대상 테이블 확정 → commit 성공 후 방출)이고, 모든 일반 커넥션에 설치된 `preupdate_hook`은 트리거 간접 write와 행 필터 매칭을 처리하는 보조 경로입니다.
 
 ---
 
@@ -461,9 +439,9 @@ cargo test --workspace
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --features "tokio,multi-instance" -- -D warnings
+cargo clippy --workspace --all-targets --features tokio -- -D warnings
 cargo test --workspace
-cargo test --workspace --features "tokio,multi-instance"
+cargo test --workspace --features tokio
 ```
 
 ### 컨벤션

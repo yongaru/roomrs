@@ -30,15 +30,11 @@ struct Column {
 /// 엔티티 수준 속성 인자
 struct EntityArgs {
     table: Option<String>,
-    multi_instance: bool,
 }
 
 /// `#[entity(...)]` 인자 파싱
 fn parse_args(args: TokenStream) -> syn::Result<EntityArgs> {
-    let mut out = EntityArgs {
-        table: None,
-        multi_instance: false,
-    };
+    let mut out = EntityArgs { table: None };
     if args.is_empty() {
         return Ok(out);
     }
@@ -48,11 +44,8 @@ fn parse_args(args: TokenStream) -> syn::Result<EntityArgs> {
             validate_sql_identifier(&lit.value(), lit.span())?;
             out.table = Some(lit.value());
             Ok(())
-        } else if meta.path.is_ident("multi_instance") {
-            out.multi_instance = true;
-            Ok(())
         } else {
-            Err(meta.error("알 수 없는 entity 인자 — table / multi_instance 만 지원"))
+            Err(meta.error("알 수 없는 entity 인자 — table 만 지원"))
         }
     });
     parser.parse2(args)?;
@@ -430,7 +423,6 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
 
     let struct_ident = item.ident.clone();
     let table = args.table.unwrap_or_else(|| struct_ident.to_string());
-    let multi_instance = args.multi_instance;
 
     // 필드 파싱 (ignore 제외 컬럼 목록) — ignore 필드 ident는 FromRow Default용으로 수집
     let mut cols: Vec<Column> = Vec::new();
@@ -576,7 +568,6 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             const DDL: &'static [&'static str] = &[#(#ddl_lits),*];
             const COLUMNS: &'static str = #columns_joined;
             const COLUMNS_META: &'static [::roomrs::ColumnMeta] = &[#(#column_metas),*];
-            const MULTI_INSTANCE: bool = #multi_instance;
         }
 
         impl ::roomrs::Insertable for #struct_ident {

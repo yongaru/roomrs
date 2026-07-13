@@ -20,7 +20,7 @@ fn into_tokens(result: syn::Result<proc_macro2::TokenStream>) -> TokenStream {
     }
 }
 
-/// `#[entity(table = "…", multi_instance)]` — 구조체를 테이블에 매핑 (명세 §5.1).
+/// `#[entity(table = "…")]` — 구조체를 테이블에 매핑 (명세 §5.1).
 /// 필드 속성: `#[pk(autoincrement)]` · `#[column(name/unique/index/default/ignore)]` · `#[json]`
 #[proc_macro_attribute]
 pub fn entity(args: TokenStream, input: TokenStream) -> TokenStream {

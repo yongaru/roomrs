@@ -14,7 +14,7 @@ authors.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-roomrs = { path = "../../crates/roomrs" }
+roomrs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

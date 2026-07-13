@@ -13,17 +13,6 @@ struct Item {
 #[database(entities(Item), version = 1)]
 struct Db;
 
-#[cfg(feature = "multi-instance")]
-#[entity(table = "mi_items", multi_instance)]
-struct MiItem {
-    #[pk]
-    id: i64,
-}
-
-#[cfg(feature = "multi-instance")]
-#[database(entities(MiItem), version = 1)]
-struct MiDb;
-
 /// 지정한 통합 커넥션 수로 임시 DB를 연다.
 fn open_db(connections: usize) -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().expect("임시 디렉터리 생성");
@@ -83,26 +72,6 @@ fn notifier_uses_on_open_configuration() {
         .expect("초기 조회")
         .expect("초기 값");
     assert_eq!(value, -654);
-}
-
-/// MI poller 연결도 start 전에 callback을 적용한다.
-#[cfg(feature = "multi-instance")]
-#[test]
-fn multi_instance_poller_runs_on_open() {
-    let dir = tempfile::tempdir().expect("임시 디렉터리 생성");
-    let opens = Arc::new(AtomicUsize::new(0));
-    let callback_opens = Arc::clone(&opens);
-    let _db = MiDb::builder()
-        .sqlite(dir.path().join("mi-hook.db"))
-        .connections(2)
-        .enable_multi_instance_invalidation(true)
-        .on_open(move |_| {
-            callback_opens.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
-        .build()
-        .expect("MI DB 열기");
-    assert_eq!(opens.load(Ordering::SeqCst), 4);
 }
 
 /// on_open이 연 트랜잭션은 풀 투입 전에 롤백하고 쓰기 가능 상태로 복구한다.

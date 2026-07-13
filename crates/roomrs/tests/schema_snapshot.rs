@@ -31,7 +31,6 @@ impl DatabaseSpec for Db {
                 name: <Note as Entity>::TABLE,
                 columns: <Note as Entity>::COLUMNS_META,
                 ddl: <Note as Entity>::DDL,
-                multi_instance: <Note as Entity>::MULTI_INSTANCE,
             }],
         }
     }

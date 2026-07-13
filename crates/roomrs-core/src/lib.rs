@@ -17,8 +17,6 @@ mod handle;
 #[cfg(feature = "live")]
 mod live;
 mod migration;
-#[cfg(feature = "multi-instance")]
-mod multi_instance;
 mod pool;
 mod query;
 mod relation;
