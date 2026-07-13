@@ -152,6 +152,19 @@ examples/  xtask/
 
 **작업 하나 완료 = 버전 갱신 1회 + 커밋 1개.** 순서 고정: 버전 → CHANGELOG → 커밋.
 
+### 9.0 기본 완료 파이프라인
+
+사용자가 구현·수정·개발 작업을 지시하면, 별도 제한이 없는 한 다음 전체 파이프라인까지 한 번에 수행한다.
+
+1. TDD 기반 구현과 관련 문서 갱신
+2. `cargo fmt` · clippy · 기능/워크스페이스/feature 게이트 검증
+3. 적대적 리뷰 루프
+4. 버전·CHANGELOG·README·명세·작업지시서 갱신
+5. 커밋·기본 브랜치 push·릴리스 태그 push
+6. `cargo package`/`cargo publish --dry-run` 검증 후 crates.io 순차 배포
+
+사용자가 검증 전용·문서 전용·배포 제외·push 금지처럼 범위를 제한하면 그 제한을 따른다. crates.io 배포 권한 또는 registry 인증이 없으면, 배포 직전까지 완료하고 정확한 차단 사유를 보고한다.
+
 ### 9.1 시맨틱 버전 (v1.0 이전: `0.MINOR.PATCH`)
 
 워크스페이스 전 크레이트 **버전 동일**(root `Cargo.toml` 의 `[workspace.package] version`).
