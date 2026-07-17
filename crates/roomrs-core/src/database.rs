@@ -114,7 +114,7 @@ struct ConnectionSettings {
     mem_name: Option<String>,
     busy_timeout: Duration,
     on_open: Option<ConnCallback>,
-    #[cfg(feature = "cipher")]
+    #[cfg(any(feature = "sqlcipher-bundled", feature = "sqlcipher-system"))]
     encryption_key: Option<String>,
 }
 
@@ -153,7 +153,7 @@ impl ConnectionSettings {
             (None, Some(path)) => Connection::open(path)?,
             (None, None) => return Err(Error::Config("DB 경로가 설정되지 않았습니다".into())),
         };
-        #[cfg(feature = "cipher")]
+        #[cfg(any(feature = "sqlcipher-bundled", feature = "sqlcipher-system"))]
         if let Some(key) = &self.encryption_key {
             conn.pragma_update(None, "key", key)?;
         }
@@ -587,7 +587,7 @@ pub struct DatabaseBuilder<T: DatabaseSpec> {
     migrations: Vec<crate::migration::Migration>,
     auto_migrate: bool,
     destructive_fallback: bool,
-    #[cfg(feature = "cipher")]
+    #[cfg(any(feature = "sqlcipher-bundled", feature = "sqlcipher-system"))]
     encryption_key: Option<String>,
     on_create: Option<ConnCallback>,
     on_open: Option<ConnCallback>,
@@ -611,7 +611,7 @@ impl<T: DatabaseSpec> Default for DatabaseBuilder<T> {
             migrations: Vec::new(),
             auto_migrate: false,
             destructive_fallback: false,
-            #[cfg(feature = "cipher")]
+            #[cfg(any(feature = "sqlcipher-bundled", feature = "sqlcipher-system"))]
             encryption_key: None,
             on_create: None,
             on_open: None,
@@ -668,8 +668,11 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
         self
     }
 
-    /// SQLCipher 암호화 키 (명세 §0 14, feature cipher) — 모든 커넥션 오픈 직후 PRAGMA key
-    #[cfg(feature = "cipher")]
+    /// Sets the SQLCipher key before any other access on every connection.
+    ///
+    /// Available with `sqlcipher-bundled`, `sqlcipher-system`, or the legacy
+    /// `cipher` alias.
+    #[cfg(any(feature = "sqlcipher-bundled", feature = "sqlcipher-system"))]
     pub fn encryption_key(mut self, key: impl Into<String>) -> Self {
         self.encryption_key = Some(key.into());
         self
@@ -825,7 +828,7 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
             mem_name: mem_name.clone(),
             busy_timeout: self.busy_timeout,
             on_open: self.on_open.clone(),
-            #[cfg(feature = "cipher")]
+            #[cfg(any(feature = "sqlcipher-bundled", feature = "sqlcipher-system"))]
             encryption_key: self.encryption_key.clone(),
         };
         let connection_settings = reconnect_settings;
@@ -932,8 +935,8 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
             }
         };
 
-        // 암호화 키 — 어떤 접근보다 먼저 적용해야 한다 (feature cipher)
-        #[cfg(feature = "cipher")]
+        // 암호화 키 — 어떤 접근보다 먼저 적용해야 한다.
+        #[cfg(any(feature = "sqlcipher-bundled", feature = "sqlcipher-system"))]
         if let Some(key) = &self.encryption_key {
             conn.pragma_update(None, "key", key)?;
         }

@@ -7,6 +7,18 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-17
+
+### Added
+
+- Windows MSVC에서 vcpkg의 정적 SQLite 및 SQLCipher를 사용하는 system backend 통합 검증을 추가했습니다.
+- SQLCipher 공식 vcpkg port에 preupdate hook을 활성화하는 최소 overlay port를 제공합니다.
+
+### Fixed
+
+- canonical SQLCipher feature를 직접 선택해도 암호화 키가 모든 연결에 먼저 적용되도록 수정했습니다.
+- 정적 SQLCipher의 OpenSSL 의존 라이브러리가 Windows MSVC 링크 단계에 전달되도록 수정했습니다.
+
 ## [0.2.3] - 2026-07-17
 
 ### Added
