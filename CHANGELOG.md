@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-17
+
+### Added
+
+- SQLite와 SQLCipher에 각각 bundled/system canonical backend feature를 추가했습니다. 기존 `bundled`와 `cipher`는 동일한 bundled 동작을 유지하는 하위 호환 alias입니다.
+- 서로 다른 backend feature 두 개 이상이 동시에 활성화되면 명확한 컴파일 오류로 차단합니다.
+
 ## [0.2.2] - 2026-07-14
 
 ### Fixed
@@ -66,7 +73,8 @@
 - bundled SQLite를 기본 제공하고 선택적 SQLCipher(`cipher`) 및 데스크톱·모바일 크로스 빌드를 지원합니다.
 - Rust 1.85와 Edition 2024를 지원하며 MIT OR Apache-2.0 듀얼 라이선스로 배포합니다.
 
-[Unreleased]: https://github.com/yongaru/roomrs/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/yongaru/roomrs/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/yongaru/roomrs/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/yongaru/roomrs/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/yongaru/roomrs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/yongaru/roomrs/compare/v0.1.2...v0.2.0
