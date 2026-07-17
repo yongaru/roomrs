@@ -45,7 +45,7 @@ A concept map for Room users:
 - **Versioned schema snapshots + binary-embedded auto-migration.** Each schema version is committed as a `[db_name].[version].json` file, and all versions are compressed and embedded into your binary. With `.auto_migrate(true)`, version gaps with no registered migration step are filled automatically from the embedded snapshot diff — but only with **safe operations** (CREATE TABLE, nullable ADD COLUMN, CREATE INDEX, RENAME COLUMN from a valid rename hint). Destructive changes are never executed automatically; you get a clear error instead.
 - **Runtime-agnostic async.** The async API returns plain std `Future`s (`+ Send`), so you can await them on tokio, async-std, smol, or `futures::executor` alike. The tokio-optimized integration is an optional feature.
 
-Under the hood: a synchronous [rusqlite](https://github.com/rusqlite/rusqlite) core (bundled SQLite) plus a purpose-built mini pool. SQLite is synchronous at the C level, so any library's "async" is ultimately worker offloading — which is why roomrs is built as a **synchronous core with an async facade**.
+Under the hood: a synchronous [rusqlite](https://github.com/rusqlite/rusqlite) core plus a purpose-built mini pool. Bundled SQLite remains the default, while both SQLite and SQLCipher support bundled and system linkage. SQLite is synchronous at the C level, so any library's "async" is ultimately worker offloading — which is why roomrs is built as a **synchronous core with an async facade**.
 
 ---
 
@@ -309,24 +309,53 @@ For the mobile FFI pattern (cdylib, `extern "C"`) and its stable negative error-
 
 | feature | default | description |
 |---|---|---|
-| `bundled` | on | Bundled SQLite build — no system SQLite needed |
+| `sqlite-bundled` | on (via `bundled`) | Compile SQLite source as part of the Cargo build |
+| `sqlite-system` | off | Link an OS package or vcpkg SQLite library |
+| `sqlcipher-bundled` | off | Build SQLCipher with vendored OpenSSL through Cargo |
+| `sqlcipher-system` | off | Link an OS package or vcpkg SQLCipher library |
+| `bundled` | on | Backward-compatible alias for `sqlite-bundled` |
+| `cipher` | off | Backward-compatible alias for `sqlcipher-bundled` |
 | `async` | on | Runtime-agnostic async facade. Turn off for pure sync |
 | `tokio` | off | tokio-optimized integration (implies `async`) — falls back to the built-in worker pool outside a tokio runtime |
 | `live` | on | Live queries / invalidation |
 | `time`, `uuid`, `json` | on | Type converters |
-| `cipher` | off | SQLCipher encryption |
 
 A minimal pure-sync build:
 
 ```toml
-roomrs = { version = "0.2", default-features = false, features = ["bundled"] }
+roomrs = { version = "0.2", default-features = false, features = ["sqlite-bundled"] }
 ```
 
-> **`bundled` and `cipher` are mutually exclusive** (enforced by libsqlite3-sys). To use SQLCipher, disable default features and list `cipher` plus whatever else you need:
->
-> ```toml
-> roomrs = { version = "0.2", default-features = false, features = ["cipher", "async", "live", "time", "uuid", "json"] }
-> ```
+No two canonical backend features may be selected together. A backend-free `roomrs-core` build is allowed, but an application that uses a database must select exactly one. Existing `bundled` and `cipher` users continue to use the same bundled backends.
+
+### Windows system backends with vcpkg
+
+System backends link an installed library instead of rebuilding the SQLite/SQLCipher C source through Cargo. Because `live` uses the preupdate hook, SQLite requires vcpkg's `session` feature.
+
+```powershell
+$env:VCPKG_ROOT = "D:\tools\vcpkg"
+$env:VCPKGRS_TRIPLET = "x64-windows-static-md"
+& "$env:VCPKG_ROOT\vcpkg.exe" install "sqlite3[session]:x64-windows-static-md"
+```
+
+```toml
+roomrs = { version = "0.2", default-features = false, features = ["sqlite-system", "async", "live", "time", "uuid", "json"] }
+```
+
+The official SQLCipher port does not enable the preupdate hook, so use the minimal overlay port included in the roomrs repository.
+
+```powershell
+& "$env:VCPKG_ROOT\vcpkg.exe" install "sqlcipher:x64-windows-static-md" `
+  --overlay-ports="<roomrs-repo>\vcpkg\ports"
+```
+
+```toml
+roomrs = { version = "0.2", default-features = false, features = ["sqlcipher-system", "async", "live", "time", "uuid", "json"] }
+```
+
+These commands use the `x64-windows-static-md` triplet: static libraries with the dynamic CRT. Do not set `VCPKGRS_DYNAMIC`. No SQLite or SQLCipher DLL needs to be deployed. If you separately choose a dynamic-library triplet, deploying its DLLs is the application's responsibility.
+
+vcpkg compiles the C/C++ libraries on the first install and Cargo only links the resulting `.lib` files afterward. Therefore, `cargo clean` neither removes vcpkg artifacts nor rebuilds SQLite/SQLCipher. Set `VCPKG_DEFAULT_BINARY_CACHE` to a shared location to reuse the same ABI result across checkouts and CI. With a system backend, the linked library version, compile options, ABI, license acceptance, and deployment model are application acceptance criteria.
 
 ---
 
@@ -398,7 +427,7 @@ With the debug level enabled you can see connection opens, transaction begin/com
 
 - **MSRV 1.85** (Edition 2024) — included in the CI matrix.
 - Tested on all three desktop OSes (Windows/macOS/Linux); mobile (Android/iOS) is supported through the FFI pattern.
-- SQLite is a bundled build, so no system installation is needed.
+- The default bundled SQLite needs no system installation. System backends require the OS package or vcpkg setup above.
 
 Cross-building from a Windows host uses zig/NDK. The bundled SQLite (C) is compiled along with it.
 

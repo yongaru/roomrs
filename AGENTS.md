@@ -39,7 +39,7 @@
 
 | 항목 | 값 |
 |---|---|
-| 코어 | rusqlite (`bundled`). r2d2 금지 |
+| 코어 | rusqlite. SQLite/SQLCipher × bundled/system 선택, 기본은 bundled SQLite. r2d2 금지 |
 | 풀 | 자체 미니 풀: **통합 커넥션 N — 전 커넥션 read/write 가능**. write 직렬화 = WAL + `BEGIN IMMEDIATE` + busy_timeout |
 | 비동기 | 런타임 무관 std `Future`(futures-channel/core). tokio는 선택 feature. 생성 Future `+ Send` |
 | MSRV | **1.85 (Edition 2024)** — CI 매트릭스 포함 |
@@ -73,7 +73,7 @@ examples/  xtask/
 - `unwrap()`/`expect()` 는 테스트 + "논리적 불가능" 지점만. 후자는 expect 메시지에 불가능 근거.
 - panic이 라이브러리 경계 넘지 않는다 — 공개 API 전부 `Result<T, roomrs::Error>`.
 - 스레드 이름: `roomrs-notifier`, `roomrs-mi-poller`, `roomrs-worker-{n}`. (구 `roomrs-writer` 전담 스레드는 통합 풀 전환으로 소멸)
-- feature 조합 컴파일 보장(CI 전부): `default` · `--no-default-features --features bundled` · `--features "tokio,multi-instance"` · `cargo test --workspace`(default — 비-tokio 실행기 테스트 포함). `--all-features` 불가 — `bundled`×`cipher` 상호 배타(compile_error!).
+- feature 조합 컴파일 보장(CI 전부): `sqlite-bundled` · `sqlite-system` · `sqlcipher-bundled` · `sqlcipher-system` 각각 `check/test/clippy/fmt/doc/feature graph` · canonical backend 충돌 6쌍 · `cargo test --workspace`(default — 비-tokio 실행기 테스트 포함). `--all-features` 불가 — backend 4종 상호 배타(`compile_error!`).
 - 매크로 에러는 원인 span에 `syn::Error`(한국어). `panic!` 금지.
 - **로깅**: 라이브러리는 `log` 파사드(`error!`~`trace!`), **로그 메시지는 영어**. subscriber 초기화 금지(소비자 몫). 파라미터 값 등 민감정보 로그 금지. 예제는 `tracing` + `tracing-log` 브리지, debug 필터.
 
@@ -227,6 +227,6 @@ checkout 반납 시 PRAGMA 오염을 복구해야 풀 재사용이 안전하다.
 
 ## 11. 현재 상태
 
-- 현재 버전: **0.1.0**(최초 공개 준비)
+- 현재 버전: **0.2.4**(최초 공개 준비)
 - crates.io publish 미실행 — 명시 요청 시(§9.1)
 - 이 절은 마일스톤마다 갱신.

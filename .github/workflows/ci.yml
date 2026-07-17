@@ -27,14 +27,14 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --features tokio -- -D warnings
-      # 순수 동기 빌드 — SQLite는 번들 유지 (H-7).
+      # 순수 동기 빌드 — SQLite는 canonical bundled backend 유지 (H-7).
       # --workspace 로 돌리면 feature 통합(unification) 함정에 걸린다: 멤버
       # examples/mobile-ffi 가 roomrs를 default feature로 의존해 default가
       # 다시 켜져 no-default 빌드가 무의미해진다. 패키지 스코프(-p roomrs)면
-      # mobile-ffi가 선택에서 빠져 [bundled]만 켜진 순수 동기 경로가 실제로
+      # mobile-ffi가 선택에서 빠져 sqlite-bundled만 켜진 순수 동기 경로가 실제로
       # 컴파일된다 (roomrs-core·macros·migrate는 의존성으로 함께 빌드됨).
-      - run: cargo build -p roomrs --no-default-features --features bundled
-      # cipher는 bundled와 상호 배타 — all-features 대신 명시 목록
+      - run: cargo build -p roomrs --no-default-features --features sqlite-bundled
+      # backend는 상호 배타 — all-features 대신 명시 목록
       - run: cargo build --workspace --features tokio
 
   # 테스트 — 데스크톱 3 OS 매트릭스 (명세 §13)
@@ -78,8 +78,128 @@ jobs:
             exit 1
           }
 
-  # SQLCipher 조합 (명세 §0 14) — vendored OpenSSL 빌드에 perl 필요(ubuntu 내장)
-  cipher:
+  # bundled backend 2종 — vendored SQLCipher/OpenSSL 빌드에는 ubuntu의 perl 사용
+  backend-bundled:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sqlite-bundled, sqlcipher-bundled]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 브랜치 (2026-07)
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - run: cargo fmt --all --check
+      - run: cargo check -p roomrs --no-default-features --features "${{ matrix.backend }},async,live,time,uuid,json"
+      - run: cargo test -p roomrs --no-default-features --features "${{ matrix.backend }},async,live,time,uuid,json"
+      - run: cargo clippy -p roomrs --all-targets --no-default-features --features "${{ matrix.backend }},async,live,time,uuid,json" -- -D warnings
+      - run: cargo test -p roomrs --doc --no-default-features --features "${{ matrix.backend }},async,live,time,uuid,json"
+      - name: legacy alias compatibility
+        shell: bash
+        run: |
+          if [ "${{ matrix.backend }}" = "sqlite-bundled" ]; then
+            alias_feature=bundled
+          else
+            alias_feature=cipher
+          fi
+          cargo check -p roomrs --no-default-features \
+            --features "$alias_feature,async,live,time,uuid,json"
+      - name: bundled feature graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree -p roomrs --no-default-features \
+            --features "${{ matrix.backend }},async,live,time,uuid,json" \
+            -e features -i libsqlite3-sys)
+          full_tree=$(cargo tree -p roomrs --no-default-features \
+            --features "${{ matrix.backend }},async,live,time,uuid,json" \
+            -e features)
+          echo "$tree"
+          grep -q 'cc v' <<<"$full_tree"
+          if [ "${{ matrix.backend }}" = "sqlite-bundled" ]; then
+            grep -q 'libsqlite3-sys feature "bundled"' <<<"$tree"
+            ! grep -q 'libsqlite3-sys feature "sqlcipher"' <<<"$tree"
+          else
+            grep -q 'libsqlite3-sys feature "bundled-sqlcipher-vendored-openssl"' <<<"$tree"
+            grep -q 'libsqlite3-sys feature "bundled-sqlcipher"' <<<"$tree"
+          fi
+
+  # system backend 2종 — vcpkg x64-windows-static-md 고정
+  backend-system:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: sqlite-system
+            rustflags: ""
+          - backend: sqlcipher-system
+            # trybuild가 만드는 다수 실행 파일의 MSVC PDB 제한을 피한다.
+            rustflags: -C link-arg=/DEBUG:NONE
+    runs-on: windows-latest
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg-toolchain
+      VCPKGRS_TRIPLET: x64-windows-static-md
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          repository: microsoft/vcpkg
+          ref: 545b5dc234f4015a6fb32bf6cba863bb6b41cb9c
+          path: vcpkg-toolchain
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 브랜치 (2026-07)
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - name: bootstrap vcpkg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+      - name: install SQLite system backend
+        if: matrix.backend == 'sqlite-system'
+        shell: pwsh
+        run: '& "$env:VCPKG_ROOT\vcpkg.exe" install "sqlite3[session]:x64-windows-static-md"'
+      - name: install SQLCipher system backend
+        if: matrix.backend == 'sqlcipher-system'
+        shell: pwsh
+        run: '& "$env:VCPKG_ROOT\vcpkg.exe" install "sqlcipher:x64-windows-static-md" --overlay-ports="${{ github.workspace }}\vcpkg\ports"'
+      - run: cargo fmt --all --check
+      - run: cargo check -p roomrs --no-default-features --features "${{ matrix.backend }},async,live,time,uuid,json"
+      - run: cargo test -p roomrs --no-default-features --features "${{ matrix.backend }},async,live,time,uuid,json"
+      - run: cargo clippy -p roomrs --all-targets --no-default-features --features "${{ matrix.backend }},async,live,time,uuid,json" -- -D warnings
+      - run: cargo test -p roomrs --doc --no-default-features --features "${{ matrix.backend }},async,live,time,uuid,json"
+      - name: system feature graph
+        shell: pwsh
+        run: |
+          $tree = cargo tree -p roomrs --no-default-features `
+            --features "${{ matrix.backend }},async,live,time,uuid,json" `
+            -e features -i libsqlite3-sys | Out-String
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $fullTree = cargo tree -p roomrs --no-default-features `
+            --features "${{ matrix.backend }},async,live,time,uuid,json" `
+            -e features | Out-String
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tree
+          if ($tree -match 'feature "bundled') {
+            throw "system backend가 bundled C build를 활성화했습니다"
+          }
+          if ($fullTree -match '(?m)^.*\bcc v\d') {
+            throw "system backend graph에 cc가 있습니다"
+          }
+          if ('${{ matrix.backend }}' -eq 'sqlcipher-system' -and
+              $tree -notmatch 'libsqlite3-sys feature "sqlcipher"') {
+            throw "SQLCipher native feature가 없습니다"
+          }
+
+  # canonical backend 6쌍이 모두 roomrs compile_error로 차단되는지 검증
+  backend-conflicts:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
@@ -87,7 +207,34 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - run: cargo check -p roomrs --no-default-features --features "cipher,async,live,time,uuid,json"
+      - run: sudo apt-get update && sudo apt-get install -y libsqlcipher-dev
+      - name: reject all backend pairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          pairs=(
+            "sqlite-bundled,sqlite-system"
+            "sqlite-bundled,sqlcipher-bundled"
+            "sqlite-bundled,sqlcipher-system"
+            "sqlite-system,sqlcipher-bundled"
+            "sqlite-system,sqlcipher-system"
+            "sqlcipher-bundled,sqlcipher-system"
+          )
+          for pair in "${pairs[@]}"; do
+            set +e
+            out=$(cargo check -p roomrs-core --no-default-features --features "$pair" 2>&1)
+            status=$?
+            set -e
+            echo "$out"
+            if [ "$status" -eq 0 ]; then
+              echo "충돌 backend 조합이 성공했습니다: $pair"
+              exit 1
+            fi
+            grep -q 'SQLite backend feature는 최대 하나만 선택해야 합니다.' <<<"$out" || {
+              echo "roomrs compile_error가 아닌 이유로 실패했습니다: $pair"
+              exit 1
+            }
+          done
 
   # 크로스 빌드 — 리눅스(zig) + 안드로이드(NDK) (명세 §13, docs/cross-build.md)
   cross:
@@ -118,5 +265,5 @@ jobs:
         with:
           toolchain: "1.85"
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      # cipher는 bundled와 상호 배타 — all-features 대신 명시 목록
+      # backend는 상호 배타 — all-features 대신 명시 목록
       - run: cargo build --workspace --features tokio
