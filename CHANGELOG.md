@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 네 backend 조합과 여섯 충돌 조합을 CI에서 검증하고, Windows vcpkg system backend 설치·링크·배포 계약을 한영 README에 문서화했습니다.
+
 ## [0.2.4] - 2026-07-17
 
 ### Added

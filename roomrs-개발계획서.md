@@ -541,7 +541,7 @@ pub trait Migration {
 | `time`, `uuid` | **on** | 기본 예시가 기본 설정에서 컴파일되도록 승격[C-4] |
 | `json` | on | `#[json]` |
 
-backend canonical feature는 동시에 둘 이상 활성화할 수 없다. `roomrs-core`를 backend feature 없이 빌드하는 구성은 유지한다. Windows MSVC system backend는 vcpkg 정적 라이브러리를 사용하며, `live`에는 `SQLITE_ENABLE_PREUPDATE_HOOK`가 포함된 port가 필요하다.
+backend canonical feature는 동시에 둘 이상 활성화할 수 없다. `roomrs-core`를 backend feature 없이 빌드하는 구성은 유지한다. Windows MSVC system backend는 vcpkg `x64-windows-static-md` 라이브러리를 사용하며, `live`에는 `SQLITE_ENABLE_PREUPDATE_HOOK`가 포함된 port가 필요하다. CI는 네 backend 각각의 check/test/clippy/fmt/doc/feature graph와 canonical backend 충돌 6쌍을 검증한다.
 
 
 ## 15. 0.1.0 기능 범위

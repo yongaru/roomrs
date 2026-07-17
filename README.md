@@ -45,7 +45,7 @@ Room 사용자를 위한 개념 대응표:
 - **버전별 스키마 스냅샷 + 바이너리 내장 자동 마이그레이션.** 스키마의 각 버전이 `[db이름].[버전].json` 파일로 커밋되고, 전 버전이 압축되어 바이너리에 내장됩니다. `.auto_migrate(true)`를 켜면 마이그레이션 스텝을 등록하지 않은 구간을 내장 스냅샷 diff의 **안전 연산**(CREATE TABLE, nullable ADD COLUMN, CREATE INDEX, 유효한 rename 힌트의 RENAME COLUMN)으로 자동 실행합니다. 파괴적 변경은 절대 자동 실행하지 않고 명확한 에러로 안내합니다.
 - **런타임 무관 비동기.** 비동기 API는 순수 std `Future`(+`Send`)를 반환하므로 tokio, async-std, smol, `futures::executor` 어디서든 그대로 await할 수 있습니다. tokio 최적화 통합은 선택 feature입니다.
 
-기반은 [rusqlite](https://github.com/rusqlite/rusqlite) 동기 코어(bundled SQLite) + 자체 미니 풀입니다. SQLite는 C 레벨에서 동기이므로 어떤 라이브러리의 "async"든 결국 워커 오프로드입니다 — 그래서 roomrs는 **동기 코어 + 비동기 파사드** 구조를 택했습니다.
+기반은 [rusqlite](https://github.com/rusqlite/rusqlite) 동기 코어 + 자체 미니 풀입니다. 기본값은 bundled SQLite이고, SQLite와 SQLCipher 모두 bundled/system 링크 방식을 선택할 수 있습니다. SQLite는 C 레벨에서 동기이므로 어떤 라이브러리의 "async"든 결국 워커 오프로드입니다 — 그래서 roomrs는 **동기 코어 + 비동기 파사드** 구조를 택했습니다.
 
 ---
 
@@ -309,24 +309,53 @@ struct Profile {
 
 | feature | 기본 | 설명 |
 |---|---|---|
-| `bundled` | on | SQLite 번들 빌드 — 시스템 SQLite 불필요 |
+| `sqlite-bundled` | on(`bundled` 경유) | SQLite 소스를 Cargo 빌드에 포함 |
+| `sqlite-system` | off | OS package 또는 vcpkg SQLite에 링크 |
+| `sqlcipher-bundled` | off | vendored OpenSSL을 포함한 SQLCipher를 Cargo에서 빌드 |
+| `sqlcipher-system` | off | OS package 또는 vcpkg SQLCipher에 링크 |
+| `bundled` | on | `sqlite-bundled` 하위 호환 alias |
+| `cipher` | off | `sqlcipher-bundled` 하위 호환 alias |
 | `async` | on | 런타임 무관 비동기 파사드. 끄면 순수 동기 |
 | `tokio` | off | tokio 통합 최적화(`async` 포함) — tokio 런타임 밖에서는 자체 워커 풀로 폴백 |
 | `live` | on | 라이브 쿼리 / 무효화 |
 | `time`, `uuid`, `json` | on | 타입 컨버터 |
-| `cipher` | off | SQLCipher 암호화 |
 
 순수 동기 최소 빌드:
 
 ```toml
-roomrs = { version = "0.2", default-features = false, features = ["bundled"] }
+roomrs = { version = "0.2", default-features = false, features = ["sqlite-bundled"] }
 ```
 
-> **`bundled`와 `cipher`는 상호 배타입니다** (libsqlite3-sys가 강제). SQLCipher를 쓰려면 기본 feature를 끄고 `cipher`와 필요한 feature를 명시하세요:
->
-> ```toml
-> roomrs = { version = "0.2", default-features = false, features = ["cipher", "async", "live", "time", "uuid", "json"] }
-> ```
+네 canonical backend feature는 동시에 둘 이상 선택할 수 없습니다. backend 없는 `roomrs-core` 빌드는 허용하지만, 데이터베이스를 사용하는 애플리케이션은 정확히 하나를 선택해야 합니다. 기존 `bundled`와 `cipher` 사용자는 각각 동일한 bundled backend를 계속 사용합니다.
+
+### Windows system backend와 vcpkg
+
+system backend는 SQLite/SQLCipher C 소스를 Cargo가 다시 컴파일하지 않고 이미 설치된 라이브러리에 링크합니다. `live`는 preupdate hook을 사용하므로 SQLite에는 vcpkg의 `session` feature가 필요합니다.
+
+```powershell
+$env:VCPKG_ROOT = "D:\tools\vcpkg"
+$env:VCPKGRS_TRIPLET = "x64-windows-static-md"
+& "$env:VCPKG_ROOT\vcpkg.exe" install "sqlite3[session]:x64-windows-static-md"
+```
+
+```toml
+roomrs = { version = "0.2", default-features = false, features = ["sqlite-system", "async", "live", "time", "uuid", "json"] }
+```
+
+공식 SQLCipher port는 preupdate hook을 활성화하지 않으므로 roomrs 저장소의 최소 overlay port를 사용합니다.
+
+```powershell
+& "$env:VCPKG_ROOT\vcpkg.exe" install "sqlcipher:x64-windows-static-md" `
+  --overlay-ports="<roomrs-repo>\vcpkg\ports"
+```
+
+```toml
+roomrs = { version = "0.2", default-features = false, features = ["sqlcipher-system", "async", "live", "time", "uuid", "json"] }
+```
+
+위 명령은 정적 라이브러리와 동적 CRT를 조합한 `x64-windows-static-md` triplet을 사용하므로 `VCPKGRS_DYNAMIC`을 설정하지 않습니다. SQLite/SQLCipher DLL도 배포할 필요가 없습니다. 동적 라이브러리 triplet을 별도로 선택한다면 해당 DLL 배포가 애플리케이션 책임입니다.
+
+vcpkg 설치는 최초 한 번만 C/C++를 컴파일하고 이후 Cargo는 `.lib`에 링크합니다. 따라서 `cargo clean`은 vcpkg 산출물을 지우거나 SQLite/SQLCipher를 다시 빌드하지 않습니다. `VCPKG_DEFAULT_BINARY_CACHE`를 공유 경로로 지정하면 다른 checkout과 CI에서도 동일 ABI 결과를 재사용할 수 있습니다. system backend에서 실제로 연결되는 라이브러리 버전, compile option, ABI, 라이선스 수용과 배포 방식은 최종 애플리케이션의 acceptance 대상입니다.
 
 ---
 
@@ -398,7 +427,7 @@ debug 레벨을 켜면 커넥션 오픈, 트랜잭션 begin/commit/rollback, 무
 
 - **MSRV 1.85** (Edition 2024) — CI 매트릭스에 포함되어 있습니다.
 - 데스크톱(Windows/macOS/Linux) 3 OS에서 테스트하며, 모바일(Android/iOS)은 FFI 패턴으로 지원합니다.
-- SQLite는 번들 빌드라 시스템 설치가 필요 없습니다.
+- 기본 bundled SQLite는 시스템 설치가 필요 없습니다. system backend는 위의 OS package 또는 vcpkg 설치가 필요합니다.
 
 Windows 호스트에서 zig/NDK로 크로스 빌드합니다. bundled SQLite(C)도 함께 컴파일됩니다.
 
