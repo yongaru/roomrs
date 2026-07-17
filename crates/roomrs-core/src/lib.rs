@@ -4,11 +4,16 @@
 //! Internal crate — use the `roomrs` facade instead.
 #![deny(unsafe_code)]
 
-// bundled와 cipher는 상호 배타 — libsqlite3-sys가 어차피 실패하지만 명확한 메시지 제공
-#[cfg(all(feature = "bundled", feature = "cipher"))]
-compile_error!(
-    "feature 'bundled'와 'cipher'는 함께 켤 수 없습니다 — cipher 사용 시 default-features=false로 bundled를 끄세요"
-);
+// SQLite/SQLCipher backend는 최대 하나만 선택한다.
+#[cfg(any(
+    all(feature = "sqlite-bundled", feature = "sqlite-system"),
+    all(feature = "sqlite-bundled", feature = "sqlcipher-bundled"),
+    all(feature = "sqlite-bundled", feature = "sqlcipher-system"),
+    all(feature = "sqlite-system", feature = "sqlcipher-bundled"),
+    all(feature = "sqlite-system", feature = "sqlcipher-system"),
+    all(feature = "sqlcipher-bundled", feature = "sqlcipher-system"),
+))]
+compile_error!("SQLite backend feature는 최대 하나만 선택해야 합니다.");
 
 mod database;
 mod entity;

@@ -24,8 +24,14 @@ futures-core = { version = "0.3", optional = true }
 
 [features]
 default = []
-# SQLite 번들 빌드 (명세 §0 15) — cipher와 상호 배타(libsqlite3-sys가 강제)
-bundled = ["rusqlite/bundled"]
+# SQLite/SQLCipher 링크 backend (명세 §0 15) — canonical feature는 상호 배타
+sqlite-bundled = ["rusqlite/bundled"]
+sqlite-system = []
+sqlcipher-bundled = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
+sqlcipher-system = ["rusqlite/sqlcipher"]
+# 기존 공개 feature 하위 호환 alias
+bundled = ["sqlite-bundled"]
+cipher = ["sqlcipher-bundled"]
 # 라이브 쿼리/무효화 (명세 §9) — 런타임 SQL 테이블 추출에 sqlparser 사용
 live = ["dep:sqlparser", "rusqlite/preupdate_hook"]
 # LiveQuery::into_stream (명세 §5.6) — 파사드 async feature가 켠다
@@ -34,6 +40,3 @@ stream = ["dep:futures-core"]
 time = ["rusqlite/time", "dep:time"]
 uuid = ["rusqlite/uuid", "dep:uuid"]
 json = ["dep:serde_json"]
-# SQLCipher 암호화 (명세 §0 14) — bundled와 상호 배타.
-# 사용: roomrs를 default-features=false로 두고 cipher + 나머지 feature 명시
-cipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]

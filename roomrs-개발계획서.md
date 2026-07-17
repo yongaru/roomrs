@@ -1,10 +1,10 @@
-# roomrs — 0.2.0 기능 명세 (Agent Spec) · **SQLite 전용 · 동기+비동기**
+# roomrs — 0.2.3 기능 명세 (Agent Spec) · **SQLite 전용 · 동기+비동기**
 
 > Android **Room** 과 동일한 개발 경험을 목표로 하는 Rust용 **로컬 SQLite 퍼시스턴스** 라이브러리.
-> 백엔드: **SQLite(번들 최신) 전용 — 다른 DB 지원 없음**. API: **동기 1급 + 비동기(런타임 무관 std Future + tokio 통합)**. 기반: **rusqlite** 동기 코어 + **자체 통합 미니 풀(N)**.
+> 백엔드: **SQLite 전용 — bundled/system 링크 선택, 기본은 bundled**. 다른 DB 지원 없음. API: **동기 1급 + 비동기(런타임 무관 std Future + tokio 통합)**. 기반: **rusqlite** 동기 코어 + **자체 통합 미니 풀(N)**.
 >
 > 본 문서는 **에이전트/구현자 실행용 명세**다. 사람용 개요는 `README.md` 참조.
-> 제품 버전: **0.2.0**.
+> 제품 버전: **0.2.3**.
 >
 > **범위 확정**: roomrs는 **SQLite만** 지원한다. 다른 DB 백엔드는 지원하지 않으며 계획에도 없다.
 >
@@ -18,7 +18,7 @@
 
 | # | 항목 | 결정 | 비고 |
 |---|------|------|------|
-| 1 | 기반 스택 | **rusqlite 동기 코어 (bundled SQLite) + 자체 미니 풀** | 3자 버전 lockstep·유지보수 리스크 없음 |
+| 1 | 기반 스택 | **rusqlite 동기 코어 + 자체 미니 풀** | SQLite/SQLCipher 각각 bundled/system 링크 선택. 기본은 bundled SQLite |
 | 1b | 쓰기 전략 | **통합 풀 N — 모든 일반 커넥션 read/write 가능, SQL 라우팅 없음** | `query`/`execute`는 반환 형태만 구분. WAL·`busy_timeout`으로 잠금 경합 처리 |
 | 2 | API 모델 | **동기 1급 + 비동기 파사드(런타임 무관 std Future 기본, tokio 통합 선택)** | 어떤 실행기에서도 await 가능 |
 | 2b | API 네임스페이스 | **`db.run_sync()` / `db.run_async()` 핸들 분리** — 양쪽 메서드명 동일 | 완전 대칭 쌍 + 예약어 `async` 충돌 회피(§5.0) |
@@ -42,8 +42,8 @@
 | 12c | autoincrement PK | insert 시 **PK 컬럼 항상 생략 + 새 id는 반환값으로** | `id:0` 센티널 금지. 명시 삽입은 `#[insert(keep_pk)]` |
 | 13 | 플랫폼 | 데스크톱(Win/Mac/Linux) + 모바일(Android/iOS) | 전 타깃 SQLite |
 | 13b | MSRV | **1.85 (Edition 2024)** | Rust 1.88 안정화 let-chain 금지. CI `cargo +1.85 build`를 릴리스 게이트로 포함 |
-| 14 | 암호화 | 선택적 feature `cipher`(SQLCipher) | rusqlite `bundled-sqlcipher` |
-| 15 | SQLite 빌드 | 번들 최신(rusqlite `bundled`) | |
+| 14 | 암호화 | 선택적 SQLCipher backend | `sqlcipher-bundled` 또는 `sqlcipher-system`; `cipher`는 bundled 호환 alias |
+| 15 | SQLite 링크 | canonical backend feature 4종 중 최대 하나: `sqlite-bundled`, `sqlite-system`, `sqlcipher-bundled`, `sqlcipher-system` | 기본 `bundled`는 `sqlite-bundled` alias. core의 backend 없는 빌드는 허용 |
 | 16 | 에러 모델 | thiserror (`roomrs::Error`) | |
 | 16b | 운영 훅 | `.on_create/.on_open/.query_logger` | Room Callback/QueryCallback 대응 |
 | 17 | 라이선스 | MIT / Apache-2.0 듀얼 | |
@@ -176,7 +176,7 @@ roomrs/
 │   전부 read/write 가능 · checkout 독점         │
 │   전부 preupdate_hook 설치                     │
 └──────┬────────────────────────────────────────┘
-   rusqlite → libsqlite3-sys (bundled 최신 / bundled-sqlcipher)
+   rusqlite → libsqlite3-sys (SQLite/SQLCipher × bundled/system)
 ```
 
 ---
@@ -529,12 +529,19 @@ pub trait Migration {
 
 | feature | 기본 | 설명 |
 |---|---|---|
+| `sqlite-bundled` | on(`bundled` 경유) | rusqlite가 SQLite를 함께 빌드 |
+| `sqlite-system` | off | OS package 또는 vcpkg SQLite에 링크 |
+| `sqlcipher-bundled` | off | vendored OpenSSL을 포함한 SQLCipher를 함께 빌드 |
+| `sqlcipher-system` | off | OS package 또는 vcpkg SQLCipher에 링크 |
+| `bundled` | on | `sqlite-bundled` 하위 호환 alias |
+| `cipher` | off | `sqlcipher-bundled` 하위 호환 alias |
 | `async` | on | 런타임 무관 비동기 파사드. 끄면 순수 동기 |
 | `tokio` | off | tokio 통합 최적화(`async` 포함) |
 | `live` | on | 라이브 쿼리/무효화 |
 | `time`, `uuid` | **on** | 기본 예시가 기본 설정에서 컴파일되도록 승격[C-4] |
 | `json` | on | `#[json]` |
-| `cipher` | off | SQLCipher |
+
+backend canonical feature는 동시에 둘 이상 활성화할 수 없다. `roomrs-core`를 backend feature 없이 빌드하는 구성은 유지한다. Windows MSVC system backend는 vcpkg 정적 라이브러리를 사용하며, `live`에는 `SQLITE_ENABLE_PREUPDATE_HOOK`가 포함된 port가 필요하다.
 
 
 ## 15. 0.1.0 기능 범위
@@ -562,6 +569,7 @@ pub trait Migration {
 | 사용자 hook 교체로 보조 경로 사망 | 문서 경고 + `rearm_hooks()` · 주 경로(문장 기반)는 영향 없음 |
 | 멀티인스턴스 트리거 스큐/소실 | 버전 태깅 · Validate가 존재 검사 · 옵트인으로 노출면 축소 |
 | 비동기 클로저 미지원 | 0.1.0 제약 명시 · 후속 액터 설계 검토 |
+| system SQLite/SQLCipher ABI·compile option 차이 | 지원 버전과 compile option을 애플리케이션 acceptance 대상으로 검증 · Windows CI는 고정 vcpkg triplet와 feature graph 검사 |
 
 ## 18. 미해결 이슈
 - `#[pk]`/`#[json]` 표기 확장 여부.

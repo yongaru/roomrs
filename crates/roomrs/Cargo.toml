@@ -32,8 +32,14 @@ tracing-log = "0.2"
 
 [features]
 default = ["bundled", "async", "live", "time", "uuid", "json"]
-# SQLite 번들 빌드 — cipher 사용 시 default-features=false로 끄고 cipher를 켠다
-bundled = ["roomrs-core/bundled"]
+# SQLite/SQLCipher 링크 backend — canonical feature는 상호 배타
+sqlite-bundled = ["roomrs-core/sqlite-bundled"]
+sqlite-system = ["roomrs-core/sqlite-system"]
+sqlcipher-bundled = ["roomrs-core/sqlcipher-bundled"]
+sqlcipher-system = ["roomrs-core/sqlcipher-system"]
+# 기존 공개 feature 하위 호환 alias
+bundled = ["sqlite-bundled"]
+cipher = ["sqlcipher-bundled"]
 # 런타임 무관 비동기 파사드. 끄면 순수 동기
 async = ["dep:roomrs-async", "roomrs-core/stream"]
 # tokio 통합 최적화 (async 포함)
@@ -44,8 +50,6 @@ live = ["roomrs-core/live", "roomrs-async?/live"]
 time = ["roomrs-core/time"]
 uuid = ["roomrs-core/uuid"]
 json = ["roomrs-core/json"]
-# SQLCipher 암호화 — bundled와 상호 배타 (기본 feature 끄고 사용)
-cipher = ["roomrs-core/cipher"]
 
 # 예제 feature 요구 — 순수 동기 빌드에서 제외
 [[example]]
