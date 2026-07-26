@@ -26,6 +26,7 @@
 
 - 기본 feature는 bundled SQLite, async, tokio, live, time, uuid, json입니다. SQLCipher는 명시적으로 선택합니다.
 - CLI 실행파일을 `cargo-roomrs` 하나로 통합하고 schema·migration 명령을 `cargo roomrs ...` 형식으로 제공합니다.
+- README를 빠른 시작 중심의 일반 오픈소스 구조로 재구성하고, 설치부터 스키마 변경·운영까지 설명하는 한·영 상세 사용 가이드를 추가했습니다.
 - 라이브러리 로그는 `log` 파사드만 사용하며, 예제와 CLI는 `RUST_LOG`를 지원하는 `tracing-log` 브리지를 사용합니다.
 - `#[pk]`를 여러 필드에 지정하면 필드 선언 순서대로 복합 PRIMARY KEY를 생성합니다. `#[pk(autoincrement)]`는 단일 정수 키에서만 허용합니다.
 - schema snapshot export는 기존 같은 revision을 덮어쓰지 않으며, hash 불일치·파손·파괴적 diff를 구조화된 오류와 수정 조언으로 보고합니다.
