@@ -28,28 +28,20 @@ mod relation;
 mod row;
 
 pub use database::{
-    ColumnMeta, Database, DatabaseBuilder, DatabaseInner, DatabaseSpec, EmbeddedSchema,
-    MigrationPolicy, SchemaDef, TableMeta, check_schema_snapshot, export_schema_for_test,
-    write_schema_snapshot,
+    ColumnMeta, Database, DatabaseBuilder, DatabaseInner, DatabaseSpec, EmbeddedSchema, GeneratedColumnMeta, MigrationPolicy, PlannedExportAction, PlannedSnapshotWrite, SchemaDef, SchemaExportEntry, TableMeta, TriggerMeta, check_export_entry, check_schema_snapshot, export_schema_snapshot, plan_export_auto, plan_export_for_entry, plan_export_snapshot, run_registered_schema_check,
+    run_registered_schema_export, write_schema_snapshot,
 };
 pub use entity::{Entity, Insertable, outputs_to_values, to_owned_value};
-pub use error::{Error, Result};
+pub use error::{Error, ErrorAdvice, ErrorPath, Result};
 #[cfg(feature = "live")]
 pub use handle::WatchContext;
 pub use handle::{SqlContext, SyncHandle, Tx};
 #[cfg(feature = "live")]
-pub use live::{
-    InvalidationFilter, InvalidationFilterBuilder, InvalidationGroupBuilder, LiveQuery,
-    SubscriptionGuard,
-};
+pub use live::{DEFAULT_DEBOUNCE, IntoInvalidationFilters, InvalidationFilter, InvalidationFilterBuilder, InvalidationGroupBuilder, LiveMetrics, LiveQuery, SubscriptionGuard};
 pub use migration::{Migration, MigrationStep};
 pub use query::{Col, Execute, Expr, IntoDbValue, Order, Query, SelectBuilder, col};
 pub use relation::{RelationView, in_placeholders, load_children, load_junction};
-pub use roomrs_migrate::{
-    ColumnSnapshot, DiffPlan, SCHEMA_DIR_RELATIVE, SchemaSnapshot, TableSnapshot,
-    compress_snapshot, decompress_snapshot, diff_plan, diff_sql, list_snapshot_versions,
-    resolve_schema_dir, snapshot_file_name, snapshot_path,
-};
+pub use roomrs_migrate::{ColumnSnapshot, DiffPlan, GeneratedColumnSnapshot, SCHEMA_DIR_RELATIVE, SchemaSnapshot, TableSnapshot, TriggerSnapshot, compress_snapshot, decompress_snapshot, diff_plan, diff_sql, list_snapshot_versions, resolve_schema_dir, snapshot_file_name, snapshot_path};
 pub use row::FromRow;
 
 // 매크로 생성 코드·사용자 코드가 쓰는 rusqlite 표면 재수출
@@ -60,6 +52,7 @@ pub use rusqlite::{Params, ToSql, params, params_from_iter};
 /// 매크로 생성 코드 전용 내부 재수출 — 직접 사용 금지
 #[doc(hidden)]
 pub mod __private {
+    pub use inventory;
     pub use rusqlite::Row;
 
     #[cfg(feature = "json")]

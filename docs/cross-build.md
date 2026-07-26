@@ -1,7 +1,7 @@
 # 크로스 빌드 가이드 (Linux · Android)
 
 zig를 C 컴파일러/링커로 써서 Windows에서 리눅스·안드로이드 산출물을 뽑는다.
-bundled SQLite(C 소스)도 zig cc가 함께 컴파일한다.
+기본 feature의 bundled SQLite(C 소스)도 함께 컴파일한다. SQLCipher를 명시 선택하면 vendored OpenSSL(C 소스)도 추가로 컴파일한다.
 
 ## 요구 도구
 
@@ -11,6 +11,7 @@ bundled SQLite(C 소스)도 zig cc가 함께 컴파일한다.
 | cargo-zigbuild | `cargo install cargo-zigbuild` | `cargo zigbuild --help` |
 | cargo-ndk | `cargo install cargo-ndk` | `cargo ndk --version` |
 | Android NDK | Android Studio SDK Manager | `ANDROID_HOME` 또는 `ANDROID_NDK_HOME` |
+| Perl | Strawberry Perl 또는 vcpkg가 설치한 Perl | `perl -v` |
 
 rust 타깃:
 
@@ -53,7 +54,7 @@ cargo ndk -t arm64-v8a build -p roomrs-mobile-ffi-example
   1. zig 자체가 bionic libc를 제공하지 않는다 —
      `zig cc -target aarch64-linux-android` 실행 시
      `error: unable to provide libc for target '…-android.29'` (제공 목록은 gnu/musl뿐).
-     bionic 헤더/crt는 NDK에만 있다 → libsqlite3-sys의 sqlite3.c 컴파일 불가.
+     bionic 헤더/crt는 NDK에만 있다 → libsqlite3-sys의 SQLCipher C 소스 컴파일 불가.
   2. 그 이전에 cargo-zigbuild 0.22.1의 Windows `.bat` 래퍼를 cc-rs가 잘못 파싱해
      (`failed to find tool "…\8571.exe"`) build script가 먼저 죽는다.
   결론: Android는 cargo-ndk와 NDK 경로를 사용한다.

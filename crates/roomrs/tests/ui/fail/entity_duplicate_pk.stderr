@@ -1,5 +1,5 @@
-error: #[pk] 필드는 최대 1개만 허용됩니다 (복합 PK는 후속 지원)
- --> tests/ui/fail/entity_duplicate_pk.rs:5:8
+error: #[pk(autoincrement)]는 다른 #[pk] 와 함께 사용할 수 없습니다 — SQLite 단일 INTEGER PRIMARY KEY 전용
+ --> tests/ui/fail/entity_duplicate_pk.rs:7:5
   |
-5 | struct Pair {
-  |        ^^^^
+7 |     a: i64,
+  |     ^

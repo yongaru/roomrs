@@ -30,20 +30,10 @@ fn default_table_is_struct_name() {
 
     let db = Db::builder().in_memory().build().unwrap();
     let h = db.run_sync();
-    h.memo_dao()
-        .add(&Memo {
-            id: 0,
-            body: "기본 테이블".into(),
-        })
-        .unwrap();
+    h.memo_dao().add(&Memo { id: 0, body: "기본 테이블".into() }).unwrap();
     assert_eq!(h.memo_dao().all().unwrap().len(), 1);
 
     // sqlite_master에도 struct 이름 그대로
-    let n: i64 = h
-        .query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='Memo'",
-            params![],
-        )
-        .unwrap();
+    let n: i64 = h.query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='Memo'", params![]).unwrap();
     assert_eq!(n, 1);
 }

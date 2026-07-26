@@ -16,6 +16,26 @@ pub struct SchemaSnapshot {
     pub tables: Vec<TableSnapshot>,
 }
 
+/// Trigger SQL file hook recorded in the snapshot (decision 46).
+///
+/// The SQL body is not auto-applied; only path + content hash track drift.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TriggerSnapshot {
+    /// Path relative to the crate manifest (as declared on `#[entity]`).
+    pub path: String,
+    /// FNV-1a 64 of the file bytes at snapshot export/macro expand time.
+    pub content_hash: u64,
+}
+
+/// Generated column meta in a snapshot (decision 54).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratedColumnSnapshot {
+    /// Expression body (SQLite DDL fragment, not sanitized further).
+    pub expr: String,
+    /// `true` = STORED, `false` = VIRTUAL.
+    pub stored: bool,
+}
+
 /// 테이블 스냅샷
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TableSnapshot {
@@ -24,6 +44,15 @@ pub struct TableSnapshot {
     /// 테이블·인덱스 DDL — diff 초안·해시에 사용 (M3)
     #[serde(default)]
     pub ddl: Vec<String>,
+    /// Trigger file hooks — path + content hash (결정 46)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<TriggerSnapshot>,
+    /// `#[entity(strict)]` — STRICT 테이블 (결정 54). 구형 스냅샷 = false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
+    /// `#[entity(without_rowid)]` (결정 54). 구형 스냅샷 = false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub without_rowid: bool,
 }
 
 /// 컬럼 스냅샷
@@ -37,31 +66,61 @@ pub struct ColumnSnapshot {
     /// rename 힌트 (명세 §8.3) — diff 초안 전용, 해시 제외
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renamed_from: Option<String>,
+    /// `#[column(default = "…")]` 렌더 결과 SQL DEFAULT 식 (결정 53).
+    /// 구형 스냅샷은 필드 부재 → `None` (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sql: Option<String>,
+    /// `#[column(collate = "…")]` (결정 54)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collate: Option<String>,
+    /// `#[column(generated = "…")]` (결정 54)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<GeneratedColumnSnapshot>,
 }
 
 impl SchemaSnapshot {
     /// 파일에서 로드
     pub fn read_from(path: &Path) -> std::io::Result<Self> {
-        let raw = std::fs::read_to_string(path)?;
-        serde_json::from_str(&raw).map_err(std::io::Error::other)
+        log::debug!("snapshot read started: path={}", path.display());
+        let result = std::fs::read_to_string(path).and_then(|raw| serde_json::from_str::<Self>(&raw).map_err(std::io::Error::other));
+        match &result {
+            Ok(snapshot) => log::info!("snapshot read: path={}, version={}, tables={}", path.display(), snapshot.version, snapshot.tables.len()),
+            Err(e) => log::error!("snapshot read failed: path={}: {e}", path.display()),
+        }
+        result
     }
 
     /// Parse a snapshot from raw JSON bytes (e.g. a decompressed embedded blob).
     pub fn from_slice(bytes: &[u8]) -> std::io::Result<Self> {
-        serde_json::from_slice(bytes).map_err(std::io::Error::other)
+        log::trace!("snapshot parse started: bytes={}", bytes.len());
+        serde_json::from_slice(bytes).map_err(|e| {
+            log::error!("snapshot parse failed: {e}");
+            std::io::Error::other(e)
+        })
     }
 
     /// Serialize to the pretty JSON format used by snapshot files.
     pub fn to_json(&self) -> std::io::Result<String> {
-        serde_json::to_string_pretty(self).map_err(std::io::Error::other)
+        log::trace!("snapshot serialization started: version={}, tables={}", self.version, self.tables.len());
+        serde_json::to_string_pretty(self).map_err(|e| {
+            log::error!("snapshot serialization failed: {e}");
+            std::io::Error::other(e)
+        })
     }
 
     /// 파일로 저장 (pretty JSON — 리뷰 가능한 diff)
     pub fn write_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let result = (|| {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, self.to_json()?)
+        })();
+        match &result {
+            Ok(()) => log::info!("snapshot written: path={}, version={}, tables={}", path.display(), self.version, self.tables.len()),
+            Err(e) => log::error!("snapshot write failed: path={}: {e}", path.display()),
         }
-        std::fs::write(path, self.to_json()?)
+        result
     }
 
     /// 테이블 조회
@@ -83,13 +142,30 @@ impl SchemaSnapshot {
         for t in tables {
             out.push('t');
             push_field(&mut out, &t.name);
+            // table flags (결정 54)
+            out.push_str(&format!("s{}w{}", t.strict as u8, t.without_rowid as u8));
             out.push('(');
             for c in &t.columns {
                 out.push('c');
                 push_field(&mut out, &c.name);
                 out.push('y');
                 push_field(&mut out, &c.sql_type);
-                out.push_str(&format!("n{}p{},", c.not_null as u8, c.pk as u8));
+                out.push_str(&format!("n{}p{}", c.not_null as u8, c.pk as u8));
+                // DEFAULT 식 — 변경 감지용 해시 포함 (결정 53). 구형 None = 빈 식.
+                out.push('e');
+                push_field(&mut out, c.default_sql.as_deref().unwrap_or(""));
+                // collate / generated (결정 54)
+                out.push('l');
+                push_field(&mut out, c.collate.as_deref().unwrap_or(""));
+                out.push('G');
+                match &c.generated {
+                    Some(g) => {
+                        out.push(if g.stored { 'S' } else { 'V' });
+                        push_field(&mut out, &g.expr);
+                    }
+                    None => out.push_str("0:"),
+                }
+                out.push(',');
             }
             out.push_str(");");
             // 인덱스 등 DDL 변경도 스테일로 감지되도록 해시에 포함 (M3)
@@ -97,6 +173,15 @@ impl SchemaSnapshot {
                 out.push('d');
                 push_field(&mut out, d);
                 out.push(';');
+            }
+            // trigger 훅 경로·내용 hash (결정 46)
+            let mut triggers: Vec<&TriggerSnapshot> = t.triggers.iter().collect();
+            triggers.sort_by(|a, b| a.path.cmp(&b.path));
+            for tr in triggers {
+                out.push('g');
+                push_field(&mut out, &tr.path);
+                out.push('h');
+                out.push_str(&format!("{};", tr.content_hash));
             }
         }
         out
@@ -135,7 +220,9 @@ const DECOMPRESS_LIMIT: usize = 64 * 1024 * 1024;
 /// Used by `#[database]` to embed every committed snapshot into the binary
 /// (spec §8.4, decision 21c). Reverse with [`decompress_snapshot`].
 pub fn compress_snapshot(bytes: &[u8]) -> Vec<u8> {
-    miniz_oxide::deflate::compress_to_vec(bytes, 8)
+    let compressed = miniz_oxide::deflate::compress_to_vec(bytes, 8);
+    log::trace!("snapshot compressed: input_bytes={}, output_bytes={}", bytes.len(), compressed.len());
+    compressed
 }
 
 /// Decompress bytes produced by [`compress_snapshot`].
@@ -144,7 +231,13 @@ pub fn compress_snapshot(bytes: &[u8]) -> Vec<u8> {
 /// 64 MiB sanity limit.
 pub fn decompress_snapshot(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, DECOMPRESS_LIMIT)
-        .map_err(|_| std::io::Error::other("스냅샷 압축 해제 실패: 스트림 손상 또는 64MB 초과"))
+        .inspect(|output| {
+            log::trace!("snapshot decompressed: input_bytes={}, output_bytes={}", bytes.len(), output.len());
+        })
+        .map_err(|_| {
+            log::error!("snapshot decompression failed: input_bytes={}, limit={DECOMPRESS_LIMIT}", bytes.len());
+            std::io::Error::other("스냅샷 압축 해제 실패: 스트림 손상 또는 64MB 초과")
+        })
 }
 
 // ─────────────────────── 스냅샷 파일 경로 (결정 21) ───────────────────────
@@ -163,19 +256,17 @@ pub const SCHEMA_DIR_RELATIVE: &str = "migrations/schema";
 /// test runs — otherwise the embedded snapshot chain and the exported
 /// files silently diverge.
 pub fn resolve_schema_dir(manifest_dir: &str) -> PathBuf {
-    match std::env::var("ROOMRS_SCHEMA_DIR") {
+    let resolved = match std::env::var("ROOMRS_SCHEMA_DIR") {
         Ok(p) if !p.is_empty() => {
             let p = PathBuf::from(p);
             // 상대 경로 = manifest 기준 절대화 — fs::read(CWD 기준)와
             // include_bytes!(소스 기준)가 서로 다른 파일을 보는 이중 해석 차단 (M-8)
-            if p.is_relative() {
-                Path::new(manifest_dir).join(p)
-            } else {
-                p
-            }
+            if p.is_relative() { Path::new(manifest_dir).join(p) } else { p }
         }
         _ => Path::new(manifest_dir).join(SCHEMA_DIR_RELATIVE),
-    }
+    };
+    log::debug!("schema directory resolved: path={}", resolved.display());
+    resolved
 }
 
 /// File name of a versioned snapshot: `{db_name}.{version}.json`
@@ -194,12 +285,19 @@ pub fn snapshot_path(dir: &Path, db_name: &str, version: u32) -> PathBuf {
 /// duplicate versions are impossible by file name. A missing directory
 /// yields an empty list.
 pub fn list_snapshot_versions(dir: &Path, db_name: &str) -> std::io::Result<Vec<(u32, PathBuf)>> {
+    log::debug!("snapshot scan started: directory={}, database={db_name}", dir.display());
     let mut out: Vec<(u32, PathBuf)> = Vec::new();
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         // 디렉토리 부재 = 스냅샷 없음 (온보딩 마찰 방지, 명세 §7.4c)
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(e) => return Err(e),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log::debug!("snapshot directory absent: path={}", dir.display());
+            return Ok(out);
+        }
+        Err(e) => {
+            log::error!("snapshot scan failed: directory={}: {e}", dir.display());
+            return Err(e);
+        }
     };
     let prefix = format!("{db_name}.");
     for entry in rd {
@@ -209,9 +307,11 @@ pub fn list_snapshot_versions(dir: &Path, db_name: &str) -> std::io::Result<Vec<
         let Some(v) = parse_snapshot_version(name, &prefix)? else {
             continue;
         };
+        log::trace!("snapshot candidate accepted: database={db_name}, version={v}");
         out.push((v, entry.path()));
     }
     out.sort_by_key(|(v, _)| *v);
+    log::info!("snapshot scan completed: database={db_name}, count={}", out.len());
     Ok(out)
 }
 
@@ -235,9 +335,7 @@ fn parse_snapshot_version(name: &str, prefix: &str) -> std::io::Result<Option<u3
     match num.parse() {
         Ok(v) => Ok(Some(v)),
         // 전부 숫자인데 파스 실패 = u32 오버플로 (L-14)
-        Err(_) => Err(std::io::Error::other(format!(
-            "스냅샷 파일명 버전이 u32 범위를 넘습니다: {name}"
-        ))),
+        Err(_) => Err(std::io::Error::other(format!("스냅샷 파일명 버전이 u32 범위를 넘습니다: {name}"))),
     }
 }
 
@@ -246,11 +344,11 @@ fn parse_snapshot_version(name: &str, prefix: &str) -> std::io::Result<Option<u3
 /// Structured migration plan between two snapshots (spec §8.1/§8.4).
 ///
 /// `safe` holds executable SQL statements (CREATE TABLE, nullable ADD
-/// COLUMN, valid RENAME COLUMN, CREATE INDEX). `destructive` holds
-/// human-review items that roomrs never runs automatically (DROP TABLE,
-/// DROP COLUMN, column definition changes, NOT NULL ADD COLUMN without a
-/// default, DROP INDEX). `warnings` reports ignored or invalid rename
-/// hints.
+/// COLUMN, `NOT NULL DEFAULT` ADD COLUMN, valid RENAME COLUMN, CREATE INDEX).
+/// `destructive` holds human-review items that roomrs never runs automatically
+/// (DROP TABLE, DROP COLUMN, column definition/DEFAULT changes, NOT NULL ADD
+/// COLUMN without a default, DROP INDEX). `warnings` reports ignored or
+/// invalid rename hints.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiffPlan {
     /// Executable safe statements, in order.
@@ -270,14 +368,16 @@ pub struct DiffPlan {
 /// consumed only once — a second hint pointing at the same source degrades
 /// to ADD COLUMN with a warning (M-9).
 ///
-/// Constraint-level `CREATE TABLE` changes (UNIQUE/DEFAULT/CHECK …) are not
-/// visible in the column snapshots, so when the column definitions of a
-/// same-name table are identical but its `CREATE TABLE` statement text
-/// differs (whitespace-normalized), a destructive table-rewrite item is
-/// emitted (H-5). Limitation: when column changes and constraint changes
-/// happen in the same version step, the DDL text difference cannot be
-/// attributed, so only the column-level items are reported.
+/// Column-level DEFAULT is tracked in [`ColumnSnapshot::default_sql`]
+/// (decision 53). Table-level UNIQUE/CHECK/FK changes remain DDL-text based:
+/// when column definitions of a same-name table are identical but its
+/// `CREATE TABLE` statement text differs (whitespace-normalized), a
+/// destructive table-rewrite item is emitted (H-5). Limitation: when column
+/// changes and constraint changes happen in the same version step, the DDL
+/// text difference cannot be attributed, so only the column-level items are
+/// reported.
 pub fn diff_plan(old: &SchemaSnapshot, new: &SchemaSnapshot) -> DiffPlan {
+    log::debug!("schema diff started: from={}, to={}, old_tables={}, new_tables={}", old.version, new.version, old.tables.len(), new.tables.len());
     let mut plan = DiffPlan::default();
 
     // 새 테이블 — DDL 전체가 안전 연산
@@ -304,59 +404,52 @@ pub fn diff_plan(old: &SchemaSnapshot, new: &SchemaSnapshot) -> DiffPlan {
         diff_table_constraints(ot, nt, &mut plan);
     }
 
+    log::debug!("schema diff completed: from={}, to={}, safe={}, destructive={}, warnings={}", old.version, new.version, plan.safe.len(), plan.destructive.len(), plan.warnings.len());
+    if !plan.destructive.is_empty() {
+        log::warn!("schema diff contains destructive changes: from={}, to={}, count={}", old.version, new.version, plan.destructive.len());
+    }
+    if !plan.warnings.is_empty() {
+        log::warn!("schema diff contains warnings: from={}, to={}, count={}", old.version, new.version, plan.warnings.len());
+    }
     plan
 }
 
-/// 동일 이름 테이블의 CREATE TABLE 문 비교 — 제약(UNIQUE/DEFAULT/CHECK 등)
-/// 변경 감지 (H-5). 컬럼 스냅샷에는 제약 정보가 없어 컬럼 diff만으로는
-/// 빈 계획이 나와 auto_migrate가 조용히 스키마 분기를 방치한다.
+/// 동일 이름 테이블의 CREATE TABLE 문 비교 — table-level 제약(UNIQUE/CHECK/FK 등)
+/// 변경 감지 (H-5). 컬럼 DEFAULT는 [`ColumnSnapshot::default_sql`] 로 별도 비교.
 ///
-/// 한계(의도된 보수 정책): 컬럼 정의(이름/타입/not_null/pk)가 **완전히 동일**할
-/// 때만 비교한다 — 컬럼 추가/삭제/rename이 있으면 CREATE TABLE 문은 그로
-/// 인해 당연히 달라지므로, 그 차이를 재작성 필요로 오탐하지 않기 위해
-/// 건너뛴다. 컬럼 변경과 제약 변경이 한 버전에서 동시에 일어나면 제약
-/// 변경은 감지되지 않는다 (rustdoc의 diff_plan 한계 참조).
+/// 한계(의도된 보수 정책): 컬럼 정의(이름/타입/not_null/pk/default_sql)가
+/// **완전히 동일**할 때만 비교한다 — 컬럼 추가/삭제/rename이 있으면 CREATE
+/// TABLE 문은 그로 인해 당연히 달라지므로, 그 차이를 재작성 필요로 오탐하지
+/// 않기 위해 건너뛴다. 컬럼 변경과 제약 변경이 한 버전에서 동시에 일어나면
+/// 제약 변경은 감지되지 않는다 (rustdoc의 diff_plan 한계 참조).
 fn diff_table_constraints(ot: &TableSnapshot, nt: &TableSnapshot, plan: &mut DiffPlan) {
     // 컬럼 집합 동일 검사 — 이름 기준 매칭(순서 무관), 정의 필드 전부 일치
-    let same_columns = ot.columns.len() == nt.columns.len()
-        && nt.columns.iter().all(|n| {
-            ot.columns.iter().any(|o| {
-                o.name == n.name
-                    && o.sql_type == n.sql_type
-                    && o.not_null == n.not_null
-                    && o.pk == n.pk
-            })
-        });
+    let same_columns = ot.columns.len() == nt.columns.len() && nt.columns.iter().all(|n| ot.columns.iter().any(|o| o.name == n.name && o.sql_type == n.sql_type && o.not_null == n.not_null && o.pk == n.pk && o.default_sql == n.default_sql && o.collate == n.collate && o.generated == n.generated));
     if !same_columns {
+        return;
+    }
+    // STRICT / WITHOUT ROWID 플래그 변경 = 테이블 재작성 (결정 54)
+    if ot.strict != nt.strict || ot.without_rowid != nt.without_rowid {
+        plan.destructive.push(format!("테이블 재작성 필요(STRICT/WITHOUT ROWID 변경): \"{}\" — 수동 migration", nt.name));
         return;
     }
     // 구형 스냅샷(serde default)은 ddl 이 빈 벡터 — 한쪽만 비면 [] vs [CREATE …]
     // 차이를 재작성 필요로 오탐한다. 비교 스킵 + 경고로 강등 (D-2b)
     if ot.ddl.is_empty() || nt.ddl.is_empty() {
         if ot.ddl.is_empty() != nt.ddl.is_empty() {
-            plan.warnings.push(format!(
-                "제약 비교 스킵: \"{}\" — 한쪽 스냅샷에 ddl 정보가 없습니다(구형 스냅샷) — write_schema_snapshot 재생성 권장",
-                nt.name
-            ));
+            plan.warnings.push(format!("제약 비교 스킵: \"{}\" — 한쪽 스냅샷에 ddl 정보가 없습니다(구형 스냅샷) — `cargo roomrs schema export` 로 재생성 권장", nt.name));
         }
         return;
     }
     if create_table_entries(ot) != create_table_entries(nt) {
-        plan.destructive.push(format!(
-            "테이블 재작성 필요(제약/DDL 변경): \"{}\" — 컬럼 정의는 동일하나 CREATE TABLE 문이 다릅니다",
-            nt.name
-        ));
+        plan.destructive.push(format!("테이블 재작성 필요(제약/DDL 변경): \"{}\" — 컬럼 정의는 동일하나 CREATE TABLE 문이 다릅니다", nt.name));
     }
 }
 
 /// 인덱스 외 DDL(CREATE TABLE 문)만 공백 정규화해 추출 (H-5).
 /// 정규화는 인용 구간 **밖**의 공백만 접는다 (D-2a)
 fn create_table_entries(t: &TableSnapshot) -> Vec<String> {
-    t.ddl
-        .iter()
-        .filter(|d| index_name(d).is_none())
-        .map(|d| normalize_ws_outside_quotes(d))
-        .collect()
+    t.ddl.iter().filter(|d| index_name(d).is_none()).map(|d| normalize_ws_outside_quotes(d)).collect()
 }
 
 /// 인용 구간('…', "…") 밖의 연속 공백을 1개로 접고 선두/말미 공백을 제거한다.
@@ -394,20 +487,17 @@ fn normalize_ws_outside_quotes(s: &str) -> String {
 }
 
 /// 동일 이름 테이블의 컬럼 diff — 정의 변경 감지(H-10)·rename 힌트 검증(H-11)·
-/// rename 원본 중복 소비 차단(M-9)
+/// rename 원본 중복 소비 차단(M-9)·NOT NULL DEFAULT 안전 ADD(결정 53)
 fn diff_columns(ot: &TableSnapshot, nt: &TableSnapshot, plan: &mut DiffPlan) {
     // rename 힌트가 이미 소비한 원본 컬럼 — 같은 원본을 두 번 RENAME 하면
     // 두 번째 문이 런타임에 실패한다(safe 계약 위반, M-9)
     let mut consumed_sources: Vec<&str> = Vec::new();
     for nc in &nt.columns {
-        // 동명 컬럼 — sql_type/not_null/pk 변경 = 테이블 재작성 필요 (H-10)
+        // 동명 컬럼 — sql_type/not_null/pk/default 변경 = 테이블 재작성 필요 (H-10/결정 53)
         if let Some(oc) = ot.columns.iter().find(|c| c.name == nc.name) {
             let mut changes: Vec<String> = Vec::new();
             if oc.sql_type != nc.sql_type {
-                changes.push(format!(
-                    "sql_type \"{}\" -> \"{}\"",
-                    oc.sql_type, nc.sql_type
-                ));
+                changes.push(format!("sql_type \"{}\" -> \"{}\"", oc.sql_type, nc.sql_type));
             }
             if oc.not_null != nc.not_null {
                 changes.push(format!("not_null {} -> {}", oc.not_null, nc.not_null));
@@ -415,13 +505,22 @@ fn diff_columns(ot: &TableSnapshot, nt: &TableSnapshot, plan: &mut DiffPlan) {
             if oc.pk != nc.pk {
                 changes.push(format!("pk {} -> {}", oc.pk, nc.pk));
             }
+            if oc.default_sql != nc.default_sql {
+                // DEFAULT 변경은 ALTER 불가 — 수동 migration 안내 (결정 53)
+                let old_d = oc.default_sql.as_deref().unwrap_or("(없음)");
+                let new_d = nc.default_sql.as_deref().unwrap_or("(없음)");
+                changes.push(format!("default {old_d} -> {new_d}"));
+            }
+            if oc.collate != nc.collate {
+                let old_c = oc.collate.as_deref().unwrap_or("(없음)");
+                let new_c = nc.collate.as_deref().unwrap_or("(없음)");
+                changes.push(format!("collate {old_c} -> {new_c}"));
+            }
+            if oc.generated != nc.generated {
+                changes.push("generated 식/STORED 변경".into());
+            }
             if !changes.is_empty() {
-                plan.destructive.push(format!(
-                    "테이블 재작성 필요: \"{}\".\"{}\" 정의 변경 ({})",
-                    nt.name,
-                    nc.name,
-                    changes.join(", ")
-                ));
+                plan.destructive.push(format!("테이블 재작성 필요: \"{}\".\"{}\" 정의 변경 ({})", nt.name, nc.name, changes.join(", ")));
             }
             continue;
         }
@@ -431,37 +530,22 @@ fn diff_columns(ot: &TableSnapshot, nt: &TableSnapshot, plan: &mut DiffPlan) {
             if consumed_sources.contains(&from.as_str()) {
                 // 같은 원본을 이미 다른 컬럼이 rename으로 소비 — 두 번째 RENAME은
                 // 런타임 실패이므로 경고 + ADD COLUMN 강등 (M-9)
-                plan.warnings.push(format!(
-                    "rename 힌트 중복: \"{}\".\"{from}\" 은 이미 다른 컬럼의 rename 원본으로 소비됨 — \"{}\"는 ADD COLUMN으로 처리",
-                    nt.name, nc.name
-                ));
+                plan.warnings.push(format!("rename 힌트 중복: \"{}\".\"{from}\" 은 이미 다른 컬럼의 rename 원본으로 소비됨 — \"{}\"는 ADD COLUMN으로 처리", nt.name, nc.name));
             } else if nt.has_column(from) {
                 // 새 스키마에 원본 컬럼이 여전히 존재 = 힌트 무효 (H-11) — ADD로 강등
-                plan.warnings.push(format!(
-                    "rename 힌트 무시: 새 스키마 \"{}\"에 \"{from}\" 컬럼이 여전히 존재 — \"{}\"는 ADD COLUMN으로 처리",
-                    nt.name, nc.name
-                ));
+                plan.warnings.push(format!("rename 힌트 무시: 새 스키마 \"{}\"에 \"{from}\" 컬럼이 여전히 존재 — \"{}\"는 ADD COLUMN으로 처리", nt.name, nc.name));
             } else if let Some(of) = ot.columns.iter().find(|c| &c.name == from) {
                 // 원본 소비 기록 — safe RENAME이든 파괴적 재작성이든 원본은 소비됨 (M-9)
                 consumed_sources.push(from);
-                if of.sql_type == nc.sql_type && of.not_null == nc.not_null && of.pk == nc.pk {
-                    plan.safe.push(format!(
-                        "ALTER TABLE \"{}\" RENAME COLUMN \"{from}\" TO \"{}\"",
-                        nt.name, nc.name
-                    ));
+                if of.sql_type == nc.sql_type && of.not_null == nc.not_null && of.pk == nc.pk && of.default_sql == nc.default_sql && of.collate == nc.collate && of.generated == nc.generated {
+                    plan.safe.push(format!("ALTER TABLE \"{}\" RENAME COLUMN \"{from}\" TO \"{}\"", nt.name, nc.name));
                 } else {
                     // rename + 정의 변경 동시 = RENAME COLUMN으로 불가 (H-10)
-                    plan.destructive.push(format!(
-                        "테이블 재작성 필요: \"{}\".\"{from}\" -> \"{}\" rename에 정의 변경이 동반됨",
-                        nt.name, nc.name
-                    ));
+                    plan.destructive.push(format!("테이블 재작성 필요: \"{}\".\"{from}\" -> \"{}\" rename에 정의 변경이 동반됨", nt.name, nc.name));
                 }
                 continue;
             } else {
-                plan.warnings.push(format!(
-                    "잘못된 rename 힌트: 옛 스키마 \"{}\"에 \"{from}\" 컬럼 없음 — \"{}\"는 ADD COLUMN으로 처리",
-                    nt.name, nc.name
-                ));
+                plan.warnings.push(format!("잘못된 rename 힌트: 옛 스키마 \"{}\"에 \"{from}\" 컬럼 없음 — \"{}\"는 ADD COLUMN으로 처리", nt.name, nc.name));
             }
         }
 
@@ -470,56 +554,55 @@ fn diff_columns(ot: &TableSnapshot, nt: &TableSnapshot, plan: &mut DiffPlan) {
         if !nc.sql_type.is_empty() {
             col.push_str(&format!(" {}", nc.sql_type));
         }
+        // generated / advanced column on existing table = 수동 (결정 54)
+        if nc.generated.is_some() {
+            plan.destructive.push(format!("수동 migration 필요(generated column 추가): \"{}\".\"{}\" — 기존 테이블 advanced DSL 변경은 자동 실행하지 않습니다", nt.name, nc.name));
+            continue;
+        }
+        if let Some(collate) = &nc.collate {
+            col.push_str(&format!(" COLLATE {collate}"));
+        }
         if nc.pk {
-            plan.destructive.push(format!(
-                "테이블 재작성 필요: \"{}\".\"{}\" — PK 컬럼은 ADD COLUMN 불가",
-                nt.name, nc.name
-            ));
+            plan.destructive.push(format!("테이블 재작성 필요: \"{}\".\"{}\" — PK 컬럼은 ADD COLUMN 불가", nt.name, nc.name));
         } else if nc.not_null {
-            // NOT NULL ADD COLUMN은 기존 행 때문에 DEFAULT 필요 — 스냅샷에
-            // DEFAULT 정보가 없으므로 파괴적(수동 검토)으로 분류
-            plan.destructive.push(format!(
-                "ALTER TABLE \"{}\" ADD COLUMN {col} NOT NULL — DEFAULT 필요(기존 행)",
-                nt.name
-            ));
+            // NOT NULL ADD — DEFAULT 보유 시 SQLite 안전 연산 (결정 53)
+            match &nc.default_sql {
+                Some(def) => plan.safe.push(format!("ALTER TABLE \"{}\" ADD COLUMN {col} NOT NULL DEFAULT {def}", nt.name)),
+                None => plan.destructive.push(format!("ALTER TABLE \"{}\" ADD COLUMN {col} NOT NULL — DEFAULT 필요(기존 행) — 수동 migration 또는 #[column(default = \"…\")] 추가 후 export", nt.name)),
+            }
         } else {
-            plan.safe
-                .push(format!("ALTER TABLE \"{}\" ADD COLUMN {col}", nt.name));
+            // nullable ADD — DEFAULT 있으면 함께 기록
+            match &nc.default_sql {
+                Some(def) => plan.safe.push(format!("ALTER TABLE \"{}\" ADD COLUMN {col} DEFAULT {def}", nt.name)),
+                None => plan.safe.push(format!("ALTER TABLE \"{}\" ADD COLUMN {col}", nt.name)),
+            }
         }
     }
 
     // 삭제된 컬럼 — 유효한 rename으로 소비된 컬럼은 제외
     for oc in &ot.columns {
-        let renamed_away = nt
-            .columns
-            .iter()
-            .any(|nc| nc.renamed_from.as_deref() == Some(oc.name.as_str()));
+        let renamed_away = nt.columns.iter().any(|nc| nc.renamed_from.as_deref() == Some(oc.name.as_str()));
         if !nt.has_column(&oc.name) && !renamed_away {
-            plan.destructive.push(format!(
-                "ALTER TABLE \"{}\" DROP COLUMN \"{}\"",
-                nt.name, oc.name
-            ));
+            plan.destructive.push(format!("ALTER TABLE \"{}\" DROP COLUMN \"{}\"", nt.name, oc.name));
         }
     }
 }
 
-/// 동일 이름 테이블의 인덱스 diff — 이름 기준 추가/삭제/변경 감지 (H-10)
+/// 동일 이름 테이블의 인덱스 diff — 이름 기준 추가/삭제/변경 감지 (H-10).
+/// 일반 CREATE INDEX 추가 = 안전. UNIQUE INDEX 추가·변경 = 수동(파괴적 분류, 결정 42).
 fn diff_indexes(ot: &TableSnapshot, nt: &TableSnapshot, plan: &mut DiffPlan) {
     let old_idx: Vec<(String, &String)> = index_entries(ot);
     let new_idx: Vec<(String, &String)> = index_entries(nt);
 
     for (name, ddl) in &new_idx {
         match old_idx.iter().find(|(n, _)| n == name) {
-            // 신규 인덱스 = 안전
+            None if is_unique_index(ddl) => {
+                plan.destructive.push(format!("수동 migration 필요(UNIQUE INDEX): {ddl}"));
+            }
+            // 신규 일반 인덱스 = 안전
             None => plan.safe.push((*ddl).clone()),
             // 동명 인덱스 정의 변경 = 재생성 필요(파괴적 검토)
-            Some((_, old_ddl))
-                if normalize_ws_outside_quotes(old_ddl) != normalize_ws_outside_quotes(ddl) =>
-            {
-                plan.destructive.push(format!(
-                    "인덱스 재생성 필요: DROP INDEX \"{name}\" 후 재생성 ({ddl})"
-                ))
-            }
+            Some((_, old_ddl)) if normalize_ws_outside_quotes(old_ddl) != normalize_ws_outside_quotes(ddl) => plan.destructive.push(format!("인덱스 재생성 필요: DROP INDEX \"{name}\" 후 재생성 ({ddl})")),
             Some(_) => {}
         }
     }
@@ -528,14 +611,37 @@ fn diff_indexes(ot: &TableSnapshot, nt: &TableSnapshot, plan: &mut DiffPlan) {
             plan.destructive.push(format!("DROP INDEX \"{name}\""));
         }
     }
+    // trigger 훅 변경 = 수동 (결정 46)
+    diff_triggers(ot, nt, plan);
+}
+
+/// trigger 경로·내용 hash diff — 생성·변경·삭제는 자동 실행 금지 (결정 46)
+fn diff_triggers(ot: &TableSnapshot, nt: &TableSnapshot, plan: &mut DiffPlan) {
+    for tr in &nt.triggers {
+        match ot.triggers.iter().find(|o| o.path == tr.path) {
+            None => plan.destructive.push(format!("수동 migration 필요(trigger 추가): {}", tr.path)),
+            Some(old) if old.content_hash != tr.content_hash => plan.destructive.push(format!("수동 migration 필요(trigger 내용 변경): {}", tr.path)),
+            Some(_) => {}
+        }
+    }
+    for old in &ot.triggers {
+        if !nt.triggers.iter().any(|n| n.path == old.path) {
+            plan.destructive.push(format!("수동 migration 필요(trigger 삭제): {}", old.path));
+        }
+    }
+}
+
+/// `CREATE UNIQUE INDEX …` 여부 (대소문자 무시)
+fn is_unique_index(ddl: &str) -> bool {
+    let Some(rest) = strip_keyword(ddl, "CREATE") else {
+        return false;
+    };
+    strip_keyword(rest, "UNIQUE").is_some()
 }
 
 /// 테이블 DDL에서 (인덱스명, DDL) 목록 추출
 fn index_entries(t: &TableSnapshot) -> Vec<(String, &String)> {
-    t.ddl
-        .iter()
-        .filter_map(|d| index_name(d).map(|n| (n, d)))
-        .collect()
+    t.ddl.iter().filter_map(|d| index_name(d).map(|n| (n, d))).collect()
 }
 
 /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name …` DDL에서 인덱스명 추출.
@@ -598,14 +704,8 @@ fn parse_leading_identifier(s: &str) -> Option<String> {
         '[' => s[1..].find(']').map(|end| s[1..1 + end].to_string()),
         _ => {
             // 비인용 — 공백 또는 여는 괄호(`name(col)` 표기) 앞까지
-            let end = s
-                .find(|c: char| c.is_whitespace() || c == '(')
-                .unwrap_or(s.len());
-            if end == 0 {
-                None
-            } else {
-                Some(s[..end].to_string())
-            }
+            let end = s.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(s.len());
+            if end == 0 { None } else { Some(s[..end].to_string()) }
         }
     }
 }
@@ -615,10 +715,7 @@ fn parse_leading_identifier(s: &str) -> Option<String> {
 /// 주석, 경고는 `-- 경고` 주석으로 출력한다.
 pub fn diff_sql(old: &SchemaSnapshot, new: &SchemaSnapshot) -> String {
     let plan = diff_plan(old, new);
-    let mut out = format!(
-        "-- roomrs 자동 diff 초안: v{} -> v{}\n-- 검토 후 사용하세요. 파괴적 변경은 주석 처리되어 있습니다.\n",
-        old.version, new.version
-    );
+    let mut out = format!("-- roomrs 자동 diff 초안: v{} -> v{}\n-- 검토 후 사용하세요. 파괴적 변경은 주석 처리되어 있습니다.\n", old.version, new.version);
     for s in &plan.safe {
         out.push_str(&format!("{s};\n"));
     }
@@ -644,6 +741,23 @@ mod tests {
             not_null,
             pk,
             renamed_from: None,
+            default_sql: None,
+            collate: None,
+            generated: None,
+        }
+    }
+
+    /// DEFAULT 포함 컬럼 스냅샷 헬퍼
+    fn col_default(name: &str, sql_type: &str, not_null: bool, default_sql: &str) -> ColumnSnapshot {
+        ColumnSnapshot {
+            name: name.into(),
+            sql_type: sql_type.into(),
+            not_null,
+            pk: false,
+            renamed_from: None,
+            default_sql: Some(default_sql.into()),
+            collate: None,
+            generated: None,
         }
     }
 
@@ -653,6 +767,9 @@ mod tests {
             name: name.into(),
             columns,
             ddl: ddl.into_iter().map(String::from).collect(),
+            triggers: vec![],
+            strict: false,
+            without_rowid: false,
         }
     }
 
@@ -664,10 +781,7 @@ mod tests {
     /// 정준 문자열이 테이블 순서에 불변인지
     #[test]
     fn canonical_is_order_invariant() {
-        let a = snap(
-            1,
-            vec![table("b", vec![], vec![]), table("a", vec![], vec![])],
-        );
+        let a = snap(1, vec![table("b", vec![], vec![]), table("a", vec![], vec![])]);
         let mut b = a.clone();
         b.tables.reverse();
         assert_eq!(a.hash(), b.hash());
@@ -676,10 +790,7 @@ mod tests {
     /// 컬럼 변경 = 해시 변경
     #[test]
     fn hash_changes_on_column_change() {
-        let a = snap(
-            1,
-            vec![table("t", vec![col("id", "INTEGER", true, true)], vec![])],
-        );
+        let a = snap(1, vec![table("t", vec![col("id", "INTEGER", true, true)], vec![])]);
         let mut b = a.clone();
         b.tables[0].columns[0].name = "id2".into();
         assert_ne!(a.hash(), b.hash());
@@ -689,14 +800,8 @@ mod tests {
     #[test]
     fn canonical_no_field_boundary_collision() {
         // 옛 포맷("name:type:nn:pk,")에서는 두 스냅샷 모두 "a:X:1:0:0," 로 충돌
-        let a = snap(
-            1,
-            vec![table("t", vec![col("a", "X:1", false, false)], vec![])],
-        );
-        let b = snap(
-            1,
-            vec![table("t", vec![col("a:X", "1", false, false)], vec![])],
-        );
+        let a = snap(1, vec![table("t", vec![col("a", "X:1", false, false)], vec![])]);
+        let b = snap(1, vec![table("t", vec![col("a:X", "1", false, false)], vec![])]);
         assert_ne!(a.canonical_string(), b.canonical_string());
         assert_ne!(a.hash(), b.hash());
     }
@@ -704,12 +809,7 @@ mod tests {
     /// 압축/해제 왕복
     #[test]
     fn compress_roundtrip() {
-        let json = snap(
-            3,
-            vec![table("t", vec![col("id", "INTEGER", true, true)], vec![])],
-        )
-        .to_json()
-        .unwrap();
+        let json = snap(3, vec![table("t", vec![col("id", "INTEGER", true, true)], vec![])]).to_json().unwrap();
         let comp = compress_snapshot(json.as_bytes());
         let back = decompress_snapshot(&comp).unwrap();
         assert_eq!(back, json.as_bytes());
@@ -747,48 +847,30 @@ mod tests {
     #[test]
     fn snapshot_path_rule() {
         assert_eq!(snapshot_file_name("app_db", 3), "app_db.3.json");
-        assert_eq!(
-            snapshot_path(Path::new("/x"), "app_db", 3),
-            Path::new("/x").join("app_db.3.json")
-        );
+        assert_eq!(snapshot_path(Path::new("/x"), "app_db", 3), Path::new("/x").join("app_db.3.json"));
     }
 
     /// diff_plan — 동명 컬럼 타입 변경 = 파괴적 재작성 항목 (H-10)
     #[test]
     fn diff_plan_type_change_is_destructive() {
-        let old = snap(
-            1,
-            vec![table("t", vec![col("c", "TEXT", true, false)], vec![])],
-        );
-        let new = snap(
-            2,
-            vec![table("t", vec![col("c", "INTEGER", true, false)], vec![])],
-        );
+        let old = snap(1, vec![table("t", vec![col("c", "TEXT", true, false)], vec![])]);
+        let new = snap(2, vec![table("t", vec![col("c", "INTEGER", true, false)], vec![])]);
         let plan = diff_plan(&old, &new);
         assert!(plan.safe.is_empty(), "{plan:?}");
         assert_eq!(plan.destructive.len(), 1);
-        assert!(
-            plan.destructive[0].contains("테이블 재작성 필요"),
-            "{plan:?}"
-        );
+        assert!(plan.destructive[0].contains("테이블 재작성 필요"), "{plan:?}");
         assert!(plan.destructive[0].contains("sql_type"), "{plan:?}");
     }
 
     /// diff_plan — 유효한 rename 힌트 = 안전 RENAME COLUMN
     #[test]
     fn diff_plan_valid_rename_is_safe() {
-        let old = snap(
-            1,
-            vec![table("t", vec![col("title", "TEXT", true, false)], vec![])],
-        );
+        let old = snap(1, vec![table("t", vec![col("title", "TEXT", true, false)], vec![])]);
         let mut renamed = col("subject", "TEXT", true, false);
         renamed.renamed_from = Some("title".into());
         let new = snap(2, vec![table("t", vec![renamed], vec![])]);
         let plan = diff_plan(&old, &new);
-        assert_eq!(
-            plan.safe,
-            vec![r#"ALTER TABLE "t" RENAME COLUMN "title" TO "subject""#.to_string()]
-        );
+        assert_eq!(plan.safe, vec![r#"ALTER TABLE "t" RENAME COLUMN "title" TO "subject""#.to_string()]);
         assert!(plan.destructive.is_empty(), "{plan:?}");
         assert!(plan.warnings.is_empty(), "{plan:?}");
     }
@@ -796,73 +878,41 @@ mod tests {
     /// diff_plan — 새 스키마에 원본 컬럼이 남아 있는 rename 힌트 = 무시 + 경고 (H-11)
     #[test]
     fn diff_plan_rename_hint_ignored_when_source_still_exists() {
-        let old = snap(
-            1,
-            vec![table("t", vec![col("title", "TEXT", false, false)], vec![])],
-        );
+        let old = snap(1, vec![table("t", vec![col("title", "TEXT", false, false)], vec![])]);
         let mut copied = col("subject", "TEXT", false, false);
         copied.renamed_from = Some("title".into());
-        let new = snap(
-            2,
-            vec![table(
-                "t",
-                vec![col("title", "TEXT", false, false), copied],
-                vec![],
-            )],
-        );
+        let new = snap(2, vec![table("t", vec![col("title", "TEXT", false, false), copied], vec![])]);
         let plan = diff_plan(&old, &new);
         assert_eq!(plan.warnings.len(), 1, "{plan:?}");
         assert!(plan.warnings[0].contains("rename 힌트 무시"), "{plan:?}");
         // ADD COLUMN으로 강등 (nullable = 안전)
-        assert_eq!(
-            plan.safe,
-            vec![r#"ALTER TABLE "t" ADD COLUMN "subject" TEXT"#.to_string()]
-        );
+        assert_eq!(plan.safe, vec![r#"ALTER TABLE "t" ADD COLUMN "subject" TEXT"#.to_string()]);
     }
 
     /// diff_plan — 옛 스키마에 원본이 없는 rename 힌트 = 경고 + ADD 강등
     #[test]
     fn diff_plan_rename_hint_missing_source_warns() {
-        let old = snap(
-            1,
-            vec![table("t", vec![col("id", "INTEGER", true, true)], vec![])],
-        );
+        let old = snap(1, vec![table("t", vec![col("id", "INTEGER", true, true)], vec![])]);
         let mut renamed = col("subject", "TEXT", false, false);
         renamed.renamed_from = Some("ghost".into());
-        let new = snap(
-            2,
-            vec![table(
-                "t",
-                vec![col("id", "INTEGER", true, true), renamed],
-                vec![],
-            )],
-        );
+        let new = snap(2, vec![table("t", vec![col("id", "INTEGER", true, true), renamed], vec![])]);
         let plan = diff_plan(&old, &new);
         assert_eq!(plan.warnings.len(), 1, "{plan:?}");
         assert!(plan.warnings[0].contains("잘못된 rename 힌트"), "{plan:?}");
-        assert_eq!(
-            plan.safe,
-            vec![r#"ALTER TABLE "t" ADD COLUMN "subject" TEXT"#.to_string()]
-        );
+        assert_eq!(plan.safe, vec![r#"ALTER TABLE "t" ADD COLUMN "subject" TEXT"#.to_string()]);
     }
 
     /// diff_plan — rename 힌트 + 정의 변경 동반 = 파괴적
     #[test]
     fn diff_plan_rename_with_type_change_is_destructive() {
-        let old = snap(
-            1,
-            vec![table("t", vec![col("title", "TEXT", true, false)], vec![])],
-        );
+        let old = snap(1, vec![table("t", vec![col("title", "TEXT", true, false)], vec![])]);
         let mut renamed = col("subject", "INTEGER", true, false);
         renamed.renamed_from = Some("title".into());
         let new = snap(2, vec![table("t", vec![renamed], vec![])]);
         let plan = diff_plan(&old, &new);
         assert!(plan.safe.is_empty(), "{plan:?}");
         assert_eq!(plan.destructive.len(), 1, "{plan:?}");
-        assert!(
-            plan.destructive[0].contains("테이블 재작성 필요"),
-            "{plan:?}"
-        );
+        assert!(plan.destructive[0].contains("테이블 재작성 필요"), "{plan:?}");
     }
 
     /// diff_plan — 인덱스 추가 = 안전, 삭제 = 파괴적 (H-10)
@@ -870,44 +920,91 @@ mod tests {
     fn diff_plan_index_add_remove() {
         let ct = r#"CREATE TABLE "t" ("id" INTEGER PRIMARY KEY)"#;
         let idx_a = r#"CREATE INDEX IF NOT EXISTS "idx_t_a" ON "t"("a")"#;
-        let idx_b = r#"CREATE UNIQUE INDEX "idx_t_b" ON "t"("b")"#;
+        let idx_b = r#"CREATE INDEX IF NOT EXISTS "idx_t_b" ON "t"("b")"#;
+        let idx_u = r#"CREATE UNIQUE INDEX "idx_t_u" ON "t"("u")"#;
         let cols = vec![col("id", "INTEGER", true, true)];
         let old = snap(1, vec![table("t", cols.clone(), vec![ct, idx_a])]);
-        let new = snap(2, vec![table("t", cols, vec![ct, idx_b])]);
+        let new = snap(2, vec![table("t", cols, vec![ct, idx_b, idx_u])]);
         let plan = diff_plan(&old, &new);
-        assert_eq!(plan.safe, vec![idx_b.to_string()], "신규 인덱스 = 안전");
-        assert_eq!(
-            plan.destructive,
-            vec![r#"DROP INDEX "idx_t_a""#.to_string()]
-        );
+        assert_eq!(plan.safe, vec![idx_b.to_string()], "일반 신규 인덱스 = 안전: {plan:?}");
+        assert!(plan.destructive.iter().any(|d| d.contains("DROP INDEX") && d.contains("idx_t_a")), "{plan:?}");
+        assert!(plan.destructive.iter().any(|d| d.contains("UNIQUE INDEX") && d.contains("idx_t_u")), "UNIQUE INDEX = 수동: {plan:?}");
+    }
+
+    /// trigger 훅 추가 = 수동 migration (결정 46)
+    #[test]
+    fn diff_plan_trigger_add_is_manual() {
+        let mut new_t = table("t", vec![col("id", "INTEGER", true, true)], vec![]);
+        new_t.triggers.push(TriggerSnapshot { path: "migrations/triggers/a.sql".into(), content_hash: 1 });
+        let old = snap(1, vec![table("t", vec![col("id", "INTEGER", true, true)], vec![])]);
+        let new = snap(2, vec![new_t]);
+        let plan = diff_plan(&old, &new);
+        assert!(plan.safe.is_empty(), "{plan:?}");
+        assert!(plan.destructive.iter().any(|d| d.contains("trigger") && d.contains("a.sql")), "{plan:?}");
+    }
+
+    /// trigger content_hash 변경 = hash 변경
+    #[test]
+    fn hash_changes_on_trigger() {
+        let mut a = table("t", vec![], vec![]);
+        a.triggers.push(TriggerSnapshot { path: "t.sql".into(), content_hash: 1 });
+        let mut b = a.clone();
+        b.triggers[0].content_hash = 2;
+        assert_ne!(snap(1, vec![a]).hash(), snap(1, vec![b]).hash());
     }
 
     /// diff_plan — NOT NULL ADD COLUMN(DEFAULT 정보 없음) = 파괴적
     #[test]
     fn diff_plan_not_null_add_is_destructive() {
-        let old = snap(
-            1,
-            vec![table("t", vec![col("id", "INTEGER", true, true)], vec![])],
-        );
-        let new = snap(
-            2,
-            vec![table(
-                "t",
-                vec![
-                    col("id", "INTEGER", true, true),
-                    col("note", "TEXT", true, false),
-                ],
-                vec![],
-            )],
-        );
+        let old = snap(1, vec![table("t", vec![col("id", "INTEGER", true, true)], vec![])]);
+        let new = snap(2, vec![table("t", vec![col("id", "INTEGER", true, true), col("note", "TEXT", true, false)], vec![])]);
         let plan = diff_plan(&old, &new);
         assert!(plan.safe.is_empty(), "{plan:?}");
         assert_eq!(plan.destructive.len(), 1, "{plan:?}");
         assert!(plan.destructive[0].contains("DEFAULT 필요"), "{plan:?}");
-        assert!(
-            plan.destructive[0].contains(r#"ADD COLUMN "note""#),
-            "{plan:?}"
-        );
+        assert!(plan.destructive[0].contains(r#"ADD COLUMN "note""#), "{plan:?}");
+    }
+
+    /// diff_plan — NOT NULL DEFAULT ADD COLUMN = 안전 auto (결정 53)
+    #[test]
+    fn diff_plan_not_null_default_add_is_safe() {
+        let old = snap(1, vec![table("t", vec![col("id", "INTEGER", true, true)], vec![])]);
+        let new = snap(2, vec![table("t", vec![col("id", "INTEGER", true, true), col_default("note", "TEXT", true, "'x'")], vec![])]);
+        let plan = diff_plan(&old, &new);
+        assert_eq!(plan.safe, vec![r#"ALTER TABLE "t" ADD COLUMN "note" TEXT NOT NULL DEFAULT 'x'"#.to_string()], "{plan:?}");
+        assert!(plan.destructive.is_empty(), "{plan:?}");
+    }
+
+    /// diff_plan — DEFAULT 변경 = 파괴적(수동 migration)
+    #[test]
+    fn diff_plan_default_change_is_destructive() {
+        let old = snap(1, vec![table("t", vec![col_default("note", "TEXT", false, "'a'")], vec![])]);
+        let new = snap(2, vec![table("t", vec![col_default("note", "TEXT", false, "'b'")], vec![])]);
+        let plan = diff_plan(&old, &new);
+        assert!(plan.safe.is_empty(), "{plan:?}");
+        assert!(plan.destructive.iter().any(|d| d.contains("default") && d.contains("'a'") && d.contains("'b'")), "{plan:?}");
+    }
+
+    /// 해시 — DEFAULT 변경 감지
+    #[test]
+    fn hash_tracks_default_sql() {
+        let a = snap(1, vec![table("t", vec![col_default("note", "TEXT", false, "'a'")], vec![])]);
+        let b = snap(1, vec![table("t", vec![col_default("note", "TEXT", false, "'b'")], vec![])]);
+        assert_ne!(a.hash(), b.hash());
+    }
+
+    /// 구형 스냅샷 JSON — default_sql 필드 부재 = None 역직렬화
+    #[test]
+    fn legacy_snapshot_without_default_sql_deserializes() {
+        let json = r#"{"version":1,"tables":[{"name":"t","columns":[{"name":"id","sql_type":"INTEGER","not_null":true,"pk":true}],"ddl":[]}]}"#;
+        let old = SchemaSnapshot::from_slice(json.as_bytes()).expect("구형 JSON 파스");
+        assert!(old.tables[0].columns[0].default_sql.is_none());
+        let new = SchemaSnapshot {
+            version: 2,
+            tables: vec![table("t", vec![col("id", "INTEGER", true, true), col("note", "TEXT", true, false)], vec![])],
+        };
+        let plan = diff_plan(&old, &new);
+        assert!(plan.destructive.iter().any(|d| d.contains("DEFAULT 필요")), "{plan:?}");
     }
 
     /// diff_plan — 테이블 추가/삭제 분류
@@ -915,10 +1012,7 @@ mod tests {
     fn diff_plan_table_add_remove() {
         let ct = r#"CREATE TABLE "b" ("id" INTEGER PRIMARY KEY)"#;
         let old = snap(1, vec![table("a", vec![], vec![])]);
-        let new = snap(
-            2,
-            vec![table("b", vec![col("id", "INTEGER", true, true)], vec![ct])],
-        );
+        let new = snap(2, vec![table("b", vec![col("id", "INTEGER", true, true)], vec![ct])]);
         let plan = diff_plan(&old, &new);
         assert_eq!(plan.safe, vec![ct.to_string()]);
         assert_eq!(plan.destructive, vec![r#"DROP TABLE "a""#.to_string()]);
@@ -927,10 +1021,7 @@ mod tests {
     /// diff_plan — 컬럼 동일 + CREATE TABLE 문 변경(UNIQUE 추가) = 파괴적 재작성 (H-5)
     #[test]
     fn diff_plan_constraint_change_is_destructive() {
-        let cols = vec![
-            col("id", "INTEGER", true, true),
-            col("email", "TEXT", true, false),
-        ];
+        let cols = vec![col("id", "INTEGER", true, true), col("email", "TEXT", true, false)];
         let ct_old = r#"CREATE TABLE "t" ("id" INTEGER PRIMARY KEY, "email" TEXT NOT NULL)"#;
         let ct_new = r#"CREATE TABLE "t" ("id" INTEGER PRIMARY KEY, "email" TEXT NOT NULL UNIQUE)"#;
         let old = snap(1, vec![table("t", cols.clone(), vec![ct_old])]);
@@ -959,54 +1050,24 @@ mod tests {
     fn diff_plan_column_add_no_false_rewrite() {
         let ct_old = r#"CREATE TABLE "t" ("id" INTEGER PRIMARY KEY)"#;
         let ct_new = r#"CREATE TABLE "t" ("id" INTEGER PRIMARY KEY, "note" TEXT)"#;
-        let old = snap(
-            1,
-            vec![table(
-                "t",
-                vec![col("id", "INTEGER", true, true)],
-                vec![ct_old],
-            )],
-        );
-        let new = snap(
-            2,
-            vec![table(
-                "t",
-                vec![
-                    col("id", "INTEGER", true, true),
-                    col("note", "TEXT", false, false),
-                ],
-                vec![ct_new],
-            )],
-        );
+        let old = snap(1, vec![table("t", vec![col("id", "INTEGER", true, true)], vec![ct_old])]);
+        let new = snap(2, vec![table("t", vec![col("id", "INTEGER", true, true), col("note", "TEXT", false, false)], vec![ct_new])]);
         let plan = diff_plan(&old, &new);
-        assert_eq!(
-            plan.safe,
-            vec![r#"ALTER TABLE "t" ADD COLUMN "note" TEXT"#.to_string()]
-        );
+        assert_eq!(plan.safe, vec![r#"ALTER TABLE "t" ADD COLUMN "note" TEXT"#.to_string()]);
         assert!(plan.destructive.is_empty(), "재작성 오탐: {plan:?}");
     }
 
     /// diff_plan — 같은 rename 원본 2회 소비 = 첫 힌트만 RENAME, 둘째는 경고+ADD (M-9)
     #[test]
     fn diff_plan_duplicate_rename_source_degrades() {
-        let old = snap(
-            1,
-            vec![table("t", vec![col("a", "TEXT", false, false)], vec![])],
-        );
+        let old = snap(1, vec![table("t", vec![col("a", "TEXT", false, false)], vec![])]);
         let mut b = col("b", "TEXT", false, false);
         b.renamed_from = Some("a".into());
         let mut c = col("c", "TEXT", false, false);
         c.renamed_from = Some("a".into());
         let new = snap(2, vec![table("t", vec![b, c], vec![])]);
         let plan = diff_plan(&old, &new);
-        assert_eq!(
-            plan.safe,
-            vec![
-                r#"ALTER TABLE "t" RENAME COLUMN "a" TO "b""#.to_string(),
-                r#"ALTER TABLE "t" ADD COLUMN "c" TEXT"#.to_string(),
-            ],
-            "{plan:?}"
-        );
+        assert_eq!(plan.safe, vec![r#"ALTER TABLE "t" RENAME COLUMN "a" TO "b""#.to_string(), r#"ALTER TABLE "t" ADD COLUMN "c" TEXT"#.to_string(),], "{plan:?}");
         assert_eq!(plan.warnings.len(), 1, "{plan:?}");
         assert!(plan.warnings[0].contains("rename 힌트 중복"), "{plan:?}");
         // 원본 a 는 첫 rename 이 소비 — DROP 오탐 없음
@@ -1017,20 +1078,11 @@ mod tests {
     #[test]
     fn index_name_multibyte_no_panic() {
         // 인용 한글 — 종전 &s[..kw.len()] 슬라이스가 char boundary panic
-        assert_eq!(
-            index_name(r#"CREATE INDEX "할일_idx" ON t(a)"#),
-            Some("할일_idx".to_string())
-        );
+        assert_eq!(index_name(r#"CREATE INDEX "할일_idx" ON t(a)"#), Some("할일_idx".to_string()));
         // 비인용 한글
-        assert_eq!(
-            index_name("CREATE INDEX 할일 ON t(a)"),
-            Some("할일".to_string())
-        );
+        assert_eq!(index_name("CREATE INDEX 할일 ON t(a)"), Some("할일".to_string()));
         // 한글 UNIQUE 인덱스 + IF NOT EXISTS 조합
-        assert_eq!(
-            index_name(r#"CREATE UNIQUE INDEX IF NOT EXISTS "메모 색인" ON t(b)"#),
-            Some("메모 색인".to_string())
-        );
+        assert_eq!(index_name(r#"CREATE UNIQUE INDEX IF NOT EXISTS "메모 색인" ON t(b)"#), Some("메모 색인".to_string()));
     }
 
     /// diff_plan — 문자열 리터럴 내부 공백 변경도 제약 변경으로 감지 (D-2a)
@@ -1042,11 +1094,7 @@ mod tests {
         let old = snap(1, vec![table("t", cols.clone(), vec![ct_old])]);
         let new = snap(2, vec![table("t", cols, vec![ct_new])]);
         let plan = diff_plan(&old, &new);
-        assert_eq!(
-            plan.destructive.len(),
-            1,
-            "리터럴 내부 공백 = 실 변경: {plan:?}"
-        );
+        assert_eq!(plan.destructive.len(), 1, "리터럴 내부 공백 = 실 변경: {plan:?}");
         assert!(plan.destructive[0].contains("제약/DDL 변경"), "{plan:?}");
     }
 
@@ -1066,85 +1114,36 @@ mod tests {
     /// normalize_ws_outside_quotes — 인용 밖 접기·인용 안 보존·이스케이프
     #[test]
     fn normalize_ws_quote_aware() {
-        assert_eq!(
-            normalize_ws_outside_quotes("CREATE  TABLE \"t\"\n(\"a  b\" TEXT DEFAULT 'x  y')"),
-            r#"CREATE TABLE "t" ("a  b" TEXT DEFAULT 'x  y')"#
-        );
+        assert_eq!(normalize_ws_outside_quotes("CREATE  TABLE \"t\"\n(\"a  b\" TEXT DEFAULT 'x  y')"), r#"CREATE TABLE "t" ("a  b" TEXT DEFAULT 'x  y')"#);
         // '' 이스케이프 사이엔 공백이 없어 결과 동일
-        assert_eq!(
-            normalize_ws_outside_quotes("DEFAULT  'o''clock  x'"),
-            "DEFAULT 'o''clock  x'"
-        );
+        assert_eq!(normalize_ws_outside_quotes("DEFAULT  'o''clock  x'"), "DEFAULT 'o''clock  x'");
     }
 
     /// 인덱스 DDL의 인용 밖 공백 차이는 정의 변경이 아니다.
     #[test]
     fn index_diff_ignores_whitespace_outside_quotes() {
-        let old = snap(
-            1,
-            vec![table(
-                "items",
-                vec![],
-                vec!["CREATE  INDEX idx_name\n ON items (name)"],
-            )],
-        );
-        let new = snap(
-            2,
-            vec![table(
-                "items",
-                vec![],
-                vec!["CREATE INDEX idx_name ON items (name)"],
-            )],
-        );
+        let old = snap(1, vec![table("items", vec![], vec!["CREATE  INDEX idx_name\n ON items (name)"])]);
+        let new = snap(2, vec![table("items", vec![], vec!["CREATE INDEX idx_name ON items (name)"])]);
         assert!(diff_plan(&old, &new).destructive.is_empty());
     }
 
     /// 인용 내부 공백 차이는 실제 인덱스 표현식 변경으로 유지한다.
     #[test]
     fn index_diff_preserves_whitespace_inside_quotes() {
-        let old = snap(
-            1,
-            vec![table(
-                "items",
-                vec![],
-                vec!["CREATE INDEX idx_name ON items ('a  b')"],
-            )],
-        );
-        let new = snap(
-            2,
-            vec![table(
-                "items",
-                vec![],
-                vec!["CREATE INDEX idx_name ON items ('a b')"],
-            )],
-        );
+        let old = snap(1, vec![table("items", vec![], vec!["CREATE INDEX idx_name ON items ('a  b')"])]);
+        let new = snap(2, vec![table("items", vec![], vec!["CREATE INDEX idx_name ON items ('a b')"])]);
         assert_eq!(diff_plan(&old, &new).destructive.len(), 1);
     }
 
     /// index_name — 공백 포함 인용 이름·이스케이프·백틱·대괄호 (M-12)
     #[test]
     fn index_name_quoted_variants() {
-        assert_eq!(
-            index_name(r#"CREATE INDEX "my idx" ON "t"("a")"#),
-            Some("my idx".to_string())
-        );
-        assert_eq!(
-            index_name(r#"CREATE UNIQUE INDEX IF NOT EXISTS "a""b" ON t(x)"#),
-            Some("a\"b".to_string())
-        );
-        assert_eq!(
-            index_name("CREATE INDEX `sp ace` ON t(a)"),
-            Some("sp ace".to_string())
-        );
-        assert_eq!(
-            index_name("CREATE INDEX [br idx] ON t(a)"),
-            Some("br idx".to_string())
-        );
+        assert_eq!(index_name(r#"CREATE INDEX "my idx" ON "t"("a")"#), Some("my idx".to_string()));
+        assert_eq!(index_name(r#"CREATE UNIQUE INDEX IF NOT EXISTS "a""b" ON t(x)"#), Some("a\"b".to_string()));
+        assert_eq!(index_name("CREATE INDEX `sp ace` ON t(a)"), Some("sp ace".to_string()));
+        assert_eq!(index_name("CREATE INDEX [br idx] ON t(a)"), Some("br idx".to_string()));
         // 비인용 + `name(col)` 붙은 표기
-        assert_eq!(
-            index_name("create unique index idx_t_a(a)"),
-            Some("idx_t_a".to_string())
-        );
+        assert_eq!(index_name("create unique index idx_t_a(a)"), Some("idx_t_a".to_string()));
         // CREATE TABLE = 인덱스 아님, 닫히지 않은 인용부 = None
         assert_eq!(index_name(r#"CREATE TABLE "t" ("id" INTEGER)"#), None);
         assert_eq!(index_name(r#"CREATE INDEX "broken ON t(a)"#), None);
@@ -1159,8 +1158,7 @@ mod tests {
         let s = snap(1, vec![]);
         s.write_to(&dir.path().join("app.1.json")).unwrap();
         // u32::MAX = 4294967295 — 그보다 큰 순수 숫자 버전
-        s.write_to(&dir.path().join("app.99999999999.json"))
-            .unwrap();
+        s.write_to(&dir.path().join("app.99999999999.json")).unwrap();
         let err = list_snapshot_versions(dir.path(), "app").unwrap_err();
         assert!(err.to_string().contains("u32 범위"), "{err}");
     }
@@ -1185,37 +1183,11 @@ mod tests {
     /// diff_sql — 안전=실행문, 파괴적=TODO 주석, 경고=주석, user_version 마무리
     #[test]
     fn diff_sql_renders_plan() {
-        let old = snap(
-            1,
-            vec![table(
-                "t",
-                vec![
-                    col("id", "INTEGER", true, true),
-                    col("gone", "TEXT", false, false),
-                ],
-                vec![],
-            )],
-        );
-        let new = snap(
-            2,
-            vec![table(
-                "t",
-                vec![
-                    col("id", "INTEGER", true, true),
-                    col("name", "TEXT", false, false),
-                ],
-                vec![],
-            )],
-        );
+        let old = snap(1, vec![table("t", vec![col("id", "INTEGER", true, true), col("gone", "TEXT", false, false)], vec![])]);
+        let new = snap(2, vec![table("t", vec![col("id", "INTEGER", true, true), col("name", "TEXT", false, false)], vec![])]);
         let sql = diff_sql(&old, &new);
-        assert!(
-            sql.contains("ALTER TABLE \"t\" ADD COLUMN \"name\" TEXT;"),
-            "{sql}"
-        );
-        assert!(
-            sql.contains("-- TODO(파괴적): ALTER TABLE \"t\" DROP COLUMN \"gone\""),
-            "{sql}"
-        );
+        assert!(sql.contains("ALTER TABLE \"t\" ADD COLUMN \"name\" TEXT;"), "{sql}");
+        assert!(sql.contains("-- TODO(파괴적): ALTER TABLE \"t\" DROP COLUMN \"gone\""), "{sql}");
         assert!(sql.contains("PRAGMA user_version = 2;"), "{sql}");
     }
 }

@@ -22,16 +22,8 @@ struct CipherDb;
 #[test]
 fn system_backend_reports_version_and_preupdate_hook() {
     let connection = roomrs::rusqlite::Connection::open_in_memory().unwrap();
-    let version: String = connection
-        .query_row("SELECT sqlite_version()", [], |row| row.get(0))
-        .unwrap();
-    let preupdate: i64 = connection
-        .query_row(
-            "SELECT sqlite_compileoption_used('ENABLE_PREUPDATE_HOOK')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let version: String = connection.query_row("SELECT sqlite_version()", [], |row| row.get(0)).unwrap();
+    let preupdate: i64 = connection.query_row("SELECT sqlite_compileoption_used('ENABLE_PREUPDATE_HOOK')", [], |row| row.get(0)).unwrap();
 
     assert!(!version.is_empty());
     assert_eq!(preupdate, 1);
@@ -45,36 +37,16 @@ fn system_sqlcipher_roundtrip_and_fail_closed() {
     let path = directory.path().join("encrypted.db");
 
     {
-        let database = CipherDb::builder()
-            .sqlite(&path)
-            .encryption_key(KEY)
-            .build()
-            .unwrap();
-        database
-            .run_sync()
-            .execute("INSERT INTO secrets (id, value) VALUES (1, 'secret')", [])
-            .unwrap();
+        let database = CipherDb::builder().sqlite(&path).encryption_key(KEY).build().unwrap();
+        database.run_sync().execute("INSERT INTO secrets (id, value) VALUES (1, 'secret')", []).unwrap();
     }
 
-    let reopened = CipherDb::builder()
-        .sqlite(&path)
-        .encryption_key(KEY)
-        .build()
-        .unwrap();
-    let value: String = reopened
-        .run_sync()
-        .query_scalar("SELECT value FROM secrets WHERE id = 1", [])
-        .unwrap();
+    let reopened = CipherDb::builder().sqlite(&path).encryption_key(KEY).build().unwrap();
+    let value: String = reopened.run_sync().query_scalar("SELECT value FROM secrets WHERE id = 1", []).unwrap();
     assert_eq!(value, "secret");
     drop(reopened);
 
-    assert!(
-        CipherDb::builder()
-            .sqlite(&path)
-            .encryption_key("wrong-key")
-            .build()
-            .is_err()
-    );
+    assert!(CipherDb::builder().sqlite(&path).encryption_key("wrong-key").build().is_err());
     assert!(CipherDb::builder().sqlite(&path).build().is_err());
 }
 
@@ -83,8 +55,6 @@ fn system_sqlcipher_roundtrip_and_fail_closed() {
 #[test]
 fn system_sqlcipher_reports_cipher_version() {
     let connection = roomrs::rusqlite::Connection::open_in_memory().unwrap();
-    let version: String = connection
-        .query_row("PRAGMA cipher_version", [], |row| row.get(0))
-        .unwrap();
+    let version: String = connection.query_row("PRAGMA cipher_version", [], |row| row.get(0)).unwrap();
     assert!(!version.is_empty());
 }

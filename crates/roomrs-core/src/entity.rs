@@ -10,9 +10,7 @@ pub fn to_owned_value<T: ToSql + ?Sized>(t: &T) -> Result<Value> {
     match t.to_sql()? {
         ToSqlOutput::Borrowed(vr) => Ok(vr.into()),
         ToSqlOutput::Owned(v) => Ok(v),
-        other => Err(Error::Internal(format!(
-            "지원하지 않는 ToSqlOutput 변형: {other:?} — 비동기 경로에서 사용 불가"
-        ))),
+        other => Err(Error::Internal(format!("지원하지 않는 ToSqlOutput 변형: {other:?} — 비동기 경로에서 사용 불가"))),
     }
 }
 
@@ -22,9 +20,7 @@ pub fn outputs_to_values(outs: Vec<ToSqlOutput<'_>>) -> Result<Vec<Value>> {
         .map(|o| match o {
             ToSqlOutput::Borrowed(vr) => Ok(vr.into()),
             ToSqlOutput::Owned(v) => Ok(v),
-            other => Err(Error::Internal(format!(
-                "지원하지 않는 ToSqlOutput 변형: {other:?} — 비동기 경로에서 사용 불가"
-            ))),
+            other => Err(Error::Internal(format!("지원하지 않는 ToSqlOutput 변형: {other:?} — 비동기 경로에서 사용 불가"))),
         })
         .collect()
 }
@@ -39,6 +35,14 @@ pub trait Entity: FromRow {
     const COLUMNS: &'static str;
     /// 컬럼 메타 — 스냅샷 생성·해시 대조용 (명세 §7)
     const COLUMNS_META: &'static [crate::database::ColumnMeta];
+    /// Trigger SQL file hooks (path + content hash, decision 46).
+    const TRIGGERS: &'static [crate::database::TriggerMeta] = &[];
+    /// `#[entity(strict)]` — STRICT tables (decision 54).
+    const STRICT: bool = false;
+    /// `#[entity(without_rowid)]` (decision 54).
+    const WITHOUT_ROWID: bool = false;
+    /// Schema DSL conflict reported by explicit schema export/check.
+    const SCHEMA_VALIDATION_ERROR: Option<&'static str> = None;
 }
 
 /// INSERT 지원 메타. `#[entity]` 생성물 (명세 §12c — autoincrement PK 항상 생략).

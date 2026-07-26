@@ -8,9 +8,7 @@
 //!   명시 식별자에 한정 (SELECT * · 표현식 · 서브쿼리 제외)
 
 use roomrs_migrate::SchemaSnapshot;
-use sqlparser::ast::{
-    Expr, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
-};
+use sqlparser::ast::{Expr, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins};
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 use std::path::Path;
@@ -34,15 +32,11 @@ fn load_snapshots_in_dir(dir: &Path) -> Result<Vec<SchemaSnapshot>, String> {
         // 권한 등 그 외 IO 에러 = 부재와 구분해 하드 에러 — 침묵 스킵하면
         // 스냅샷이 있는데도 검증 없이 통과한다 (L-13)
         Err(e) => {
-            return Err(format!(
-                "스냅샷 디렉토리 읽기 실패: {} — {e} (명세 §7.4)",
-                dir.display()
-            ));
+            return Err(format!("스냅샷 디렉토리 읽기 실패: {} — {e} (명세 §7.4)", dir.display()));
         }
     };
     // db이름 → (최고 버전, 경로). BTreeMap = 이름순 결정적 조회 순서
-    let mut latest: std::collections::BTreeMap<String, (u32, std::path::PathBuf)> =
-        std::collections::BTreeMap::new();
+    let mut latest: std::collections::BTreeMap<String, (u32, std::path::PathBuf)> = std::collections::BTreeMap::new();
     for entry in rd.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -66,10 +60,7 @@ fn load_snapshots_in_dir(dir: &Path) -> Result<Vec<SchemaSnapshot>, String> {
             Ok(s) => out.push(s),
             // 존재하는데 파손 = 하드 에러 (M-19)
             Err(e) => {
-                return Err(format!(
-                    "스냅샷 파일 파손: {} — 파스 실패: {e} (명세 §7.4)",
-                    path.display()
-                ));
+                return Err(format!("스냅샷 파일 파손: {} — 파스 실패: {e} (명세 §7.4)", path.display()));
             }
         }
     }
@@ -139,11 +130,7 @@ pub fn validate_sql(sql: &str, snaps: &[SchemaSnapshot]) -> Option<String> {
 
     // 합집합 테이블 조회 — 첫 일치 스냅샷의 테이블 반환.
     // SQLite 의미론대로 대소문자 무시 비교 (M-18)
-    let find_table = |name: &str| {
-        snaps
-            .iter()
-            .find_map(|s| s.tables.iter().find(|t| t.name.eq_ignore_ascii_case(name)))
-    };
+    let find_table = |name: &str| snaps.iter().find_map(|s| s.tables.iter().find(|t| t.name.eq_ignore_ascii_case(name)));
 
     for stmt in &stmts {
         let mut refs = Refs::default();
@@ -163,27 +150,13 @@ pub fn validate_sql(sql: &str, snaps: &[SchemaSnapshot]) -> Option<String> {
         // 컬럼 검증만 스킵한다(테이블 존재 검증은 위에서 그대로 수행, M-10)
         if !refs.aliased && refs.tables.len() == 1 {
             if let Some(table) = find_table(&refs.tables[0]) {
-                let ambiguous = snaps
-                    .iter()
-                    .filter_map(|s| {
-                        s.tables
-                            .iter()
-                            .find(|t| t.name.eq_ignore_ascii_case(&table.name))
-                    })
-                    .any(|other| !same_column_names(table, other));
+                let ambiguous = snaps.iter().filter_map(|s| s.tables.iter().find(|t| t.name.eq_ignore_ascii_case(&table.name))).any(|other| !same_column_names(table, other));
                 if ambiguous {
                     continue;
                 }
                 for c in &refs.columns {
-                    if !table
-                        .columns
-                        .iter()
-                        .any(|col| col.name.eq_ignore_ascii_case(c))
-                    {
-                        return Some(format!(
-                            "테이블 \"{}\"에 없는 컬럼 참조: \"{c}\" (명세 §7.2)",
-                            table.name
-                        ));
+                    if !table.columns.iter().any(|col| col.name.eq_ignore_ascii_case(c)) {
+                        return Some(format!("테이블 \"{}\"에 없는 컬럼 참조: \"{c}\" (명세 §7.2)", table.name));
                     }
                 }
             }
@@ -194,12 +167,7 @@ pub fn validate_sql(sql: &str, snaps: &[SchemaSnapshot]) -> Option<String> {
 
 /// 두 테이블 스냅샷의 컬럼 **이름 집합**이 같은지 — 대소문자 무시 (M-10)
 fn same_column_names(a: &roomrs_migrate::TableSnapshot, b: &roomrs_migrate::TableSnapshot) -> bool {
-    a.columns.len() == b.columns.len()
-        && a.columns.iter().all(|ca| {
-            b.columns
-                .iter()
-                .any(|cb| cb.name.eq_ignore_ascii_case(&ca.name))
-        })
+    a.columns.len() == b.columns.len() && a.columns.iter().all(|ca| b.columns.iter().any(|cb| cb.name.eq_ignore_ascii_case(&ca.name)))
 }
 
 /// 문 단위 수집
@@ -216,12 +184,7 @@ fn collect_stmt(stmt: &Statement, refs: &mut Refs) {
                 collect_query(src, refs);
             }
         }
-        Statement::Update {
-            table,
-            assignments,
-            selection,
-            ..
-        } => {
+        Statement::Update { table, assignments, selection, .. } => {
             collect_table_with_joins(table, refs);
             for a in assignments {
                 if let sqlparser::ast::AssignmentTarget::ColumnName(name) = &a.target {
@@ -234,8 +197,7 @@ fn collect_stmt(stmt: &Statement, refs: &mut Refs) {
         }
         Statement::Delete(del) => {
             let from = match &del.from {
-                sqlparser::ast::FromTable::WithFromKeyword(v)
-                | sqlparser::ast::FromTable::WithoutKeyword(v) => v,
+                sqlparser::ast::FromTable::WithFromKeyword(v) | sqlparser::ast::FromTable::WithoutKeyword(v) => v,
             };
             for t in from {
                 collect_table_with_joins(t, refs);
@@ -268,11 +230,7 @@ fn collect_query(q: &Query, refs: &mut Refs) {
             // (`WITH todos AS (SELECT * FROM todos …) …`). 아래 제외가 그 실 의존을
             // 지우므로 전체를 미상 처리하도록 표시한다. WITH RECURSIVE의 자기
             // 참조는 가상 테이블이라 제외가 올바르다 (H-4)
-            if !with.recursive
-                && refs.tables[body_start..]
-                    .iter()
-                    .any(|t| t.eq_ignore_ascii_case(&name))
-            {
+            if !with.recursive && refs.tables[body_start..].iter().any(|t| t.eq_ignore_ascii_case(&name)) {
                 refs.cte_self_shadow = true;
             }
             cte_names.push(name);
@@ -282,11 +240,7 @@ fn collect_query(q: &Query, refs: &mut Refs) {
     if !cte_names.is_empty() {
         // 이 쿼리 스코프(scope_start 이후)에서 수집한 테이블만 CTE 이름 제외 (H-4)
         let scoped = refs.tables.split_off(scope_start);
-        refs.tables.extend(
-            scoped
-                .into_iter()
-                .filter(|t| !cte_names.iter().any(|c| c.eq_ignore_ascii_case(t))),
-        );
+        refs.tables.extend(scoped.into_iter().filter(|t| !cte_names.iter().any(|c| c.eq_ignore_ascii_case(t))));
     }
 }
 
@@ -367,9 +321,7 @@ fn collect_expr(e: &Expr, refs: &mut Refs) {
         Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => collect_expr(expr, refs),
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => collect_expr(inner, refs),
         Expr::InList { expr, .. } => collect_expr(expr, refs),
-        Expr::Between {
-            expr, low, high, ..
-        } => {
+        Expr::Between { expr, low, high, .. } => {
             collect_expr(expr, refs);
             collect_expr(low, refs);
             collect_expr(high, refs);
@@ -418,6 +370,9 @@ mod tests {
             not_null: false,
             pk: false,
             renamed_from: None,
+            default_sql: None,
+            collate: None,
+            generated: None,
         }
     }
 
@@ -429,6 +384,9 @@ mod tests {
                 name: table.into(),
                 columns: cols.iter().map(|c| col(c)).collect(),
                 ddl: vec![],
+                triggers: vec![],
+                strict: false,
+                without_rowid: false,
             }],
         }
     }
@@ -436,77 +394,46 @@ mod tests {
     /// H-4(a) — 서브쿼리 CTE 이름이 바깥 쿼리의 동명 실 테이블을 지우지 않는다
     #[test]
     fn cte_exclusion_scoped_to_own_query() {
-        let deps =
-            depends_on("SELECT * FROM x, (WITH x AS (SELECT 1 FROM other) SELECT * FROM x) d")
-                .expect("의존 수집");
-        assert!(
-            deps.iter().any(|t| t == "x"),
-            "바깥 실 테이블 x 유지: {deps:?}"
-        );
-        assert!(
-            deps.iter().any(|t| t == "other"),
-            "CTE 본문 실 테이블: {deps:?}"
-        );
+        let deps = depends_on("SELECT * FROM x, (WITH x AS (SELECT 1 FROM other) SELECT * FROM x) d").expect("의존 수집");
+        assert!(deps.iter().any(|t| t == "x"), "바깥 실 테이블 x 유지: {deps:?}");
+        assert!(deps.iter().any(|t| t == "other"), "CTE 본문 실 테이블: {deps:?}");
     }
 
     /// H-4(b) — 자기 가림 CTE(본문이 자기 이름의 실 테이블 참조) = 미상(None)
     #[test]
     fn cte_self_shadow_degrades_to_none() {
-        assert_eq!(
-            depends_on("WITH todos AS (SELECT * FROM todos WHERE done = 0) SELECT * FROM todos"),
-            None
-        );
+        assert_eq!(depends_on("WITH todos AS (SELECT * FROM todos WHERE done = 0) SELECT * FROM todos"), None);
     }
 
     /// H-4(c) — 일반 CTE는 이름만 제외, 본문 실 테이블 유지
     #[test]
     fn cte_normal_excludes_alias_keeps_real_tables() {
-        let deps =
-            depends_on("WITH recent AS (SELECT * FROM logs) SELECT * FROM recent").expect("수집");
+        let deps = depends_on("WITH recent AS (SELECT * FROM logs) SELECT * FROM recent").expect("수집");
         assert_eq!(deps, vec!["logs".to_string()]);
     }
 
     /// H-4 — WITH RECURSIVE 자기 참조는 가상 테이블 — 미상 강등 없이 실 테이블 수집
     #[test]
     fn recursive_cte_self_reference_not_degraded() {
-        let deps = depends_on(
-            "WITH RECURSIVE r AS (SELECT id FROM t UNION ALL SELECT id + 1 FROM r) SELECT * FROM r",
-        )
-        .expect("재귀 CTE 수집");
+        let deps = depends_on("WITH RECURSIVE r AS (SELECT id FROM t UNION ALL SELECT id + 1 FROM r) SELECT * FROM r").expect("재귀 CTE 수집");
         assert_eq!(deps, vec!["t".to_string()]);
     }
 
     /// M-10 — 동명 테이블(다른 db, 다른 컬럼 집합) = 컬럼 검증 스킵(오탐 방지)
     #[test]
     fn union_same_table_name_different_columns_skips_column_check() {
-        let snaps = vec![
-            snap_with("items", &["id", "name"]),
-            snap_with("items", &["id", "price"]),
-        ];
+        let snaps = vec![snap_with("items", &["id", "name"]), snap_with("items", &["id", "price"])];
         // price는 첫 스냅샷에 없다 — 종전엔 첫 일치 기준 하드 에러(오탐)
-        assert_eq!(
-            validate_sql("SELECT price FROM items", &snaps),
-            None,
-            "동명·컬럼 상이 = 컬럼 검증 스킵"
-        );
+        assert_eq!(validate_sql("SELECT price FROM items", &snaps), None, "동명·컬럼 상이 = 컬럼 검증 스킵");
         // 테이블 존재 검증은 유지
-        assert!(
-            validate_sql("SELECT id FROM ghost", &snaps).is_some(),
-            "없는 테이블은 여전히 에러"
-        );
+        assert!(validate_sql("SELECT id FROM ghost", &snaps).is_some(), "없는 테이블은 여전히 에러");
     }
 
     /// M-10 — 동명 테이블이라도 컬럼 집합이 같으면 컬럼 검증 수행
     #[test]
     fn union_same_table_same_columns_still_checks() {
-        let snaps = vec![
-            snap_with("items", &["id", "name"]),
-            snap_with("items", &["id", "name"]),
-        ];
-        assert!(
-            validate_sql("SELECT ghost_col FROM items", &snaps).is_some(),
-            "컬럼 집합 동일 = 검증 유지"
-        );
+        let snaps = vec![snap_with("items", &["id", "name"]), snap_with("items", &["id", "name"])];
+        assert!(validate_sql("SELECT ghost_col FROM items", &snaps).is_some(), "컬럼 집합 동일 = 검증 유지");
         assert_eq!(validate_sql("SELECT name FROM items", &snaps), None);
     }
 }

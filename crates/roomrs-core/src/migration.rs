@@ -17,9 +17,7 @@ pub trait MigrationStep: Send + Sync + 'static {
     fn up(&self, tx: &Tx<'_>) -> Result<()>;
     /// 역방향(선택) — v1 러너는 up만 실행. down은 사용자 수동 실행용.
     fn down(&self, _tx: &Tx<'_>) -> Result<()> {
-        Err(Error::Migration(
-            "down 마이그레이션이 구현되지 않았습니다".into(),
-        ))
+        Err(Error::Migration("down 마이그레이션이 구현되지 않았습니다".into()))
     }
 }
 
@@ -43,16 +41,8 @@ impl Migration {
     }
 
     /// 코드 스텝
-    pub fn code(
-        from: u32,
-        to: u32,
-        f: impl Fn(&Tx<'_>) -> Result<()> + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            from,
-            to,
-            up: Box::new(f),
-        }
+    pub fn code(from: u32, to: u32, f: impl Fn(&Tx<'_>) -> Result<()> + Send + Sync + 'static) -> Self {
+        Self { from, to, up: Box::new(f) }
     }
 
     /// trait 구현체 래핑 (명세 §8.3)
@@ -86,34 +76,22 @@ impl Migration {
 /// 체인 검증 + 실행 계획 — current에서 target까지의 스텝 나열.
 /// 중복 구간 = 에러, 갭 = `Err(None 계획)` 대신 명확한 에러 메시지 반환.
 /// 참조 슬라이스를 받는다 — 등록 스텝 + 합성 스텝(명세 §8.4)을 복제 없이 합친다.
-pub(crate) fn plan_chain<'a>(
-    steps: &[&'a Migration],
-    current: u32,
-    target: u32,
-) -> Result<Vec<&'a Migration>> {
+pub(crate) fn plan_chain<'a>(steps: &[&'a Migration], current: u32, target: u32) -> Result<Vec<&'a Migration>> {
     // 유효성: to > from
     for s in steps {
         if s.to <= s.from {
-            return Err(Error::Migration(format!(
-                "잘못된 마이그레이션 구간: {} -> {} (to는 from보다 커야 함)",
-                s.from, s.to
-            )));
+            return Err(Error::Migration(format!("잘못된 마이그레이션 구간: {} -> {} (to는 from보다 커야 함)", s.from, s.to)));
         }
     }
     // 같은 from 중복 = 에러 (명세 §8.3 같은 구간 중복)
     let mut froms: Vec<u32> = steps.iter().map(|s| s.from).collect();
     froms.sort_unstable();
     if let Some(w) = froms.windows(2).find(|w| w[0] == w[1]) {
-        return Err(Error::Migration(format!(
-            "중복 마이그레이션 구간: from={} 스텝이 2개 이상",
-            w[0]
-        )));
+        return Err(Error::Migration(format!("중복 마이그레이션 구간: from={} 스텝이 2개 이상", w[0])));
     }
 
     if current > target {
-        return Err(Error::Migration(format!(
-            "다운그레이드는 지원하지 않습니다 (DB={current}, 코드={target}) — down은 수동 실행"
-        )));
+        return Err(Error::Migration(format!("다운그레이드는 지원하지 않습니다 (DB={current}, 코드={target}) — down은 수동 실행")));
     }
 
     // 그리디 체인 — from==v 스텝 순차 적용
@@ -121,15 +99,10 @@ pub(crate) fn plan_chain<'a>(
     let mut v = current;
     while v < target {
         let Some(step) = steps.iter().copied().find(|s| s.from == v) else {
-            return Err(Error::Migration(format!(
-                "마이그레이션 체인 갭: v{v} -> v{target} 구간을 잇는 스텝이 없습니다"
-            )));
+            return Err(Error::Migration(format!("마이그레이션 체인 갭: v{v} -> v{target} 구간을 잇는 스텝이 없습니다")));
         };
         if step.to > target {
-            return Err(Error::Migration(format!(
-                "마이그레이션 스텝이 목표를 지나칩니다: {} -> {} (목표 {target})",
-                step.from, step.to
-            )));
+            return Err(Error::Migration(format!("마이그레이션 스텝이 목표를 지나칩니다: {} -> {} (목표 {target})", step.from, step.to)));
         }
         v = step.to;
         plan.push(step);
@@ -146,10 +119,7 @@ mod tests {
     /// 체인 계획 — 정상/갭/중복/다운그레이드
     #[test]
     fn chain_plan() {
-        let owned = [
-            Migration::sql(1, 2, "SELECT 1"),
-            Migration::sql(2, 3, "SELECT 1"),
-        ];
+        let owned = [Migration::sql(1, 2, "SELECT 1"), Migration::sql(2, 3, "SELECT 1")];
         let steps: Vec<&Migration> = owned.iter().collect();
         assert_eq!(plan_chain(&steps, 1, 3).unwrap().len(), 2);
         assert_eq!(plan_chain(&steps, 2, 3).unwrap().len(), 1);

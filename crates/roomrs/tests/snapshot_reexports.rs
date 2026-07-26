@@ -15,8 +15,14 @@ fn snapshot_model_is_available_from_facade() {
                 not_null: true,
                 pk: true,
                 renamed_from: None,
+                default_sql: None,
+                collate: None,
+                generated: None,
             }],
             ddl: vec!["CREATE TABLE items(id INTEGER PRIMARY KEY)".into()],
+            triggers: vec![],
+            strict: false,
+            without_rowid: false,
         }],
     };
     assert_eq!(snapshot.tables[0].columns[0].name, "id");

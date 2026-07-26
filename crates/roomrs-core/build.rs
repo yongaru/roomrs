@@ -10,38 +10,27 @@ fn main() {
     println!("cargo:rerun-if-env-changed=VCPKGRS_TRIPLET");
     println!("cargo:rerun-if-env-changed=VCPKGRS_DYNAMIC");
 
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
-        || env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc")
-    {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") || env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
         return;
     }
 
     let Some(root) = env::var_os("VCPKG_ROOT") else {
-        eprintln!("system SQLCipher에는 VCPKG_ROOT가 필요합니다.");
+        println!("cargo::error=system SQLCipher requires VCPKG_ROOT.");
         std::process::exit(1);
     };
     let Some(triplet) = env::var_os("VCPKGRS_TRIPLET") else {
-        eprintln!("system SQLCipher에는 VCPKGRS_TRIPLET이 필요합니다.");
+        println!("cargo::error=system SQLCipher requires VCPKGRS_TRIPLET.");
         std::process::exit(1);
     };
-    let library_directory = PathBuf::from(root)
-        .join("installed")
-        .join(triplet)
-        .join("lib");
+    let library_directory = PathBuf::from(root).join("installed").join(triplet).join("lib");
     for library in ["libssl.lib", "libcrypto.lib"] {
         if !library_directory.join(library).is_file() {
-            eprintln!(
-                "system SQLCipher용 vcpkg OpenSSL library가 없습니다: {}",
-                library_directory.join(library).display()
-            );
+            println!("cargo::error=vcpkg OpenSSL library for system SQLCipher is missing: {}", library_directory.join(library).display());
             std::process::exit(1);
         }
     }
 
-    println!(
-        "cargo:rustc-link-search=native={}",
-        library_directory.display()
-    );
+    println!("cargo:rustc-link-search=native={}", library_directory.display());
     println!("cargo:rustc-link-lib=static=libssl");
     println!("cargo:rustc-link-lib=static=libcrypto");
     for library in ["crypt32", "ws2_32", "advapi32", "user32"] {

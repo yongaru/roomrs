@@ -6,6 +6,7 @@
 //! 실행: cargo run --example transactions
 
 use roomrs::{dao, database, entity};
+mod support;
 
 #[entity]
 #[derive(Debug, Clone)]
@@ -44,33 +45,21 @@ trait AccountDao {
 struct Db;
 
 fn main() -> roomrs::Result<()> {
+    support::init_tracing();
     let db = Db::builder().in_memory().build()?;
     let h = db.run_sync();
-    let a = h.account_dao().add(&Account {
-        id: 0,
-        name: "a".into(),
-        balance: 100,
-    })?;
-    let b = h.account_dao().add(&Account {
-        id: 0,
-        name: "b".into(),
-        balance: 0,
-    })?;
+    let a = h.account_dao().add(&Account { id: 0, name: "a".into(), balance: 100 })?;
+    let b = h.account_dao().add(&Account { id: 0, name: "b".into(), balance: 0 })?;
 
     // 1) #[transaction] 이체
     h.account_dao().transfer(a, b, 30)?;
-    println!(
-        "이체 후: a={} b={}",
-        h.account_dao().balance(a)?,
-        h.account_dao().balance(b)?
-    );
+    println!("이체 후: a={} b={}", h.account_dao().balance(a)?, h.account_dao().balance(b)?);
 
     // 2) 잔액 부족 = 에러 + 원상 유지
-    let err = h.account_dao().transfer(a, b, 9999).unwrap_err();
-    println!(
-        "실패 이체: {err} (a={} 그대로)",
-        h.account_dao().balance(a)?
-    );
+    match h.account_dao().transfer(a, b, 9999) {
+        Ok(()) => println!("부족 잔액 이체가 예상과 다르게 성공했습니다"),
+        Err(e) => println!("실패 이체: {e} (a={} 그대로)", h.account_dao().balance(a)?),
+    }
 
     // 3) 클로저 트랜잭션 + 중첩 savepoint — 내부 실패는 내부만 롤백
     use DbTxDaos as _;
@@ -83,11 +72,7 @@ fn main() -> roomrs::Result<()> {
         println!("savepoint 결과: {inner:?}");
         Ok(())
     })?;
-    println!(
-        "중첩 후: a={} b={} (999 미반영)",
-        h.account_dao().balance(a)?,
-        h.account_dao().balance(b)?
-    );
+    println!("중첩 후: a={} b={} (999 미반영)", h.account_dao().balance(a)?, h.account_dao().balance(b)?);
 
     // 4) RAII — commit 없이 drop = 롤백
     {
@@ -95,9 +80,6 @@ fn main() -> roomrs::Result<()> {
         tx.execute("UPDATE Account SET balance = 0", roomrs::params![])?;
         // drop → 롤백
     }
-    println!(
-        "RAII drop 후: a={} (롤백 확인)",
-        h.account_dao().balance(a)?
-    );
+    println!("RAII drop 후: a={} (롤백 확인)", h.account_dao().balance(a)?);
     Ok(())
 }

@@ -1,19 +1,77 @@
 //! 라이브 쿼리 엔진 (명세 §5.6, §9) — feature `live`
 //!
 //! 주 경로: 문장 기반 무효화(commit 성공 후 방출) · 보조: preupdate_hook 행 매칭.
-//! 노티파이어 스레드가 디바운스·재조회·팬아웃을 담당한다.
+//! notifier는 이벤트 병합·observer별 고정 coalesce 예약·작업 제출만 담당한다.
+//! 재조회는 `roomrs-live-worker-{n}` 이 통합 read/write 풀에서 checkout 해 수행한다 (결정 51).
 //! 재조회·콜백은 레지스트리/콜백 락 밖에서 실행된다 — 콜백 내 재진입(구독 생성·해지) 허용.
 
 use crate::error::{Error, Result};
+use crate::pool::ConnectionPool;
 use crate::query::IntoDbValue;
 use crate::row::FromRow;
 use rusqlite::types::Value;
 use rusqlite::{Connection, ToSql};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Default live-query debounce window (decision 49).
+pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Read-only LiveQuery observability snapshot (spec §9.5 P2).
+///
+/// Counters never include SQL parameters or row payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LiveMetrics {
+    /// Invalidation messages received by the notifier (`Invalidate` / `Changes`).
+    pub events_received: u64,
+    /// Extra invalidations merged into an already-open fixed coalesce window.
+    pub coalesce_merged: u64,
+    /// Current live-worker job queue depth (point-in-time).
+    pub worker_queue_depth: u64,
+    /// Refresh closures that published a successful result.
+    pub refresh_ok: u64,
+    /// Refresh failures (query error, pool checkout error, isolated panic).
+    pub refresh_err: u64,
+    /// In-flight refresh results discarded by epoch (rebind/unregister/newer schedule).
+    pub stale_discarded: u64,
+}
+
+/// process-wide atomic counters shared by notifier / workers / refresh closures
+struct LiveMetricsState {
+    events_received: AtomicU64,
+    coalesce_merged: AtomicU64,
+    refresh_ok: AtomicU64,
+    refresh_err: AtomicU64,
+    stale_discarded: AtomicU64,
+}
+
+impl LiveMetricsState {
+    /// zeroed counters
+    fn new() -> Self {
+        Self {
+            events_received: AtomicU64::new(0),
+            coalesce_merged: AtomicU64::new(0),
+            refresh_ok: AtomicU64::new(0),
+            refresh_err: AtomicU64::new(0),
+            stale_discarded: AtomicU64::new(0),
+        }
+    }
+
+    /// point-in-time snapshot with queue depth filled by caller
+    fn snapshot(&self, worker_queue_depth: u64) -> LiveMetrics {
+        LiveMetrics {
+            events_received: self.events_received.load(Ordering::Relaxed),
+            coalesce_merged: self.coalesce_merged.load(Ordering::Relaxed),
+            worker_queue_depth,
+            refresh_ok: self.refresh_ok.load(Ordering::Relaxed),
+            refresh_err: self.refresh_err.load(Ordering::Relaxed),
+            stale_discarded: self.stale_discarded.load(Ordering::Relaxed),
+        }
+    }
+}
 
 // ─────────────────── 행 무효화 필터 ───────────────────
 
@@ -22,10 +80,48 @@ use std::time::Duration;
 /// This is not a SQL query builder. It determines only whether a changed row
 /// can affect a subscription result. Predicates within a group are ANDed and
 /// groups are ORed.
+///
+/// Multiple filters on one LiveQuery are OR-matched: any matching filter
+/// triggers a re-query (decision 52). Filter-to-filter AND is not supported.
 #[derive(Debug, Clone)]
 pub struct InvalidationFilter {
     table: String,
     groups: Vec<InvalidationGroup>,
+}
+
+/// Converts a single filter or a collection into the list accepted by
+/// `watch_*_filtered` (OR semantics, decision 52).
+pub trait IntoInvalidationFilters {
+    /// Owned filter list for registration.
+    fn into_invalidation_filters(self) -> Vec<InvalidationFilter>;
+}
+
+impl IntoInvalidationFilters for InvalidationFilter {
+    /// 단일 filter → 길이 1 목록
+    fn into_invalidation_filters(self) -> Vec<InvalidationFilter> {
+        vec![self]
+    }
+}
+
+impl IntoInvalidationFilters for Vec<InvalidationFilter> {
+    /// 소유 목록 그대로
+    fn into_invalidation_filters(self) -> Vec<InvalidationFilter> {
+        self
+    }
+}
+
+impl IntoInvalidationFilters for &[InvalidationFilter] {
+    /// 슬라이스 복제
+    fn into_invalidation_filters(self) -> Vec<InvalidationFilter> {
+        self.to_vec()
+    }
+}
+
+impl<const N: usize> IntoInvalidationFilters for [InvalidationFilter; N] {
+    /// 고정 배열 → 목록
+    fn into_invalidation_filters(self) -> Vec<InvalidationFilter> {
+        self.into()
+    }
 }
 
 /// Builder for [`InvalidationFilter`].
@@ -65,10 +161,7 @@ pub(crate) struct TableChange {
 impl InvalidationFilter {
     /// Starts a row invalidation filter for a table.
     pub fn table(table: impl Into<String>) -> InvalidationFilterBuilder {
-        InvalidationFilterBuilder {
-            table: table.into(),
-            groups: Vec::new(),
-        }
+        InvalidationFilterBuilder { table: table.into(), groups: Vec::new() }
     }
 
     /// Returns target table name.
@@ -76,108 +169,141 @@ impl InvalidationFilter {
         &self.table
     }
 
+    /// predicate 가 참조하는 컬럼명 집합 (중복 제거).
+    fn referenced_columns(&self) -> HashSet<&str> {
+        let mut out = HashSet::new();
+        for group in &self.groups {
+            for p in &group.predicates {
+                out.insert(p.column_name());
+            }
+        }
+        out
+    }
+
+    /// 실제 SQLite 스키마에 table·column 존재 여부를 검증한다 (명세 §9.5 P1).
+    /// 오타는 조용히 무시하지 않고 [`Error::InvalidationFilter`] 로 반환한다.
+    pub(crate) fn validate_against_schema(&self, conn: &Connection) -> Result<()> {
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type IN ('table', 'view') AND name = ?1 COLLATE NOCASE",
+                [self.table.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)?;
+        if table_exists == 0 {
+            return Err(Error::InvalidationFilter(format!("테이블 '{}' 이(가) 스키마에 없습니다 — InvalidationFilter::table 이름을 확인하세요", self.table)));
+        }
+
+        // pragma_table_info 는 테이블명 파라미터를 받아 컬럼 목록을 돌려준다.
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1)").map_err(Error::from)?;
+        let col_rows = stmt.query_map([self.table.as_str()], |row| row.get::<_, String>(0)).map_err(Error::from)?;
+        let mut schema_cols: HashSet<String> = HashSet::new();
+        for col in col_rows {
+            schema_cols.insert(col.map_err(Error::from)?.to_ascii_lowercase());
+        }
+        if schema_cols.is_empty() {
+            return Err(Error::InvalidationFilter(format!("테이블 '{}' 의 컬럼 정보를 읽지 못했습니다 — 스키마를 확인하세요", self.table)));
+        }
+
+        for column in self.referenced_columns() {
+            if !schema_cols.contains(&column.to_ascii_lowercase()) {
+                return Err(Error::InvalidationFilter(format!("테이블 '{}' 에 컬럼 '{}' 이(가) 없습니다 — InvalidationFilter predicate 컬럼명을 확인하세요", self.table, column)));
+            }
+        }
+        Ok(())
+    }
+
     /// 변경 전 또는 후 행이 조건을 만족하면 true.
     fn matches_change(&self, change: &TableChange) -> bool {
-        self.table.eq_ignore_ascii_case(&change.table)
-            && [change.old.as_ref(), change.new.as_ref()]
-                .into_iter()
-                .flatten()
-                .any(|row| self.matches_row(row))
+        self.table.eq_ignore_ascii_case(&change.table) && [change.old.as_ref(), change.new.as_ref()].into_iter().flatten().any(|row| self.matches_row(row))
     }
 
     /// OR 그룹 중 하나가 행과 일치하면 true.
     fn matches_row(&self, row: &HashMap<String, Value>) -> bool {
-        self.groups
-            .iter()
-            .any(|group| group.predicates.iter().all(|p| p.matches(row)))
+        self.groups.iter().any(|group| group.predicates.iter().all(|p| p.matches(row)))
     }
+}
+
+/// 여러 filter 중 하나라도 변경 행에 매칭되면 true (filter 간 OR, 결정 52).
+fn any_filter_matches(filters: &[InvalidationFilter], change: &TableChange) -> bool {
+    filters.iter().any(|f| f.matches_change(change))
+}
+
+/// 필터 목록 전체 스키마 검증 — 하나라도 실패하면 첫 오류 반환.
+pub(crate) fn validate_filters_against_schema(conn: &Connection, filters: &[InvalidationFilter]) -> Result<()> {
+    if filters.is_empty() {
+        return Err(Error::Config("InvalidationFilter 목록이 비어 있습니다 — 필터를 1개 이상 지정하세요".into()));
+    }
+    for f in filters {
+        f.validate_against_schema(conn)?;
+    }
+    Ok(())
 }
 
 impl InvalidationFilterBuilder {
     /// Adds an AND group. Subsequent groups are ORed with prior groups.
-    pub fn where_group(
-        mut self,
-        build: impl FnOnce(InvalidationGroupBuilder) -> InvalidationGroupBuilder,
-    ) -> Self {
-        self.groups.push(InvalidationGroup {
-            predicates: build(InvalidationGroupBuilder::default()).predicates,
-        });
+    pub fn where_group(mut self, build: impl FnOnce(InvalidationGroupBuilder) -> InvalidationGroupBuilder) -> Self {
+        self.groups.push(InvalidationGroup { predicates: build(InvalidationGroupBuilder::default()).predicates });
         self
     }
 
     /// Adds an AND group ORed with prior groups.
-    pub fn or_where_group(
-        self,
-        build: impl FnOnce(InvalidationGroupBuilder) -> InvalidationGroupBuilder,
-    ) -> Self {
+    pub fn or_where_group(self, build: impl FnOnce(InvalidationGroupBuilder) -> InvalidationGroupBuilder) -> Self {
         self.where_group(build)
     }
 
     /// Validates and builds filter.
     pub fn build(self) -> Result<InvalidationFilter> {
         if self.table.trim().is_empty() {
-            return Err(Error::Config(
-                "무효화 필터 테이블명은 비어 있을 수 없습니다".into(),
-            ));
+            return Err(Error::Config("무효화 필터 테이블명은 비어 있을 수 없습니다".into()));
         }
         if self.groups.is_empty() || self.groups.iter().any(|g| g.predicates.is_empty()) {
-            return Err(Error::Config(
-                "무효화 필터에는 비어 있지 않은 조건 그룹이 필요합니다".into(),
-            ));
+            return Err(Error::Config("무효화 필터에는 비어 있지 않은 조건 그룹이 필요합니다".into()));
         }
-        Ok(InvalidationFilter {
-            table: self.table,
-            groups: self.groups,
-        })
+        Ok(InvalidationFilter { table: self.table, groups: self.groups })
     }
 }
 
 impl InvalidationGroupBuilder {
     /// Matches rows whose column equals value.
     pub fn eq(mut self, column: impl Into<String>, value: impl IntoDbValue) -> Self {
-        self.predicates.push(InvalidationPredicate::Eq {
-            column: column.into(),
-            value: value.into_db_value(),
-        });
+        self.predicates.push(InvalidationPredicate::Eq { column: column.into(), value: value.into_db_value() });
         self
     }
 
     /// Matches rows whose column differs from value. NULL never matches.
     pub fn neq(mut self, column: impl Into<String>, value: impl IntoDbValue) -> Self {
-        self.predicates.push(InvalidationPredicate::Neq {
-            column: column.into(),
-            value: value.into_db_value(),
-        });
+        self.predicates.push(InvalidationPredicate::Neq { column: column.into(), value: value.into_db_value() });
         self
     }
 
     /// Matches rows whose column is NULL.
     pub fn is_null(mut self, column: impl Into<String>) -> Self {
-        self.predicates.push(InvalidationPredicate::IsNull {
-            column: column.into(),
-        });
+        self.predicates.push(InvalidationPredicate::IsNull { column: column.into() });
         self
     }
 
     /// Matches rows whose column is not NULL.
     pub fn is_not_null(mut self, column: impl Into<String>) -> Self {
-        self.predicates.push(InvalidationPredicate::IsNotNull {
-            column: column.into(),
-        });
+        self.predicates.push(InvalidationPredicate::IsNotNull { column: column.into() });
         self
     }
 }
 
 impl InvalidationPredicate {
+    /// predicate 가 참조하는 컬럼명.
+    fn column_name(&self) -> &str {
+        match self {
+            Self::Eq { column, .. } | Self::Neq { column, .. } | Self::IsNull { column } | Self::IsNotNull { column } => column.as_str(),
+        }
+    }
+
     /// SQL WHERE의 NULL 3값 논리를 따라 predicate 하나를 평가한다.
     fn matches(&self, row: &HashMap<String, Value>) -> bool {
         match self {
-            Self::Eq { column, value } => row
-                .get(column)
-                .is_some_and(|v| value != &Value::Null && v != &Value::Null && v == value),
-            Self::Neq { column, value } => row
-                .get(column)
-                .is_some_and(|v| value != &Value::Null && v != &Value::Null && v != value),
+            Self::Eq { column, value } => row.get(column).is_some_and(|v| value != &Value::Null && v != &Value::Null && v == value),
+            Self::Neq { column, value } => row.get(column).is_some_and(|v| value != &Value::Null && v != &Value::Null && v != value),
             Self::IsNull { column } => matches!(row.get(column), Some(Value::Null)),
             Self::IsNotNull { column } => row.get(column).is_some_and(|v| v != &Value::Null),
         }
@@ -224,9 +350,7 @@ fn query_tables(q: &sqlparser::ast::Query, out: &mut HashSet<String>) -> bool {
         /// 테이블 함수 등 미지원 팩터 = 의존 미상 — 실패로 보수 처리
         fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<()> {
             match tf {
-                TableFactor::Table { .. }
-                | TableFactor::Derived { .. }
-                | TableFactor::NestedJoin { .. } => ControlFlow::Continue(()),
+                TableFactor::Table { .. } | TableFactor::Derived { .. } | TableFactor::NestedJoin { .. } => ControlFlow::Continue(()),
                 _ => ControlFlow::Break(()),
             }
         }
@@ -266,8 +390,7 @@ pub(crate) fn extract_tables(sql: &str) -> Option<HashSet<String>> {
             Statement::Update { table, .. } => table_factor(&table.relation, &mut out),
             Statement::Delete(del) => {
                 let from = match &del.from {
-                    sqlparser::ast::FromTable::WithFromKeyword(v)
-                    | sqlparser::ast::FromTable::WithoutKeyword(v) => v,
+                    sqlparser::ast::FromTable::WithFromKeyword(v) | sqlparser::ast::FromTable::WithoutKeyword(v) => v,
                 };
                 from.iter().all(|t| table_factor(&t.relation, &mut out))
             }
@@ -332,11 +455,7 @@ pub(crate) fn extract_write_tables(sql: &str) -> WriteTables {
     use sqlparser::parser::Parser;
 
     let Ok(stmts) = Parser::parse_sql(&SQLiteDialect {}, sql) else {
-        return if obvious_single_read(sql) {
-            WriteTables::ReadOnly
-        } else {
-            WriteTables::Unknown
-        };
+        return if obvious_single_read(sql) { WriteTables::ReadOnly } else { WriteTables::Unknown };
     };
     let mut out = HashSet::new();
     let mut any_write = false;
@@ -346,9 +465,7 @@ pub(crate) fn extract_write_tables(sql: &str) -> WriteTables {
             // Query(body=Insert/Update)로 파싱한다 — 읽기로 오분류하면 훅 미발화
             // 테이블(WITHOUT ROWID/FTS5)에서 무효화가 소실되므로 보수 처리 (R2-1)
             Statement::Query(q) => match q.body.as_ref() {
-                sqlparser::ast::SetExpr::Insert(_)
-                | sqlparser::ast::SetExpr::Update(_)
-                | sqlparser::ast::SetExpr::Table(_) => return WriteTables::Unknown,
+                sqlparser::ast::SetExpr::Insert(_) | sqlparser::ast::SetExpr::Update(_) | sqlparser::ast::SetExpr::Table(_) => return WriteTables::Unknown,
                 // 읽기 전용 — 문장 기반 무효화 없음 (L-2)
                 _ => {}
             },
@@ -375,8 +492,7 @@ pub(crate) fn extract_write_tables(sql: &str) -> WriteTables {
             Statement::Delete(del) => {
                 any_write = true;
                 let from = match &del.from {
-                    sqlparser::ast::FromTable::WithFromKeyword(v)
-                    | sqlparser::ast::FromTable::WithoutKeyword(v) => v,
+                    sqlparser::ast::FromTable::WithFromKeyword(v) | sqlparser::ast::FromTable::WithoutKeyword(v) => v,
                 };
                 if !from.iter().all(|t| table_factor(&t.relation, &mut out)) {
                     return WriteTables::Unknown;
@@ -386,11 +502,7 @@ pub(crate) fn extract_write_tables(sql: &str) -> WriteTables {
             _ => return WriteTables::Unknown,
         }
     }
-    if any_write {
-        WriteTables::Tables(out)
-    } else {
-        WriteTables::ReadOnly
-    }
+    if any_write { WriteTables::Tables(out) } else { WriteTables::ReadOnly }
 }
 
 // ─────────────────── 소유 파라미터 ───────────────────
@@ -410,10 +522,7 @@ impl OwnedParams {
         if params.is_empty() {
             return Ok(Self::None);
         }
-        let vals: Result<Vec<Value>> = params
-            .iter()
-            .map(|p| crate::entity::to_owned_value(*p))
-            .collect();
+        let vals: Result<Vec<Value>> = params.iter().map(|p| crate::entity::to_owned_value(*p)).collect();
         Ok(Self::Positional(vals?))
     }
 
@@ -428,9 +537,7 @@ impl OwnedParams {
             }
             Self::Named(pairs) => {
                 for (k, v) in pairs {
-                    let idx = stmt
-                        .parameter_index(k)?
-                        .ok_or_else(|| Error::Config(format!("알 수 없는 파라미터: {k}")))?;
+                    let idx = stmt.parameter_index(k)?.ok_or_else(|| Error::Config(format!("알 수 없는 파라미터: {k}")))?;
                     stmt.raw_bind_parameter(idx, v)?;
                 }
             }
@@ -440,11 +547,7 @@ impl OwnedParams {
 }
 
 /// 소유 파라미터로 N건 조회 (raw 바인딩 경로)
-pub(crate) fn query_all_owned<T: FromRow>(
-    conn: &Connection,
-    sql: &str,
-    params: &OwnedParams,
-) -> Result<Vec<T>> {
+pub(crate) fn query_all_owned<T: FromRow>(conn: &Connection, sql: &str, params: &OwnedParams) -> Result<Vec<T>> {
     let mut stmt = conn.prepare(sql)?;
     params.bind(&mut stmt)?;
     let mut rows = stmt.raw_query();
@@ -456,11 +559,7 @@ pub(crate) fn query_all_owned<T: FromRow>(
 }
 
 /// 소유 파라미터로 0~1건 조회
-pub(crate) fn query_optional_owned<T: FromRow>(
-    conn: &Connection,
-    sql: &str,
-    params: &OwnedParams,
-) -> Result<Option<T>> {
+pub(crate) fn query_optional_owned<T: FromRow>(conn: &Connection, sql: &str, params: &OwnedParams) -> Result<Option<T>> {
     let mut stmt = conn.prepare(sql)?;
     params.bind(&mut stmt)?;
     let mut rows = stmt.raw_query();
@@ -471,11 +570,7 @@ pub(crate) fn query_optional_owned<T: FromRow>(
 }
 
 /// 소유 파라미터로 스칼라 조회 — 0건 = NotFound
-pub(crate) fn query_scalar_owned<T: rusqlite::types::FromSql>(
-    conn: &Connection,
-    sql: &str,
-    params: &OwnedParams,
-) -> Result<T> {
+pub(crate) fn query_scalar_owned<T: rusqlite::types::FromSql>(conn: &Connection, sql: &str, params: &OwnedParams) -> Result<T> {
     let mut stmt = conn.prepare(sql)?;
     params.bind(&mut stmt)?;
     let mut rows = stmt.raw_query();
@@ -486,15 +581,10 @@ pub(crate) fn query_scalar_owned<T: rusqlite::types::FromSql>(
 }
 
 // ─────────────────── 트래커 / 노티파이어 ───────────────────
+// ─────────────────── 트래커 / 노티파이어 / live worker ───────────────────
 
 /// 노티파이어 메시지
 pub(crate) enum Msg {
-    /// 노티파이어 연결에 사용자 초기화 적용 + 동기 결과 반환.
-    Initialize(
-        crate::database::ConnCallback,
-        bool,
-        std::sync::mpsc::SyncSender<Result<()>>,
-    ),
     /// 테이블 집합 무효화 (None = 전체 — 파싱 실패 보수 경로)
     Invalidate(Option<HashSet<String>>),
     /// preupdate hook이 수집한 행 변경 무효화.
@@ -514,223 +604,370 @@ pub(crate) enum RefreshKind {
     NewOnly,
 }
 
-/// 재조회 클로저 타입 — Arc: 레지스트리 락 밖에서 실행하기 위해 (H-1)
-type RefreshFn = Arc<dyn Fn(&Connection, RefreshKind) + Send + Sync>;
+/// 재조회 클로저 — `job_gen` 은 Full 스케줄 시점 세대. 스테일 결과 폐기용 (결정 51)
+type RefreshFn = Arc<dyn Fn(&Connection, RefreshKind, u64) + Send + Sync>;
+
+/// worker 제출 작업
+struct RefreshJob {
+    id: u64,
+    refresh: RefreshFn,
+    kind: RefreshKind,
+    /// Full 스케줄 세대. NewOnly 는 현재 세대 스냅샷(bump 없음).
+    job_gen: u64,
+}
+
+/// live worker 공유 작업 큐 (결정 51)
+struct JobQueue {
+    inner: Mutex<JobQueueInner>,
+    cv: Condvar,
+}
+
+struct JobQueueInner {
+    jobs: VecDeque<RefreshJob>,
+    closed: bool,
+}
+
+impl JobQueue {
+    /// 빈 큐 생성
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(JobQueueInner { jobs: VecDeque::new(), closed: false }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// 작업 제출 — 종료 후면 폐기
+    fn push(&self, job: RefreshJob) {
+        let mut inner = plock(&self.inner);
+        if inner.closed {
+            log::trace!("live-worker job discarded after close: id={}", job.id);
+            return;
+        }
+        let id = job.id;
+        inner.jobs.push_back(job);
+        log::trace!("live-worker job queued: id={id}, depth={}", inner.jobs.len());
+        drop(inner);
+        self.cv.notify_one();
+    }
+
+    /// 다음 작업 대기. `None` = 큐 종료.
+    fn pop(&self) -> Option<RefreshJob> {
+        let mut inner = plock(&self.inner);
+        loop {
+            if let Some(job) = inner.jobs.pop_front() {
+                return Some(job);
+            }
+            if inner.closed {
+                return None;
+            }
+            inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// 종료 — 대기 작업 폐기 후 worker 전원 깨움
+    fn close(&self) {
+        let mut inner = plock(&self.inner);
+        inner.closed = true;
+        let dropped = inner.jobs.len();
+        inner.jobs.clear();
+        drop(inner);
+        if dropped > 0 {
+            log::debug!("live-worker queue closed: dropped_jobs={dropped}");
+        }
+        self.cv.notify_all();
+    }
+
+    /// 현재 대기 작업 수 (metrics 스냅샷용)
+    fn depth(&self) -> u64 {
+        plock(&self.inner).jobs.len() as u64
+    }
+}
 
 /// 구독 엔트리 — 타입 소거 재조회 클로저
 struct SubEntry {
     /// 의존 테이블 (None = 미상 — UnknownDependencies 상태)
     tables: Option<HashSet<String>>,
     /// 명시 행 필터. 없으면 기존 테이블 단위 무효화다.
-    filter: Option<InvalidationFilter>,
-    /// 노티파이어 전용 커넥션으로 재조회 + 팬아웃
+    /// 행 필터 목록 — `None` = 테이블 단위 무효화. 복수 시 OR 매칭 (결정 52).
+    filter: Option<Vec<InvalidationFilter>>,
+    /// 통합 풀 checkout 재조회 + 팬아웃 (worker 실행)
     refresh: RefreshFn,
+    /// 재조회 세대 — Full 스케줄·rebind 시 증가, 스테일 결과 폐기
+    epoch: Arc<AtomicU64>,
     /// DB 종료 통지 — 대기 중인 recv가 깨어나 Closed 에러를 받게 한다 (M-7)
     close: Box<dyn Fn() + Send + Sync>,
+    /// observer별 무효화 debounce (결정 49) — 등록 시 DB 전역값, `.debounce` 로 override
+    debounce: Duration,
+    /// 고정 coalesce 창 만료 시각. 첫 무효화에만 설정, 창 안 추가 무효화는 연장 없이 병합.
+    pending_due: Option<Instant>,
 }
 
-/// 무효화 트래커 (명세 §9.3) — 레지스트리 + 노티파이어 채널
+/// 무효화 트래커 (명세 §9.3) — 레지스트리 + 노티파이어 채널 + live worker 큐
 pub(crate) struct Tracker {
     subs: Mutex<HashMap<u64, SubEntry>>,
     next_id: AtomicU64,
     tx: Sender<Msg>,
+    /// DB 전역 debounce 기본값 (결정 49). 구독 등록 시 observer 기본으로 복사.
+    default_debounce: Duration,
+    jobs: Arc<JobQueue>,
+    metrics: Arc<LiveMetricsState>,
     notifier_thread: Arc<std::sync::OnceLock<std::thread::ThreadId>>,
 }
 
 impl Tracker {
-    /// 트래커 + 노티파이어 스레드 기동 (전용 커넥션 소유, 명세 §9.6).
-    /// join 핸들 반환 — DB drop 시 join (M-5).
-    /// 스레드 생성 실패는 panic 대신 에러로 전파한다 (L-6)
-    pub(crate) fn start(
-        notifier_conn: Connection,
-    ) -> Result<(Arc<Tracker>, std::thread::JoinHandle<()>)> {
-        notifier_conn
-            .pragma_update(None, "query_only", "ON")
-            .map_err(Error::from)?;
+    /// 트래커 + notifier + live worker pool 기동 (결정 51).
+    /// 전용 read-only 연결 없음 — worker 가 통합 풀에서 checkout.
+    /// `default_debounce` 는 Builder `live_debounce` (미설정 시 [`DEFAULT_DEBOUNCE`]).
+    /// join 핸들 반환 — DB drop 시 join (M-5). 스레드 생성 실패는 에러 (L-6).
+    pub(crate) fn start(pool: Arc<ConnectionPool>, worker_count: usize, default_debounce: Duration) -> Result<(Arc<Tracker>, Vec<std::thread::JoinHandle<()>>)> {
+        let workers = worker_count.max(1);
         let (tx, rx) = channel::<Msg>();
+        let jobs = Arc::new(JobQueue::new());
+        let metrics = Arc::new(LiveMetricsState::new());
         let tracker = Arc::new(Tracker {
             subs: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             tx,
+            default_debounce,
+            jobs: Arc::clone(&jobs),
+            metrics: Arc::clone(&metrics),
             notifier_thread: Arc::new(std::sync::OnceLock::new()),
         });
 
+        let mut joins = Vec::with_capacity(workers + 1);
         let t2 = Arc::clone(&tracker);
-        let handle = std::thread::Builder::new()
-            .name("roomrs-notifier".into())
-            .spawn(move || t2.notifier_loop(rx, notifier_conn))
-            .map_err(|e| Error::Internal(format!("노티파이어 스레드 생성 실패: {e}")))?;
-        Ok((tracker, handle))
+        let jobs_for_notifier = Arc::clone(&jobs);
+        joins.push(std::thread::Builder::new().name("roomrs-notifier".into()).spawn(move || t2.notifier_loop(rx, jobs_for_notifier)).map_err(|e| Error::Internal(format!("노티파이어 스레드 생성 실패: {e}")))?);
+
+        for i in 0..workers {
+            let pool = Arc::clone(&pool);
+            let jobs = Arc::clone(&jobs);
+            let metrics = Arc::clone(&metrics);
+            let name = format!("roomrs-live-worker-{i}");
+            joins.push(std::thread::Builder::new().name(name.clone()).spawn(move || worker_loop(pool, jobs, metrics)).map_err(|e| Error::Internal(format!("live worker 스레드 생성 실패 ({name}): {e}")))?);
+        }
+
+        log::info!("live-query notifier started: workers={workers}, default_debounce_ms={}", default_debounce.as_millis());
+        Ok((tracker, joins))
     }
 
-    /// 노티파이어 루프 — 수신 → 드레인 디바운스 → 재조회
-    fn notifier_loop(&self, rx: Receiver<Msg>, conn: Connection) {
+    /// 읽기 전용 metrics 스냅샷 (명세 §9.5 P2).
+    pub(crate) fn metrics_snapshot(&self) -> LiveMetrics {
+        self.metrics.snapshot(self.jobs.depth())
+    }
+
+    /// refresh 클로저가 공유하는 metrics 핸들
+    fn metrics_handle(&self) -> Arc<LiveMetricsState> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// 노티파이어 루프 — 수신·고정 coalesce 예약·만료 작업 제출 (결정 49/51). DB 재조회 없음.
+    fn notifier_loop(&self, rx: Receiver<Msg>, jobs: Arc<JobQueue>) {
         let _ = self.notifier_thread.set(std::thread::current().id());
+        log::debug!("live-query notifier loop entered");
         loop {
-            let first = match rx.recv() {
-                Ok(m) => m,
-                Err(_) => return, // 송신단 소멸 = DB drop
-            };
-            if let Msg::Initialize(cb, read_uncommitted, reply) = first {
-                let callback_result = conn
-                    .pragma_update(None, "query_only", "OFF")
-                    .map_err(Error::from)
-                    .and_then(|()| {
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(&conn)))
-                            .map_err(|_| Error::Internal("on_open 콜백 panic".into()))
-                            .and_then(|result| result)
-                    });
-                let rollback_result = if !conn.is_autocommit() {
-                    conn.execute_batch("ROLLBACK").map_err(Error::from)
-                } else {
-                    Ok(())
-                };
-                let read_uncommitted_result = if read_uncommitted {
-                    conn.pragma_update(None, "read_uncommitted", "ON")
-                        .map_err(Error::from)
-                } else {
-                    Ok(())
-                };
-                let restore_result = conn
-                    .pragma_update(None, "query_only", "ON")
-                    .map_err(Error::from);
-                let result = callback_result
-                    .and(rollback_result)
-                    .and(read_uncommitted_result)
-                    .and(restore_result);
-                let _ = reply.send(result);
-                continue;
-            }
-            let mut all = false;
-            let mut tables: HashSet<String> = HashSet::new();
-            let mut refresh_ids: HashSet<u64> = HashSet::new();
-            let mut new_ids: HashSet<u64> = HashSet::new();
-            let mut changes: Vec<TableChange> = Vec::new();
-
-            // 디바운스 — 대기 중 메시지 전부 병합 (명세 §9.3)
-            let mut msg = Some(first);
-            loop {
-                match msg.take() {
-                    Some(Msg::Shutdown) => return,
-                    Some(Msg::Initialize(_, _, reply)) => {
-                        let _ = reply.send(Err(Error::Internal(
-                            "노티파이어 초기화 메시지 순서 오류".into(),
-                        )));
-                    }
-                    Some(Msg::Invalidate(None)) => all = true,
-                    Some(Msg::Invalidate(Some(ts))) => tables.extend(ts),
-                    Some(Msg::Changes(cs)) => changes.extend(cs),
-                    Some(Msg::Refresh(id)) => {
-                        refresh_ids.insert(id);
-                    }
-                    Some(Msg::RefreshNew(id)) => {
-                        new_ids.insert(id);
-                    }
-                    None => {}
-                }
-                match rx.try_recv() {
-                    Ok(m) => msg = Some(m),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break,
-                }
-            }
-
-            log::trace!(
-                "notifier debounce merged: all={all}, tables={tables:?}, refresh={}, new={}",
-                refresh_ids.len(),
-                new_ids.len()
-            );
-
-            // 영향 구독 결정 — 락 안에서는 Arc 클론만, 실행은 락 밖 (H-1:
-            // 콜백에서 watch 생성/LiveQuery drop 등 레지스트리 재진입 허용)
-            let targets: Vec<(RefreshFn, RefreshKind)> = {
+            // 가장 이른 pending 만료까지 대기 (없으면 블로킹 recv)
+            let wait = {
                 let subs = plock(&self.subs);
-                subs.iter()
-                    .filter_map(|(id, e)| {
-                        let full = refresh_ids.contains(id)
-                            || (e.tables.is_some()
-                                && (all
-                                    || e.tables
-                                        .as_ref()
-                                        .expect("직전 검사")
-                                        .iter()
-                                        .any(|t| tables.contains(t))
-                                    || changes.iter().any(|change| {
-                                        e.filter.as_ref().map_or_else(
-                                            || {
-                                                e.tables.as_ref().expect("직전 검사").iter().any(
-                                                    |table| {
-                                                        table.eq_ignore_ascii_case(&change.table)
-                                                    },
-                                                )
-                                            },
-                                            |filter| filter.matches_change(change),
-                                        )
-                                    })));
-                        if full {
-                            Some((Arc::clone(&e.refresh), RefreshKind::Full))
-                        } else if new_ids.contains(id) {
-                            Some((Arc::clone(&e.refresh), RefreshKind::NewOnly))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+                let now = Instant::now();
+                subs.values().filter_map(|e| e.pending_due).min().map(|due| due.saturating_duration_since(now))
             };
-            for (refresh, kind) in targets {
-                // 재조회/콜백 panic 은 노티파이어를 죽이지 않는다 (H-4)
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| refresh(&conn, kind)))
-                    .is_err()
-                {
-                    log::warn!("live query refresh panicked — isolated, notifier continues");
+
+            let first = match wait {
+                Some(d) if d.is_zero() => None,
+                Some(d) => match rx.recv_timeout(d) {
+                    Ok(m) => Some(m),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        log::debug!("live-query notifier channel disconnected");
+                        jobs.close();
+                        return;
+                    }
+                },
+                None => match rx.recv() {
+                    Ok(m) => Some(m),
+                    Err(_) => {
+                        log::debug!("live-query notifier channel disconnected");
+                        jobs.close();
+                        return;
+                    }
+                },
+            };
+
+            let mut immediate_full: HashSet<u64> = HashSet::new();
+            let mut immediate_new: HashSet<u64> = HashSet::new();
+            let mut schedule_all = false;
+            let mut schedule_tables: HashSet<String> = HashSet::new();
+            let mut schedule_changes: Vec<TableChange> = Vec::new();
+            let mut shutdown = false;
+
+            if let Some(first_msg) = first {
+                let mut msg = Some(first_msg);
+                loop {
+                    match msg.take() {
+                        Some(Msg::Shutdown) => {
+                            shutdown = true;
+                            break;
+                        }
+                        Some(Msg::Invalidate(None)) => {
+                            self.metrics.events_received.fetch_add(1, Ordering::Relaxed);
+                            schedule_all = true;
+                        }
+                        Some(Msg::Invalidate(Some(ts))) => {
+                            self.metrics.events_received.fetch_add(1, Ordering::Relaxed);
+                            schedule_tables.extend(ts);
+                        }
+                        Some(Msg::Changes(cs)) => {
+                            self.metrics.events_received.fetch_add(1, Ordering::Relaxed);
+                            schedule_changes.extend(cs);
+                        }
+                        Some(Msg::Refresh(id)) => {
+                            immediate_full.insert(id);
+                        }
+                        Some(Msg::RefreshNew(id)) => {
+                            immediate_new.insert(id);
+                        }
+                        None => {}
+                    }
+                    if shutdown {
+                        break;
+                    }
+                    match rx.try_recv() {
+                        Ok(m) => msg = Some(m),
+                        Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                    }
                 }
+            }
+
+            if shutdown {
+                log::info!("live-query notifier stopping");
+                jobs.close();
+                return;
+            }
+
+            // 무효화 영향 observer — 고정 coalesce: 첫 무효화만 창 시작, 추가분은 병합만
+            if schedule_all || !schedule_tables.is_empty() || !schedule_changes.is_empty() {
+                let now = Instant::now();
+                let mut subs = plock(&self.subs);
+                for (id, e) in subs.iter_mut() {
+                    if e.tables.is_none() {
+                        continue;
+                    }
+                    let table_match = e.tables.as_ref().is_some_and(|entry_tables| entry_tables.iter().any(|table| schedule_tables.iter().any(|t| t.eq_ignore_ascii_case(table))));
+                    let change_match = e.tables.as_ref().is_some_and(|entry_tables| schedule_changes.iter().any(|change| e.filter.as_ref().map_or_else(|| entry_tables.iter().any(|table| table.eq_ignore_ascii_case(&change.table)), |filters| any_filter_matches(filters, change))));
+                    if schedule_all || table_match || change_match {
+                        if e.pending_due.is_none() {
+                            let due = now + e.debounce;
+                            e.pending_due = Some(due);
+                            log::trace!("live query debounce scheduled: id={id}, delay_ms={}", e.debounce.as_millis());
+                        } else {
+                            self.metrics.coalesce_merged.fetch_add(1, Ordering::Relaxed);
+                            log::trace!("live query debounce coalesced: id={id}");
+                        }
+                    }
+                }
+            }
+
+            // 즉시 재조회 + 만료 pending → worker 제출 (notifier 는 실행하지 않음)
+            let targets: Vec<RefreshJob> = {
+                let now = Instant::now();
+                let mut subs = plock(&self.subs);
+                let mut out = Vec::new();
+                for (id, e) in subs.iter_mut() {
+                    if immediate_full.contains(id) {
+                        e.pending_due = None;
+                        let job_gen = e.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                        out.push(RefreshJob {
+                            id: *id,
+                            refresh: Arc::clone(&e.refresh),
+                            kind: RefreshKind::Full,
+                            job_gen,
+                        });
+                        continue;
+                    }
+                    if immediate_new.contains(id) {
+                        let job_gen = e.epoch.load(Ordering::Acquire);
+                        out.push(RefreshJob {
+                            id: *id,
+                            refresh: Arc::clone(&e.refresh),
+                            kind: RefreshKind::NewOnly,
+                            job_gen,
+                        });
+                    }
+                    if e.pending_due.is_some_and(|due| due <= now) {
+                        e.pending_due = None;
+                        log::trace!("live query debounce fired: id={id}");
+                        let job_gen = e.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                        out.push(RefreshJob {
+                            id: *id,
+                            refresh: Arc::clone(&e.refresh),
+                            kind: RefreshKind::Full,
+                            job_gen,
+                        });
+                    }
+                }
+                out
+            };
+
+            if !targets.is_empty() {
+                log::trace!("live-query refresh jobs submitted: count={}", targets.len());
+            }
+            for job in targets {
+                jobs.push(job);
             }
         }
     }
 
-    /// 노티파이어 전용 연결에 on_open을 동기 적용한다.
-    pub(crate) fn initialize(
-        &self,
-        cb: crate::database::ConnCallback,
-        read_uncommitted: bool,
-    ) -> Result<()> {
-        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-        self.tx
-            .send(Msg::Initialize(cb, read_uncommitted, reply_tx))
-            .map_err(|_| Error::Closed)?;
-        reply_rx.recv().map_err(|_| Error::Closed)?
-    }
-
-    /// 구독 등록 — id 반환
-    pub(crate) fn register(
-        &self,
-        tables: Option<HashSet<String>>,
-        filter: Option<InvalidationFilter>,
-        refresh: RefreshFn,
-        close: Box<dyn Fn() + Send + Sync>,
-    ) -> u64 {
+    /// 구독 등록 — id 반환. debounce 기본값은 DB 전역 `default_debounce` (결정 49).
+    pub(crate) fn register(&self, tables: Option<HashSet<String>>, filter: Option<Vec<InvalidationFilter>>, refresh: RefreshFn, epoch: Arc<AtomicU64>, close: Box<dyn Fn() + Send + Sync>) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        plock(&self.subs).insert(
-            id,
-            SubEntry {
-                tables,
-                filter,
-                refresh,
-                close,
-            },
-        );
+        let table_count = tables.as_ref().map_or(0, HashSet::len);
+        let filtered = filter.is_some();
+        let debounce = self.default_debounce;
+        plock(&self.subs).insert(id, SubEntry { tables, filter, refresh, epoch, close, debounce, pending_due: None });
+        log::debug!("live query registered: id={id}, tables={table_count}, filtered={filtered}, debounce_ms={}", debounce.as_millis());
         id
     }
 
-    /// 구독 해제
+    /// observer debounce 설정 (결정 49). `Duration::ZERO` = 무효화 즉시 재조회.
+    /// 이미 열린 고정 창은 만료 시각을 바꾸지 않는다 (추가 무효화 병합과 동일).
+    pub(crate) fn set_debounce(&self, id: u64, debounce: Duration) {
+        let mut subs = plock(&self.subs);
+        if let Some(e) = subs.get_mut(&id) {
+            e.debounce = debounce;
+            log::debug!("live query debounce set: id={id}, debounce_ms={}", debounce.as_millis());
+        }
+    }
+
+    /// 구독 해제 — 이후 Full 스케줄 epoch 불일치로 in-flight 결과 폐기
     pub(crate) fn unregister(&self, id: u64) {
-        plock(&self.subs).remove(&id);
+        let removed = {
+            let mut subs = plock(&self.subs);
+            if let Some(e) = subs.remove(&id) {
+                // in-flight worker 결과 폐기
+                e.epoch.fetch_add(1, Ordering::AcqRel);
+                true
+            } else {
+                false
+            }
+        };
+        log::debug!("live query unregistered: id={id}, removed={removed}");
     }
 
     /// 의존 테이블 갱신 (watching)
     pub(crate) fn set_tables(&self, id: u64, tables: HashSet<String>) {
-        if let Some(e) = plock(&self.subs).get_mut(&id) {
-            e.tables = Some(tables);
+        let table_count = tables.len();
+        let updated = {
+            let mut subs = plock(&self.subs);
+            if let Some(e) = subs.get_mut(&id) {
+                e.tables = Some(tables);
+                true
+            } else {
+                false
+            }
+        };
+        if updated {
+            log::debug!("live query dependencies updated: id={id}, tables={table_count}");
         }
     }
 
@@ -743,17 +980,20 @@ impl Tracker {
     /// preupdate hook 변경을 commit 성공 뒤 전달한다.
     pub(crate) fn invalidate_changes(&self, changes: Vec<TableChange>) {
         if !changes.is_empty() {
+            log::trace!("preupdate changes emitted: count={}", changes.len());
             let _ = self.tx.send(Msg::Changes(changes));
         }
     }
 
     /// 특정 구독 재조회 요청 (초기 emit / rebind[C-8] / watching)
     pub(crate) fn request_refresh(&self, id: u64) {
+        log::trace!("live query refresh requested: id={id}");
         let _ = self.tx.send(Msg::Refresh(id));
     }
 
     /// 새 콜백 전용 재조회 요청 — 기존 구독자 재-emit 없음 (L-7)
     pub(crate) fn request_refresh_new(&self, id: u64) {
+        log::trace!("live query new-subscriber refresh requested: id={id}");
         let _ = self.tx.send(Msg::RefreshNew(id));
     }
 
@@ -762,10 +1002,42 @@ impl Tracker {
     pub(crate) fn shutdown(&self) {
         let entries: Vec<SubEntry> = plock(&self.subs).drain().map(|(_, e)| e).collect();
         for e in &entries {
+            e.epoch.fetch_add(1, Ordering::AcqRel);
             (e.close)();
         }
         let _ = self.tx.send(Msg::Shutdown);
     }
+}
+
+/// live worker 루프 — 통합 풀 checkout 후 재조회, 즉시 반납 (결정 51)
+fn worker_loop(pool: Arc<ConnectionPool>, jobs: Arc<JobQueue>, metrics: Arc<LiveMetricsState>) {
+    let name = std::thread::current().name().unwrap_or("roomrs-live-worker").to_string();
+    log::debug!("live-worker started: name={name}");
+    while let Some(job) = jobs.pop() {
+        let guard = match pool.acquire() {
+            Ok(g) => g,
+            Err(e) => {
+                log::error!("live-worker pool checkout failed: name={name}, id={}, err={e}", job.id);
+                metrics.refresh_err.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        let conn = match guard.conn() {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("live-worker connection access failed: name={name}, id={}, err={e}", job.id);
+                metrics.refresh_err.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.refresh)(conn, job.kind, job.job_gen))).is_err() {
+            log::warn!("live query refresh panicked — isolated, worker continues: name={name}, id={}", job.id);
+            metrics.refresh_err.fetch_add(1, Ordering::Relaxed);
+        }
+        // guard drop = 풀 반납
+        drop(guard);
+    }
+    log::debug!("live-worker stopped: name={name}");
 }
 
 // ─────────────────── LiveQuery ───────────────────
@@ -776,7 +1048,10 @@ type CallbackList<T> = Vec<(u64, bool, Box<dyn FnMut(T) + Send>)>;
 /// callback 전달과 close 반환 사이 수명 동기화 상태.
 struct DeliveryState {
     closed: bool,
+    /// 중첩 deliver 깊이 (동일 스레드 재진입 포함)
     active: usize,
+    /// 현재 deliver 를 수행 중인 스레드 — 콜백 안 close 대기 교착 방지 (H-3)
+    owner: Option<std::thread::ThreadId>,
 }
 
 /// LiveQuery 공유 상태
@@ -793,8 +1068,8 @@ struct SubShared<T> {
     next_cb_id: AtomicU64,
     /// 지연 해지 목록 — 콜백 실행(체크아웃) 중 drop된 가드 반영용
     deferred_remove: Mutex<Vec<u64>>,
-    /// rebind 세대 — 이전 세대 결과 폐기 (명세 §5.6)
-    epoch: AtomicU64,
+    /// 재조회 세대 — Full 스케줄·rebind·unregister 시 증가, 이전 세대 결과 폐기 (명세 §5.6, 결정 51)
+    epoch: Arc<AtomicU64>,
     /// 미상 의존 상태 — 첫 recv에 UnknownDependencies 반환 (M-2 지연 통지)
     unknown_deps: AtomicBool,
     /// DB 종료 상태 — 이후 recv는 Closed (M-7)
@@ -835,12 +1110,15 @@ impl<T: Clone> SubShared<T> {
             waker.wake();
         }
         if wait_callbacks {
+            let me = std::thread::current().id();
             let mut delivery = plock(&self.delivery);
             while delivery.active != 0 {
-                delivery = self
-                    .delivery_cv
-                    .wait(delivery)
-                    .unwrap_or_else(|e| e.into_inner());
+                // 자기 스레드가 deliver 중이면 대기 금지 — worker/notifier 콜백 안
+                // Database drop → shutdown → close_terminal 교착 (H-3, 결정 51)
+                if delivery.owner == Some(me) {
+                    break;
+                }
+                delivery = self.delivery_cv.wait(delivery).unwrap_or_else(|e| e.into_inner());
             }
         }
     }
@@ -853,6 +1131,7 @@ impl<T: Clone> SubShared<T> {
                 return;
             }
             delivery.active += 1;
+            delivery.owner = Some(std::thread::current().id());
         }
         let mut cbs: CallbackList<T> = {
             let mut g = plock(&self.callbacks);
@@ -871,7 +1150,7 @@ impl<T: Clone> SubShared<T> {
                 continue;
             }
             *fresh = false;
-            // 콜백 panic 은 노티파이어를 죽이지 않는다 (H-4)
+            // 콜백 panic 은 live worker/notifier 를 죽이지 않는다 (H-4)
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(v.clone()))).is_err() {
                 log::warn!("live query callback panicked — isolated, other callbacks continue");
             }
@@ -884,8 +1163,9 @@ impl<T: Clone> SubShared<T> {
         cbs.retain(|(id, _, _)| !deferred.contains(id));
         *g = cbs;
         let mut delivery = plock(&self.delivery);
-        delivery.active -= 1;
+        delivery.active = delivery.active.saturating_sub(1);
         if delivery.active == 0 {
+            delivery.owner = None;
             self.delivery_cv.notify_all();
         }
     }
@@ -893,9 +1173,7 @@ impl<T: Clone> SubShared<T> {
 
 /// UnknownDependencies 에러 생성 (M-2 지연 통지)
 fn unknown_deps_err() -> Error {
-    Error::UnknownDependencies(
-        "쿼리의 의존 테이블을 추출하지 못했습니다 — .watching(&[…]) 필요".into(),
-    )
+    Error::UnknownDependencies("쿼리의 의존 테이블을 추출하지 못했습니다 — .watching(&[…]) 필요".into())
 }
 
 /// 결과가 SQLITE_LOCKED(공유 캐시 테이블 락)인지 — 재시도 판단 (M-6)
@@ -910,7 +1188,7 @@ fn is_table_locked<T>(out: &Result<T>) -> bool {
 /// 라이브 쿼리 — 단일 구체 타입 (명세 §5.6).
 /// 의존 테이블 write 시 자동 재조회 emit. drop = 구독 해제.
 /// `recv`/`recv_timeout`은 호출 스레드를 블로킹한다. async에서는 `into_stream`을 쓴다.
-/// 마지막 DB 핸들 drop은 notifier 스레드 종료까지 join할 수 있다.
+/// 마지막 DB 핸들 drop은 notifier·live worker 종료까지 join할 수 있다.
 pub struct LiveQuery<T> {
     id: u64,
     tracker: Arc<Tracker>,
@@ -920,54 +1198,40 @@ pub struct LiveQuery<T> {
 
 impl<T: Clone + Send + 'static> LiveQuery<T> {
     /// 내부 생성 — watch_* 전용
-    pub(crate) fn new(
-        tracker: Arc<Tracker>,
-        sql: String,
-        params: OwnedParams,
-        tables: Option<HashSet<String>>,
-        run: impl Fn(&Connection, &str, &OwnedParams) -> Result<T> + Send + Sync + 'static,
-    ) -> Self {
+    pub(crate) fn new(tracker: Arc<Tracker>, sql: String, params: OwnedParams, tables: Option<HashSet<String>>, run: impl Fn(&Connection, &str, &OwnedParams) -> Result<T> + Send + Sync + 'static) -> Self {
         Self::new_filtered(tracker, sql, params, tables, None, run)
     }
 
     /// 내부 생성 — 명시 행 필터를 가진 watch_* 전용.
-    pub(crate) fn new_filtered(
-        tracker: Arc<Tracker>,
-        sql: String,
-        params: OwnedParams,
-        tables: Option<HashSet<String>>,
-        filter: Option<InvalidationFilter>,
-        run: impl Fn(&Connection, &str, &OwnedParams) -> Result<T> + Send + Sync + 'static,
-    ) -> Self {
+    pub(crate) fn new_filtered(tracker: Arc<Tracker>, sql: String, params: OwnedParams, tables: Option<HashSet<String>>, filter: Option<Vec<InvalidationFilter>>, run: impl Fn(&Connection, &str, &OwnedParams) -> Result<T> + Send + Sync + 'static) -> Self {
         let params = Arc::new(Mutex::new(params));
         let unknown = tables.is_none();
         let validate_names = tables.clone();
         let validate_pending = Arc::new(AtomicBool::new(validate_names.is_some()));
+        let epoch = Arc::new(AtomicU64::new(0));
         let shared = Arc::new(SubShared {
             value_slot: Mutex::new(None),
             value_cv: Condvar::new(),
             #[cfg(feature = "stream")]
             stream_waker: Mutex::new(None),
             callbacks: Mutex::new(Vec::new()),
-            delivery: Mutex::new(DeliveryState {
-                closed: false,
-                active: 0,
-            }),
+            delivery: Mutex::new(DeliveryState { closed: false, active: 0, owner: None }),
             delivery_cv: Condvar::new(),
             next_cb_id: AtomicU64::new(1),
             deferred_remove: Mutex::new(Vec::new()),
-            epoch: AtomicU64::new(0),
+            epoch: Arc::clone(&epoch),
             unknown_deps: AtomicBool::new(unknown),
             closed: AtomicBool::new(false),
             last_value: Mutex::new(None),
         });
 
-        // 타입 소거 재조회 클로저 — 노티파이어 스레드에서 실행
+        // 타입 소거 재조회 클로저 — live worker 가 통합 풀 checkout 후 실행 (결정 51)
         let refresh: RefreshFn = {
             let shared = Arc::clone(&shared);
             let params = Arc::clone(&params);
             let validate_pending = Arc::clone(&validate_pending);
-            Arc::new(move |conn: &Connection, kind: RefreshKind| {
+            let metrics = tracker.metrics_handle();
+            Arc::new(move |conn: &Connection, kind: RefreshKind, job_gen: u64| {
                 // 새 콜백 전용 경로 — 캐시 값 전달, 기존 구독자 재-emit 없음 (L-7)
                 if kind == RefreshKind::NewOnly {
                     let cached = plock(&shared.last_value).clone();
@@ -990,12 +1254,12 @@ impl<T: Clone + Send + 'static> LiveQuery<T> {
                             ) == Ok(1)
                         });
                         if !all_tables {
+                            metrics.refresh_err.fetch_add(1, Ordering::Relaxed);
                             shared.publish(Err(unknown_deps_err()));
                             return;
                         }
                     }
                 }
-                let epoch = shared.epoch.load(Ordering::Acquire);
                 let p = plock(&params).clone();
                 let mut out = run(conn, &sql, &p);
                 // 공유 캐시 인메모리의 SQLITE_LOCKED는 busy 핸들러가 개입하지
@@ -1005,18 +1269,23 @@ impl<T: Clone + Send + 'static> LiveQuery<T> {
                     std::thread::sleep(Duration::from_millis(10));
                     out = run(conn, &sql, &p);
                 }
-                // 스테일 폐기 — 재조회 중 rebind가 일어났으면 결과 버림
-                if shared.epoch.load(Ordering::Acquire) != epoch {
+                // 스테일 폐기 — 이후 Full 스케줄·rebind·unregister 가 세대를 올렸으면 버림
+                if shared.epoch.load(Ordering::Acquire) != job_gen {
+                    metrics.stale_discarded.fetch_add(1, Ordering::Relaxed);
+                    log::trace!("live query stale refresh discarded: job_gen={job_gen}");
                     return;
                 }
-                // 팬아웃: 콜백들 + recv 채널
+                // recv 슬롯을 먼저 갱신한다. 콜백은 실행 중 다른 스레드가 즉시
+                // try_recv할 수 있으므로, 콜백보다 앞서 최신값을 관측 가능하게 한다.
                 match out {
                     Ok(v) => {
+                        metrics.refresh_ok.fetch_add(1, Ordering::Relaxed);
                         *plock(&shared.last_value) = Some(v.clone());
+                        shared.publish(Ok(v.clone()));
                         shared.deliver(&v, false);
-                        shared.publish(Ok(v));
                     }
                     Err(e) => {
+                        metrics.refresh_err.fetch_add(1, Ordering::Relaxed);
                         // 재시도 후에도 실패 — 에러는 구독자에게 전달되지만 로그도 남긴다
                         log::error!("live query refresh failed: {e}");
                         shared.publish(Err(e));
@@ -1035,13 +1304,8 @@ impl<T: Clone + Send + 'static> LiveQuery<T> {
             })
         };
 
-        let id = tracker.register(tables, filter, refresh, close);
-        let lq = LiveQuery {
-            id,
-            tracker,
-            shared,
-            params,
-        };
+        let id = tracker.register(tables, filter, refresh, Arc::clone(&epoch), close);
+        let lq = LiveQuery { id, tracker, shared, params };
 
         if !unknown {
             // 구독 즉시 1회 emit (명세 §9.1) — 노티파이어 경유로 순차성 보장.
@@ -1073,11 +1337,7 @@ impl<T: Clone + Send + 'static> LiveQuery<T> {
             if self.shared.closed.load(Ordering::Acquire) {
                 return Err(Error::Closed);
             }
-            slot = self
-                .shared
-                .value_cv
-                .wait(slot)
-                .unwrap_or_else(|e| e.into_inner());
+            slot = self.shared.value_cv.wait(slot).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -1093,13 +1353,7 @@ impl<T: Clone + Send + 'static> LiveQuery<T> {
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
-        let (mut slot, _) = self
-            .shared
-            .value_cv
-            .wait_timeout_while(slot, d, |slot| {
-                slot.is_none() && !self.shared.closed.load(Ordering::Acquire)
-            })
-            .unwrap_or_else(|e| e.into_inner());
+        let (mut slot, _) = self.shared.value_cv.wait_timeout_while(slot, d, |slot| slot.is_none() && !self.shared.closed.load(Ordering::Acquire)).unwrap_or_else(|e| e.into_inner());
         if let Some(value) = slot.take() {
             value.map(Some)
         } else if self.shared.closed.load(Ordering::Acquire) {
@@ -1151,22 +1405,20 @@ impl<T: Clone + Send + 'static> LiveQuery<T> {
     pub fn subscribe(&self, f: impl FnMut(T) + Send + 'static) -> SubscriptionGuard<T> {
         let cb_id = self.shared.next_cb_id.fetch_add(1, Ordering::Relaxed);
         plock(&self.shared.callbacks).push((cb_id, true, Box::new(f)));
+        log::debug!("live query callback subscribed: query_id={}, callback_id={cb_id}", self.id);
         // 새 콜백에만 현재 값 전달 — 기존 구독자 재-emit 없음 (L-7)
         self.tracker.request_refresh_new(self.id);
-        SubscriptionGuard {
-            shared: Arc::clone(&self.shared),
-            cb_id,
-            detached: false,
-        }
+        SubscriptionGuard { shared: Arc::clone(&self.shared), cb_id, detached: false }
     }
 
-    /// 같은 SQL, 바인딩 교체 (명세 §5.6b) — 재조회는 노티파이어 라우팅[C-8]
+    /// 같은 SQL, 바인딩 교체 (명세 §5.6b) — 재조회는 live worker 라우팅[C-8]
     pub fn rebind(&self, params: &[&dyn ToSql]) -> Result<()> {
         let owned = OwnedParams::from_dyn(params)?;
         *plock(&self.params) = owned;
         // epoch 증가 — 진행 중 재조회 결과 폐기, 이전 바인딩 캐시도 폐기 (L-7 보완)
         self.shared.epoch.fetch_add(1, Ordering::AcqRel);
         *plock(&self.shared.last_value) = None;
+        log::debug!("live query parameters rebound: id={}, parameter_count={}", self.id, params.len());
         self.tracker.request_refresh(self.id);
         Ok(())
     }
@@ -1177,7 +1429,22 @@ impl<T: Clone + Send + 'static> LiveQuery<T> {
         let set: HashSet<String> = tables.iter().map(|s| s.to_string()).collect();
         self.tracker.set_tables(self.id, set);
         self.shared.unknown_deps.store(false, Ordering::Release);
+        log::debug!("live query explicit dependencies set: id={}, tables={}", self.id, tables.len());
         self.tracker.request_refresh(self.id);
+        self
+    }
+
+    /// Sets the per-observer invalidation debounce window (decision 49).
+    ///
+    /// Overrides the DB-wide default from
+    /// [`crate::DatabaseBuilder::live_debounce`] (which itself defaults to
+    /// [`DEFAULT_DEBOUNCE`] / 250ms). The window starts on the first
+    /// invalidation and does not slide when more invalidations arrive inside
+    /// the same window — they are coalesced only. `Duration::ZERO` refreshes
+    /// on the next notifier turn. Initial subscription emit, `rebind`, and
+    /// `watching` still refresh immediately.
+    pub fn debounce(self, delay: Duration) -> Self {
+        self.tracker.set_debounce(self.id, delay);
         self
     }
 }
@@ -1209,10 +1476,7 @@ impl<T: Clone + Send + 'static> futures_core::Stream for LiveStream<T> {
     type Item = Result<T>;
 
     /// 최신 슬롯을 소비하고 빈 슬롯이면 publish wake를 등록한다.
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match this.query.try_recv() {
             Ok(Some(value)) => std::task::Poll::Ready(Some(Ok(value))),
@@ -1276,24 +1540,18 @@ mod tests {
             #[cfg(feature = "stream")]
             stream_waker: Mutex::new(None),
             callbacks: Mutex::new(Vec::new()),
-            delivery: Mutex::new(DeliveryState {
-                closed: false,
-                active: 0,
-            }),
+            delivery: Mutex::new(DeliveryState { closed: false, active: 0, owner: None }),
             delivery_cv: Condvar::new(),
             next_cb_id: AtomicU64::new(1),
             deferred_remove: Mutex::new(Vec::new()),
-            epoch: AtomicU64::new(0),
+            epoch: Arc::new(AtomicU64::new(0)),
             unknown_deps: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             last_value: Mutex::new(None::<i64>),
         };
         shared.close_terminal(true);
         shared.publish(Ok(99));
-        assert!(matches!(
-            plock(&shared.value_slot).take(),
-            Some(Err(Error::Closed))
-        ));
+        assert!(matches!(plock(&shared.value_slot).take(), Some(Err(Error::Closed))));
     }
 
     /// 외부 close는 실행 중 callback 종료를 기다리고 반환 뒤 새 callback을 막는다.
@@ -1305,14 +1563,11 @@ mod tests {
             #[cfg(feature = "stream")]
             stream_waker: Mutex::new(None),
             callbacks: Mutex::new(Vec::new()),
-            delivery: Mutex::new(DeliveryState {
-                closed: false,
-                active: 0,
-            }),
+            delivery: Mutex::new(DeliveryState { closed: false, active: 0, owner: None }),
             delivery_cv: Condvar::new(),
             next_cb_id: AtomicU64::new(1),
             deferred_remove: Mutex::new(Vec::new()),
-            epoch: AtomicU64::new(0),
+            epoch: Arc::new(AtomicU64::new(0)),
             unknown_deps: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             last_value: Mutex::new(None::<i64>),
@@ -1391,31 +1646,20 @@ mod tests {
     /// 상태를 바꾸는 PRAGMA와 읽기 PRAGMA 모두 보수적으로 전체 무효화한다.
     #[test]
     fn pragma_stays_unknown() {
-        assert!(matches!(
-            extract_write_tables("PRAGMA user_version = 2"),
-            WriteTables::Unknown
-        ));
-        assert!(matches!(
-            extract_write_tables("PRAGMA user_version"),
-            WriteTables::Unknown
-        ));
+        assert!(matches!(extract_write_tables("PRAGMA user_version = 2"), WriteTables::Unknown));
+        assert!(matches!(extract_write_tables("PRAGMA user_version"), WriteTables::Unknown));
     }
 
     /// EXPLAIN은 포함된 write를 실행하지 않으므로 읽기 전용이다.
     #[test]
     fn explain_write_is_read_only() {
-        assert!(matches!(
-            extract_write_tables("EXPLAIN INSERT INTO t VALUES (1)"),
-            WriteTables::ReadOnly
-        ));
+        assert!(matches!(extract_write_tables("EXPLAIN INSERT INTO t VALUES (1)"), WriteTables::ReadOnly));
     }
 
     /// 다중문에 write가 하나라도 있으면 해당 테이블을 무효화한다.
     #[test]
     fn multi_statement_with_write_collects_table() {
-        let WriteTables::Tables(tables) =
-            extract_write_tables("SELECT 1; INSERT INTO t VALUES (1)")
-        else {
+        let WriteTables::Tables(tables) = extract_write_tables("SELECT 1; INSERT INTO t VALUES (1)") else {
             panic!("SELECT + INSERT는 Tables여야 함");
         };
         assert_eq!(tables, HashSet::from(["t".to_owned()]));

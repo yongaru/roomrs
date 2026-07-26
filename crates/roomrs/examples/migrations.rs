@@ -6,6 +6,7 @@
 //! 실행: cargo run --example migrations
 
 use roomrs::{DatabaseSpec, Migration, dao, database, entity, params};
+mod support;
 
 // ── v1 스키마 ──
 #[entity(table = "docs")]
@@ -38,33 +39,27 @@ trait DocDao {
 struct DbV3;
 
 fn main() -> roomrs::Result<()> {
-    let dir = tempfile::tempdir().expect("tempdir");
+    support::init_tracing();
+    let dir = tempfile::tempdir().map_err(|e| roomrs::Error::Config(format!("tempdir 생성 실패: {e}")))?;
     let path = dir.path().join("m.db");
 
     // 1) v1 DB 생성 + 데이터
     {
         let db = DbV1::builder().sqlite(&path).build()?;
-        db.run_sync()
-            .execute("INSERT INTO docs (title) VALUES ('구버전 행')", params![])?;
+        db.run_sync().execute("INSERT INTO docs (title) VALUES ('구버전 행')", params![])?;
     }
 
     // 2) v3 코드로 열기 — 스텝 체인 자동 실행
     let db = DbV3::builder()
         .sqlite(&path)
-        .migration(Migration::sql(
-            1,
-            2,
-            r#"ALTER TABLE "docs" ADD COLUMN "note" TEXT NOT NULL DEFAULT ''"#,
-        ))
+        .migration(Migration::sql(1, 2, r#"ALTER TABLE "docs" ADD COLUMN "note" TEXT NOT NULL DEFAULT ''"#))
         .migration(Migration::code(2, 3, |tx| {
             // 코드 스텝 — 임의 로직 가능
             tx.execute_batch(r#"ALTER TABLE "docs" ADD COLUMN "done" INTEGER NOT NULL DEFAULT 0"#)
         }))
         .build()?;
 
-    let v: i64 = db
-        .run_sync()
-        .query_scalar("PRAGMA user_version", params![])?;
+    let v: i64 = db.run_sync().query_scalar("PRAGMA user_version", params![])?;
     println!("마이그레이션 완료: user_version = {v}");
     for d in db.run_sync().doc_dao().all()? {
         println!("  {d:?}  (기존 데이터 보존)");
@@ -73,9 +68,6 @@ fn main() -> roomrs::Result<()> {
     // 3) diff 초안 — v1 스냅샷 vs v3 스냅샷 (자동 실행은 안 함, 검토용)
     let old = <DbV1 as DatabaseSpec>::schema().to_snapshot();
     let new = <DbV3 as DatabaseSpec>::schema().to_snapshot();
-    println!(
-        "\n--- diff 초안 (roomrs migrate diff 동일) ---\n{}",
-        roomrs::diff_sql(&old, &new)
-    );
+    println!("\n--- diff 초안 (cargo roomrs migrate diff 동일) ---\n{}", roomrs::diff_sql(&old, &new));
     Ok(())
 }

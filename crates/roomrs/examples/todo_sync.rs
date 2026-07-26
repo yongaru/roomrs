@@ -1,6 +1,7 @@
 //! 동기 todo 예제 (명세 부록 A)
 
 use roomrs::{MigrationPolicy, dao, database, entity};
+mod support;
 
 #[entity(table = "todos")]
 #[derive(Debug, Clone)]
@@ -25,17 +26,11 @@ struct Db;
 
 /// 실행: cargo run --example todo_sync
 fn main() -> roomrs::Result<()> {
-    let db = Db::builder()
-        .in_memory()
-        .migrate(MigrationPolicy::Auto)
-        .build()?;
+    support::init_tracing();
+    let db = Db::builder().in_memory().migrate(MigrationPolicy::Auto).build()?;
     let h = db.run_sync();
 
-    let id = h.todo_dao().add(&Todo {
-        id: 0,
-        title: "명세 읽기".into(),
-        done: false,
-    })?;
+    let id = h.todo_dao().add(&Todo { id: 0, title: "명세 읽기".into(), done: false })?;
     println!("새 id = {id}");
     for t in h.todo_dao().by_done(false)? {
         println!("- [{}] {}", t.id, t.title);

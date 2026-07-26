@@ -14,18 +14,24 @@ use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::{Fields, ItemStruct, Path};
 
+/// version 모드 — 수동 N 또는 auto (결정 48)
+enum VersionMode {
+    Manual(u32),
+    Auto,
+}
+
 /// `#[database(...)]` 인자
 struct DatabaseArgs {
     entities: Vec<Path>,
     daos: Vec<Path>,
-    version: u32,
+    version: VersionMode,
 }
 
-/// 인자 파싱 — entities(...), daos(...), version = N
+/// 인자 파싱 — entities(...), daos(...), version = N|auto
 fn parse_args(args: TokenStream, span: proc_macro2::Span) -> syn::Result<DatabaseArgs> {
     let mut entities = Vec::new();
     let mut daos = Vec::new();
-    let mut version: Option<u32> = None;
+    let mut version: Option<VersionMode> = None;
 
     let parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("entities") {
@@ -39,8 +45,24 @@ fn parse_args(args: TokenStream, span: proc_macro2::Span) -> syn::Result<Databas
                 Ok(())
             })
         } else if meta.path.is_ident("version") {
-            let lit: syn::LitInt = meta.value()?.parse()?;
-            version = Some(lit.base10_parse()?);
+            let value = meta.value()?;
+            if value.peek(syn::LitInt) {
+                let lit: syn::LitInt = value.parse()?;
+                let n: u32 = lit.base10_parse()?;
+                if n == 0 {
+                    return Err(meta.error("version은 1 이상이어야 합니다 (0 = 신규 DB 마커)"));
+                }
+                version = Some(VersionMode::Manual(n));
+            } else if value.peek(syn::Ident) {
+                let id: syn::Ident = value.parse()?;
+                if id == "auto" {
+                    version = Some(VersionMode::Auto);
+                } else {
+                    return Err(meta.error("version 은 정수 N 또는 auto 만 지원"));
+                }
+            } else {
+                return Err(meta.error("version 은 정수 N 또는 auto 만 지원"));
+            }
             Ok(())
         } else {
             Err(meta.error("알 수 없는 database 인자 — entities/daos/version 만 지원"))
@@ -49,37 +71,18 @@ fn parse_args(args: TokenStream, span: proc_macro2::Span) -> syn::Result<Databas
     parser.parse2(args)?;
 
     if entities.is_empty() {
-        return Err(syn::Error::new(
-            span,
-            "entities(...)에 엔티티를 1개 이상 지정해야 합니다",
-        ));
+        return Err(syn::Error::new(span, "entities(...)에 엔티티를 1개 이상 지정해야 합니다"));
     }
-    let entity_keys: Vec<String> = entities
-        .iter()
-        .map(|entity| entity.to_token_stream().to_string())
-        .collect();
+    let entity_keys: Vec<String> = entities.iter().map(|entity| entity.to_token_stream().to_string()).collect();
     for (index, entity) in entities.iter().enumerate() {
         if entity_keys[..index].contains(&entity_keys[index]) {
-            return Err(syn::Error::new(
-                entity.span(),
-                "entities(...)에 같은 엔티티를 중복 지정할 수 없습니다",
-            ));
+            return Err(syn::Error::new(entity.span(), "entities(...)에 같은 엔티티를 중복 지정할 수 없습니다"));
         }
     }
     let Some(version) = version else {
-        return Err(syn::Error::new(span, "version = N 이 필요합니다"));
+        return Err(syn::Error::new(span, "version = N 또는 version = auto 가 필요합니다"));
     };
-    if version == 0 {
-        return Err(syn::Error::new(
-            span,
-            "version은 1 이상이어야 합니다 (0 = 신규 DB 마커)",
-        ));
-    }
-    Ok(DatabaseArgs {
-        entities,
-        daos,
-        version,
-    })
+    Ok(DatabaseArgs { entities, daos, version })
 }
 
 /// 스냅샷 스캔 결과 — 현재 버전 해시 · 압축 임베드 · 파일 의존성 토큰
@@ -90,19 +93,23 @@ struct SnapshotMeta {
     embedded_entries: Vec<TokenStream>,
     /// `include_bytes!` 의존성 등록 상수들 (리뷰 C-1)
     dep_consts: Vec<TokenStream>,
-    /// 전개 시점에 현재 버전 스냅샷 파일이 존재했는지 — export 테스트의
-    /// fail-open 창 차단용 `SNAPSHOT_FILE_SEEN` 상수 값 (결정 28, D-3b)
+    /// 전개 시점에 현재 버전 스냅샷 파일이 존재했는지 — 런타임 스테일 검증용
+    /// `SNAPSHOT_FILE_SEEN` 상수 값 (결정 28, D-3b)
     file_seen: bool,
+}
+
+/// auto 모드: 디스크 최대 version (없으면 1) — 컴파일 시점 현재 revision (결정 48)
+fn resolve_auto_version(db_snake: &str, span: proc_macro2::Span) -> syn::Result<u32> {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| syn::Error::new(span, "CARGO_MANIFEST_DIR 없음 — #[database]는 cargo 빌드에서만 사용할 수 있습니다"))?;
+    let dir = roomrs_migrate::resolve_schema_dir(&manifest);
+    let files = roomrs_migrate::list_snapshot_versions(&dir, db_snake).map_err(|e| syn::Error::new(span, format!("스냅샷 디렉토리 읽기 실패: {} — {e}", dir.display())))?;
+    Ok(files.last().map(|(v, _)| *v).unwrap_or(1))
 }
 
 /// 스키마 디렉토리에서 `{db}.{N}.json` 전 버전을 스캔한다 (명세 §7.2/§8.4).
 /// 파손 파일 = 하드 에러(부재와 구분, M-19), 버전 > database version = 에러,
 /// 각 파일은 include_bytes 의존성 등록 + miniz_oxide 압축 임베드 (결정 21c)
-fn scan_snapshots(
-    db_snake: &str,
-    version: u32,
-    span: proc_macro2::Span,
-) -> syn::Result<SnapshotMeta> {
+fn scan_snapshots(db_snake: &str, version: u32, span: proc_macro2::Span) -> syn::Result<SnapshotMeta> {
     let mut meta = SnapshotMeta {
         snapshot_hash: quote! { None },
         embedded_entries: Vec::new(),
@@ -111,58 +118,22 @@ fn scan_snapshots(
     };
     // CARGO_MANIFEST_DIR 부재 = 침묵 빈 경로 진행 대신 하드 에러 —
     // migrations_dir! 과 동일 정책 (L-13)
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
-        syn::Error::new(
-            span,
-            "CARGO_MANIFEST_DIR 없음 — #[database]는 cargo 빌드에서만 사용할 수 있습니다",
-        )
-    })?;
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| syn::Error::new(span, "CARGO_MANIFEST_DIR 없음 — #[database]는 cargo 빌드에서만 사용할 수 있습니다"))?;
     let dir = roomrs_migrate::resolve_schema_dir(&manifest);
-    let files = roomrs_migrate::list_snapshot_versions(&dir, db_snake).map_err(|e| {
-        syn::Error::new(
-            span,
-            format!("스냅샷 디렉토리 읽기 실패: {} — {e}", dir.display()),
-        )
-    })?;
+    let files = roomrs_migrate::list_snapshot_versions(&dir, db_snake).map_err(|e| syn::Error::new(span, format!("스냅샷 디렉토리 읽기 실패: {} — {e}", dir.display())))?;
     for (ver, path) in &files {
         // 버전 단조성 — database version을 넘는 스냅샷은 정의 오류
         if *ver > version {
-            return Err(syn::Error::new(
-                span,
-                format!(
-                    "스냅샷 버전이 database version보다 큽니다: {} (version = {version})",
-                    path.display()
-                ),
-            ));
+            return Err(syn::Error::new(span, format!("스냅샷 버전이 database version보다 큽니다: {} (version = {version})", path.display())));
         }
-        let raw = std::fs::read(path).map_err(|e| {
-            syn::Error::new(
-                span,
-                format!("스냅샷 파일 읽기 실패: {} — {e}", path.display()),
-            )
-        })?;
+        let raw = std::fs::read(path).map_err(|e| syn::Error::new(span, format!("스냅샷 파일 읽기 실패: {} — {e}", path.display())))?;
         // 존재하는데 파손 = 컴파일 하드 에러 — 부재(스킵)와 구분 (M-19)
-        let snap = roomrs_migrate::SchemaSnapshot::from_slice(&raw).map_err(|e| {
-            syn::Error::new(
-                span,
-                format!(
-                    "스냅샷 파일 파손: {} — 파스 실패: {e} (명세 §7.4)",
-                    path.display()
-                ),
-            )
-        })?;
+        let snap = roomrs_migrate::SchemaSnapshot::from_slice(&raw).map_err(|e| syn::Error::new(span, format!("스냅샷 파일 파손: {} — 파스 실패: {e} (명세 §7.4)", path.display())))?;
         if snap.version != *ver {
-            return Err(syn::Error::new(
-                span,
-                format!(
-                    "스냅샷 내부 version({})이 파일명 버전({ver})과 다릅니다: {}",
-                    snap.version,
-                    path.display()
-                ),
-            ));
+            return Err(syn::Error::new(span, format!("스냅샷 내부 version({})이 파일명 버전({ver})과 다릅니다: {}", snap.version, path.display())));
         }
         // 현재 버전 파일 = 런타임 스테일 검증용 해시 임베드 (명세 §7.4b).
-        // 존재 자체도 기록 — export 테스트의 fail-open 창 차단 (D-3b)
+        // 존재 자체도 기록 — 런타임 스테일 검증의 fail-open 창 차단 (D-3b)
         if *ver == version {
             let h = snap.hash();
             meta.snapshot_hash = quote! { Some(#h) };
@@ -171,18 +142,16 @@ fn scan_snapshots(
         // include_bytes 의존성 등록 (리뷰 C-1) — 기존 파일 **갱신** = 재전개 보장.
         // 경로는 resolve_schema_dir 절대화 경로 기반 — fs::read 와 동일 파일 (M-8).
         // 한계: **신규** 파일 추가는 등록 자체가 불가(디렉토리 의존성 미지원) —
-        // export 테스트가 생성 시에도 실패해 재빌드를 강제한다 (결정 28)
+        // 명시 export 뒤 사용자가 재빌드해 재전개한다 (결정 28)
         let path_str = path.to_string_lossy().replace('\\', "/");
-        meta.dep_consts
-            .push(quote! { const _: &[u8] = ::core::include_bytes!(#path_str); });
+        meta.dep_consts.push(quote! { const _: &[u8] = ::core::include_bytes!(#path_str); });
         // 압축 바이트 임베드 (결정 21c) — 커밋된 전 버전을 누적 임베드하므로
         // 바이너리가 버전 수에 단조 증가한다. 절삭("최근 K개+갭") 정책은 후속
         // 검토 — #[database] rustdoc에 명시 (L-16)
         let compressed = roomrs_migrate::compress_snapshot(&raw);
         let bytes = proc_macro2::Literal::byte_string(&compressed);
         let v = *ver;
-        meta.embedded_entries
-            .push(quote! { ::roomrs::EmbeddedSchema { version: #v, compressed: #bytes } });
+        meta.embedded_entries.push(quote! { ::roomrs::EmbeddedSchema { version: #v, compressed: #bytes } });
     }
     Ok(meta)
 }
@@ -193,10 +162,7 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
     let args = parse_args(args, item.span())?;
 
     if !matches!(item.fields, Fields::Unit) {
-        return Err(syn::Error::new(
-            item.span(),
-            "#[database]는 유닛 구조체에만 사용할 수 있습니다: struct AppDb;",
-        ));
+        return Err(syn::Error::new(item.span(), "#[database]는 유닛 구조체에만 사용할 수 있습니다: struct AppDb;"));
     }
 
     let db_ident = item.ident.clone();
@@ -204,13 +170,42 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
     let attrs: Vec<&syn::Attribute> = item.attrs.iter().collect();
     let sync_ident = format_ident!("{}Sync", db_ident);
     let tx_ext_ident = format_ident!("{}TxDaos", db_ident);
-    let version = args.version;
     let entities = &args.entities;
 
     let async_ident = format_ident!("{}Async", db_ident);
 
     // db이름 = 구조체명 snake_case (명세 §7.2, 결정 21) — 스냅샷 파일명 프리픽스
     let db_snake = to_snake_case(&db_ident.to_string());
+    let export_ident = format_ident!("__roomrs_export_{}", db_snake);
+    let export_entrypoint = if std::env::var_os("ROOMRS_SCHEMA_ACTION").is_some() {
+        quote! {
+            #[::roomrs::roomrs_export]
+            fn #export_ident() -> ::roomrs::Result<()> {
+                println!("__ROOMRS_SCHEMA_ENTRYPOINT__");
+                let manifest = ::core::env!("CARGO_MANIFEST_DIR");
+                match ::std::env::var("ROOMRS_SCHEMA_ACTION").as_deref() {
+                    Ok("export") => {
+                        for path in ::roomrs::run_registered_schema_export(manifest)? {
+                            println!("{}", path.display());
+                        }
+                        Ok(())
+                    }
+                    Ok("check") => ::roomrs::run_registered_schema_check(manifest),
+                    Ok(other) => Err(::roomrs::Error::Config(format!("알 수 없는 ROOMRS_SCHEMA_ACTION: {other}"))),
+                    Err(_) => Err(::roomrs::Error::Config("ROOMRS_SCHEMA_ACTION이 없습니다 — cargo roomrs schema export/check로 실행하세요".into())),
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // version = auto 는 디스크 최신 revision 사용 (결정 48)
+    let version_is_auto = matches!(args.version, VersionMode::Auto);
+    let version = match &args.version {
+        VersionMode::Manual(n) => *n,
+        VersionMode::Auto => resolve_auto_version(&db_snake, item.span())?,
+    };
 
     // 스냅샷 파일 스캔 + 해시/압축 임베드 (명세 §7.2/§8.4, 결정 21b/21c)
     let snap_meta = scan_snapshots(&db_snake, version, item.span())?;
@@ -219,34 +214,25 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
     let dep_consts = snap_meta.dep_consts;
     let file_seen = snap_meta.file_seen;
 
-    // export 테스트 (명세 §7.4, 결정 21b) — cargo test 시 현재 버전 스냅샷
-    // 생성/스테일 검증. 항상 방출 — 최초 `cargo test`가 초기 스냅샷을 만든다.
-    let export_fn = format_ident!("__roomrs_schema_export_{}", db_snake);
-
     // DAO 접근자 — TodoDao → fn todo_dao()
     let mut sync_accessors: Vec<TokenStream> = Vec::new();
     let mut async_accessors: Vec<TokenStream> = Vec::new();
     let mut tx_decls: Vec<TokenStream> = Vec::new();
     let mut tx_impls: Vec<TokenStream> = Vec::new();
     for dao in &args.daos {
-        let dao_name = dao
-            .segments
-            .last()
-            .ok_or_else(|| syn::Error::new(dao.span(), "빈 DAO 경로"))?
-            .ident
-            .clone();
+        let dao_name = dao.segments.last().ok_or_else(|| syn::Error::new(dao.span(), "빈 DAO 경로"))?.ident.clone();
         let method = format_ident!("{}", to_snake_case(&dao_name.to_string()));
         let on_ident = {
             // 경로 마지막 세그먼트를 XxxOn으로 치환
             let mut p = dao.clone();
-            let last = p.segments.last_mut().expect("위에서 검증");
+            let last = p.segments.last_mut().ok_or_else(|| syn::Error::new(dao.span(), "빈 DAO 경로"))?;
             last.ident = format_ident!("{}On", last.ident);
             p
         };
 
         let async_on_ident = {
             let mut p = dao.clone();
-            let last = p.segments.last_mut().expect("위에서 검증");
+            let last = p.segments.last_mut().ok_or_else(|| syn::Error::new(dao.span(), "빈 DAO 경로"))?;
             last.ident = format_ident!("{}AsyncOn", last.ident);
             p
         };
@@ -284,17 +270,6 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         // 사장 상수는 링커가 제거한다 (명세 §8.4)
         #(#dep_consts)*
 
-        /// 스냅샷 export/스테일 검증 테스트 (#[database] 생성, 명세 §7.4).
-        /// `cargo test` 시 현재 버전 스냅샷 파일 부재 = 생성 후 실패(커밋+**재빌드**
-        /// 유도 — 신규 파일은 include_bytes 의존성 미등록, 결정 28), 스테일 =
-        /// 재생성 후 실패(커밋 유도). `ROOMRS_SCHEMA_EXPORT=0` 으로 비활성.
-        #[cfg(test)]
-        #[test]
-        fn #export_fn() {
-            ::roomrs::export_schema_for_test::<#db_ident>(::core::env!("CARGO_MANIFEST_DIR"))
-                .unwrap();
-        }
-
         impl ::roomrs::DatabaseSpec for #db_ident {
             const VERSION: u32 = #version;
             const DB_NAME: &'static str = #db_snake;
@@ -313,6 +288,9 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                         name: <#entities as ::roomrs::Entity>::TABLE,
                         columns: <#entities as ::roomrs::Entity>::COLUMNS_META,
                         ddl: <#entities as ::roomrs::Entity>::DDL,
+                        triggers: <#entities as ::roomrs::Entity>::TRIGGERS,
+                        strict: <#entities as ::roomrs::Entity>::STRICT,
+                        without_rowid: <#entities as ::roomrs::Entity>::WITHOUT_ROWID,
                     },)*
                 ];
                 ::roomrs::SchemaDef { version: #version, ddl, tables }
@@ -324,6 +302,33 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             }
         }
 
+        // schema export registry (결정 47/48) — cargo roomrs schema export 가 순회
+        ::roomrs::__private::inventory::submit! {
+            ::roomrs::SchemaExportEntry {
+                db_name: <#db_ident as ::roomrs::DatabaseSpec>::DB_NAME,
+                version: <#db_ident as ::roomrs::DatabaseSpec>::VERSION,
+                auto: #version_is_auto,
+                plan: |manifest_dir| {
+                    #(
+                        if let Some(message) = <#entities as ::roomrs::Entity>::SCHEMA_VALIDATION_ERROR {
+                            return Err(::roomrs::Error::Config(message.to_owned()));
+                        }
+                    )*
+                    ::roomrs::plan_export_for_entry(
+                        <#db_ident as ::roomrs::DatabaseSpec>::DB_NAME,
+                        <#db_ident as ::roomrs::DatabaseSpec>::VERSION,
+                        #version_is_auto,
+                        &<#db_ident as ::roomrs::DatabaseSpec>::schema(),
+                        manifest_dir,
+                    )
+                },
+            }
+        }
+
+        // `cargo roomrs schema export/check` 전용 stable harness 진입점(결정 55).
+        // CLI 환경과 custom cfg 빌드 지문이 일반 cargo build/test 산출물과 분리한다.
+        #export_entrypoint
+
         impl #db_ident {
             /// 빌더 (명세 §5.4)
             #vis fn builder() -> ::roomrs::DatabaseBuilder<#db_ident> {
@@ -333,6 +338,12 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             /// 동기 핸들 (명세 §5.0)
             #vis fn run_sync(&self) -> #sync_ident<'_> {
                 #sync_ident { h: self.inner.run_sync() }
+            }
+
+            /// LiveQuery 관측성 스냅샷 (명세 §9.5 P2).
+            /// Requires the `live` feature on `roomrs`.
+            #vis fn live_metrics(&self) -> ::roomrs::LiveMetrics {
+                self.inner.live_metrics()
             }
         }
 

@@ -17,10 +17,7 @@ pub trait RelationView: Sized {
 /// IN 절 플레이스홀더 생성 (`?1, ?2, …`) — derive 생성 코드 전용
 #[doc(hidden)]
 pub fn in_placeholders(n: usize) -> String {
-    (1..=n)
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    (1..=n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ")
 }
 
 use rusqlite::ToSql;
@@ -33,13 +30,7 @@ const IN_CHUNK_SIZE: usize = 999;
 /// 1:N/1:1 자식 일괄 로딩 — 부모 키 IN 조회 후 자식 키로 그룹핑.
 /// derive 생성 코드 전용 (클로저가 키 타입을 고정한다).
 #[doc(hidden)]
-pub fn load_children<PK, C, CX, F>(
-    cx: &CX,
-    keys: &[PK],
-    child_table: &str,
-    key_col: &str,
-    key_of: F,
-) -> Result<HashMap<PK, Vec<C>>>
+pub fn load_children<PK, C, CX, F>(cx: &CX, keys: &[PK], child_table: &str, key_col: &str, key_of: F) -> Result<HashMap<PK, Vec<C>>>
 where
     PK: ToSql + Eq + Hash + Clone,
     C: crate::row::FromRow,
@@ -51,10 +42,7 @@ where
         return Ok(map);
     }
     for chunk in keys.chunks(IN_CHUNK_SIZE) {
-        let sql = format!(
-            "SELECT * FROM \"{child_table}\" WHERE \"{key_col}\" IN ({})",
-            in_placeholders(chunk.len())
-        );
+        let sql = format!("SELECT * FROM \"{child_table}\" WHERE \"{key_col}\" IN ({})", in_placeholders(chunk.len()));
         let refs: Vec<&dyn ToSql> = chunk.iter().map(|k| k as &dyn ToSql).collect();
         let children: Vec<C> = cx.ctx_query_all(&sql, &refs[..])?;
         for c in children {
@@ -68,16 +56,7 @@ where
 /// derive 생성 코드 전용.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub fn load_junction<PK, EK, C, CX, F>(
-    cx: &CX,
-    keys: &[PK],
-    junction_table: &str,
-    j_parent_col: &str,
-    j_entity_col: &str,
-    child_table: &str,
-    child_key_col: &str,
-    key_of: F,
-) -> Result<HashMap<PK, Vec<C>>>
+pub fn load_junction<PK, EK, C, CX, F>(cx: &CX, keys: &[PK], junction_table: &str, j_parent_col: &str, j_entity_col: &str, child_table: &str, child_key_col: &str, key_of: F) -> Result<HashMap<PK, Vec<C>>>
 where
     PK: ToSql + rusqlite::types::FromSql + Eq + Hash + Clone,
     EK: ToSql + rusqlite::types::FromSql + Eq + Hash + Clone + Ord,
@@ -108,10 +87,7 @@ where
     let mut by_key: HashMap<EK, C> = HashMap::new();
     if !child_keys.is_empty() {
         for chunk in child_keys.chunks(IN_CHUNK_SIZE) {
-            let csql = format!(
-                "SELECT * FROM \"{child_table}\" WHERE \"{child_key_col}\" IN ({})",
-                in_placeholders(chunk.len())
-            );
+            let csql = format!("SELECT * FROM \"{child_table}\" WHERE \"{child_key_col}\" IN ({})", in_placeholders(chunk.len()));
             let crefs: Vec<&dyn ToSql> = chunk.iter().map(|k| k as &dyn ToSql).collect();
             let children: Vec<C> = cx.ctx_query_all(&csql, &crefs[..])?;
             for c in children {

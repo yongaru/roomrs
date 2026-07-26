@@ -16,16 +16,9 @@ use syn::{FnArg, ItemTrait, LitStr, Pat, ReturnType, TraitItem, Type};
 /// 메서드 종류 — SQL은 LitStr로 보존해 에러 span을 SQL 리터럴에 맞춘다 (L-16)
 enum MethodKind {
     /// #[query("SQL")] — unchecked/with_relations 플래그
-    Query {
-        sql: LitStr,
-        unchecked: bool,
-        with_relations: bool,
-    },
+    Query { sql: LitStr, unchecked: bool, with_relations: bool },
     /// #[insert] — on_conflict, keep_pk
-    Insert {
-        on_conflict: Option<String>,
-        keep_pk: bool,
-    },
+    Insert { on_conflict: Option<String>, keep_pk: bool },
     /// #[update("SQL")] / #[delete("SQL")] (+ unchecked)
     Write { sql: LitStr, unchecked: bool },
     /// #[transaction] — 본문 있는 유일한 종류, tx-바운드 DAO 문맥으로 재작성 (명세 §5.9)
@@ -55,10 +48,7 @@ impl syn::visit_mut::VisitMut for ReplaceSelf {
     /// 침묵 실패한다 — 토큰 스캔으로 `self`를 찾으면 컴파일 에러 (H-8)
     fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
         if let Some(span) = find_self_in_tokens(mac.tokens.clone()) {
-            self.errors.push(syn::Error::new(
-                span,
-                "트랜잭션 본문의 매크로 호출 안에서는 self 를 사용할 수 없습니다 — 지역 변수로 추출하세요",
-            ));
+            self.errors.push(syn::Error::new(span, "트랜잭션 본문의 매크로 호출 안에서는 self 를 사용할 수 없습니다 — 지역 변수로 추출하세요"));
         }
         syn::visit_mut::visit_macro_mut(self, mac);
     }
@@ -122,10 +112,7 @@ fn parse_sql_args(attr: &syn::Attribute) -> syn::Result<(LitStr, bool, bool)> {
             } else if ident == "with_relations" {
                 with_relations = true;
             } else {
-                return Err(syn::Error::new(
-                    ident.span(),
-                    "알 수 없는 플래그 — unchecked / with_relations 만 지원",
-                ));
+                return Err(syn::Error::new(ident.span(), "알 수 없는 플래그 — unchecked / with_relations 만 지원"));
             }
             input.parse::<syn::Token![,]>()?;
         }
@@ -263,10 +250,7 @@ enum LiveShape {
 /// `Result<X>` 에서 X 추출
 fn unwrap_result(ret: &ReturnType) -> syn::Result<Type> {
     let ReturnType::Type(_, ty) = ret else {
-        return Err(syn::Error::new(
-            ret.span(),
-            "DAO 메서드는 Result<...>를 반환해야 합니다",
-        ));
+        return Err(syn::Error::new(ret.span(), "DAO 메서드는 Result<...>를 반환해야 합니다"));
     };
     if let Type::Path(tp) = ty.as_ref() {
         if let Some(seg) = tp.path.segments.last() {
@@ -279,10 +263,7 @@ fn unwrap_result(ret: &ReturnType) -> syn::Result<Type> {
             }
         }
     }
-    Err(syn::Error::new(
-        ty.span(),
-        "DAO 메서드는 Result<...>를 반환해야 합니다",
-    ))
+    Err(syn::Error::new(ty.span(), "DAO 메서드는 Result<...>를 반환해야 합니다"))
 }
 
 /// 제네릭 1개 타입(Vec<T>/Option<T>)의 내부 추출
@@ -318,10 +299,7 @@ fn classify_return(ret: &ReturnType, is_insert: bool) -> syn::Result<RetShape> {
 
     let inner = unwrap_result(ret)?;
     if unwrap_generic(&inner, "LiveQuery").is_some() {
-        return Err(syn::Error::new(
-            inner.span(),
-            "LiveQuery는 Result로 감싸지 않고 직접 반환해야 합니다",
-        ));
+        return Err(syn::Error::new(inner.span(), "LiveQuery는 Result로 감싸지 않고 직접 반환해야 합니다"));
     }
     if let Some(t) = unwrap_generic(&inner, "Vec") {
         // Vec<u8>은 스칼라 취급이 자연스러우나 DAO 반환으로는 비현실적 — Many 유지
@@ -349,34 +327,46 @@ fn arg_idents(sig: &syn::Signature) -> syn::Result<Vec<syn::Ident>> {
     let mut out = Vec::new();
     for arg in sig.inputs.iter().skip(1) {
         let FnArg::Typed(pt) = arg else {
-            return Err(syn::Error::new(
-                arg.span(),
-                "DAO 메서드 수신자는 &self여야 합니다",
-            ));
+            return Err(syn::Error::new(arg.span(), "DAO 메서드 수신자는 &self여야 합니다"));
         };
         let Pat::Ident(pi) = pt.pat.as_ref() else {
-            return Err(syn::Error::new(
-                pt.pat.span(),
-                "DAO 인자는 단순 식별자여야 합니다",
-            ));
+            return Err(syn::Error::new(pt.pat.span(), "DAO 인자는 단순 식별자여야 합니다"));
         };
         out.push(pi.ident.clone());
     }
     Ok(out)
 }
 
+/// 타입이 `InvalidationFilter`(경로 마지막 세그먼트)인지 — SQL bind에서 제외 (filter API 대칭)
+fn is_invalidation_filter_ty(ty: &Type) -> bool {
+    match ty {
+        Type::Path(p) => p.path.segments.last().is_some_and(|s| s.ident == "InvalidationFilter"),
+        Type::Reference(r) => is_invalidation_filter_ty(&r.elem),
+        _ => false,
+    }
+}
+
+/// LiveQuery 메서드의 `InvalidationFilter` 인자 식별자 목록 (0개 이상, OR 매칭).
+fn live_filter_args(sig: &syn::Signature) -> syn::Result<Vec<syn::Ident>> {
+    let mut found = Vec::new();
+    for arg in sig.inputs.iter().skip(1) {
+        let FnArg::Typed(pt) = arg else { continue };
+        if !is_invalidation_filter_ty(&pt.ty) {
+            continue;
+        }
+        let Pat::Ident(pi) = pt.pat.as_ref() else {
+            return Err(syn::Error::new(pt.pat.span(), "InvalidationFilter 인자는 단순 식별자여야 합니다"));
+        };
+        found.push(pi.ident.clone());
+    }
+    Ok(found)
+}
+
 /// DAO 메서드가 불변 참조 수신자 `&self`로 시작하는지 검증한다.
 fn validate_receiver(sig: &syn::Signature) -> syn::Result<()> {
     match sig.inputs.first() {
-        Some(FnArg::Receiver(receiver))
-            if receiver.reference.is_some() && receiver.mutability.is_none() =>
-        {
-            Ok(())
-        }
-        _ => Err(syn::Error::new(
-            sig.inputs.span(),
-            "DAO 메서드 수신자는 &self여야 합니다",
-        )),
+        Some(FnArg::Receiver(receiver)) if receiver.reference.is_some() && receiver.mutability.is_none() => Ok(()),
+        _ => Err(syn::Error::new(sig.inputs.span(), "DAO 메서드 수신자는 &self여야 합니다")),
     }
 }
 
@@ -389,42 +379,34 @@ fn sql_has_returning(sql: &str) -> bool {
     let Ok(statements) = Parser::parse_sql(&SQLiteDialect {}, sql) else {
         return false;
     };
-    matches!(
-        statements.as_slice(),
-        [Statement::Update {
-            returning: Some(_),
-            ..
-        }] | [Statement::Delete(sqlparser::ast::Delete {
-            returning: Some(_),
-            ..
-        })]
-    )
+    matches!(statements.as_slice(), [Statement::Update { returning: Some(_), .. }] | [Statement::Delete(sqlparser::ast::Delete { returning: Some(_), .. })])
 }
 
 /// SQL 명명 파라미터 ↔ 메서드 인자 정합성 검증 (명세 §5.2).
-/// 원인 span: 파라미터가 SQL 쪽에 있으면 SQL 리터럴, 인자 쪽이면 인자 식별자 (L-16)
-fn check_params(sql: &LitStr, sig: &syn::Signature) -> syn::Result<Vec<String>> {
+/// 원인 span: 파라미터가 SQL 쪽에 있으면 SQL 리터럴, 인자 쪽이면 인자 식별자 (L-16).
+/// `skip_idents` 는 SQL 바인드가 아닌 인자(예: InvalidationFilter) 제외 목록.
+fn check_params_excluding(sql: &LitStr, sig: &syn::Signature, skip_idents: &[syn::Ident]) -> syn::Result<Vec<String>> {
     let names = extract_named_params(&sql.value());
     let args = arg_idents(sig)?;
-    let arg_names: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let bind_args: Vec<&syn::Ident> = args.iter().filter(|a| !skip_idents.iter().any(|s| s == *a)).collect();
+    let arg_names: Vec<String> = bind_args.iter().map(|a| a.to_string()).collect();
 
     for n in &names {
         if !arg_names.contains(n) {
-            return Err(syn::Error::new(
-                sql.span(),
-                format!("SQL 파라미터 :{n} 에 대응하는 메서드 인자가 없습니다"),
-            ));
+            return Err(syn::Error::new(sql.span(), format!("SQL 파라미터 :{n} 에 대응하는 메서드 인자가 없습니다")));
         }
     }
-    for (a, ident) in arg_names.iter().zip(&args) {
+    for (a, ident) in arg_names.iter().zip(&bind_args) {
         if !names.contains(a) {
-            return Err(syn::Error::new(
-                ident.span(),
-                format!("메서드 인자 {a} 가 SQL에서 사용되지 않습니다 (:{a} 없음)"),
-            ));
+            return Err(syn::Error::new(ident.span(), format!("메서드 인자 {a} 가 SQL에서 사용되지 않습니다 (:{a} 없음)")));
         }
     }
     Ok(names)
+}
+
+/// SQL 명명 파라미터 ↔ 메서드 인자 정합성 검증 (명세 §5.2).
+fn check_params(sql: &LitStr, sig: &syn::Signature) -> syn::Result<Vec<String>> {
+    check_params_excluding(sql, sig, &[])
 }
 
 /// 메서드 속성 파싱 — query/insert/update/delete/transaction 중 정확히 하나 (M-17)
@@ -434,18 +416,11 @@ fn parse_method_kind(method: &syn::TraitItemFn) -> syn::Result<MethodKind> {
         let path = attr.path();
         let new_kind = if path.is_ident("query") {
             let (sql, unchecked, with_relations) = parse_sql_args(attr)?;
-            Some(MethodKind::Query {
-                sql,
-                unchecked,
-                with_relations,
-            })
+            Some(MethodKind::Query { sql, unchecked, with_relations })
         } else if path.is_ident("update") || path.is_ident("delete") {
             let (sql, unchecked, with_relations) = parse_sql_args(attr)?;
             if with_relations {
-                return Err(syn::Error::new(
-                    attr.span(),
-                    "with_relations는 #[query]에서만 지원됩니다",
-                ));
+                return Err(syn::Error::new(attr.span(), "with_relations는 #[query]에서만 지원됩니다"));
             }
             Some(MethodKind::Write { sql, unchecked })
         } else if path.is_ident("insert") {
@@ -465,10 +440,7 @@ fn parse_method_kind(method: &syn::TraitItemFn) -> syn::Result<MethodKind> {
                     }
                 })?;
             }
-            Some(MethodKind::Insert {
-                on_conflict,
-                keep_pk,
-            })
+            Some(MethodKind::Insert { on_conflict, keep_pk })
         } else if path.is_ident("transaction") {
             Some(MethodKind::Transaction)
         } else {
@@ -477,29 +449,16 @@ fn parse_method_kind(method: &syn::TraitItemFn) -> syn::Result<MethodKind> {
         if let Some(k) = new_kind {
             // 마지막 승자 침묵 방지 — 두 번째 SQL 속성은 즉시 에러 (M-17)
             if kind.is_some() {
-                return Err(syn::Error::new(
-                    attr.span(),
-                    "SQL 속성이 2개 이상입니다 — 하나만 지정하세요",
-                ));
+                return Err(syn::Error::new(attr.span(), "SQL 속성이 2개 이상입니다 — 하나만 지정하세요"));
             }
             kind = Some(k);
         }
     }
-    kind.ok_or_else(|| {
-        syn::Error::new(
-            method.sig.span(),
-            "DAO 메서드에는 #[query]/#[insert]/#[update]/#[delete] 중 하나가 필요합니다",
-        )
-    })
+    kind.ok_or_else(|| syn::Error::new(method.sig.span(), "DAO 메서드에는 #[query]/#[insert]/#[update]/#[delete] 중 하나가 필요합니다"))
 }
 
 /// SQL 실행 메서드 본문 생성 (query/update/delete 공용)
-fn sql_method_body(
-    sql: &str,
-    names: &[String],
-    shape: &RetShape,
-    sig: &syn::Signature,
-) -> syn::Result<TokenStream> {
+fn sql_method_body(sql: &str, names: &[String], shape: &RetShape, sig: &syn::Signature) -> syn::Result<TokenStream> {
     // 명명 파라미터 바인딩 배열
     let binds: Vec<TokenStream> = names
         .iter()
@@ -519,25 +478,18 @@ fn sql_method_body(
         RetShape::One(t) => quote! { self.cx.ctx_query_one::<#t, _>(#sql, __params) },
         RetShape::Affected => quote! { self.cx.ctx_execute(#sql, __params) },
         RetShape::InsertId => {
-            return Err(syn::Error::new(
-                sig.span(),
-                "i64 rowid 반환은 #[insert] 메서드에서만 지원됩니다",
-            ));
+            return Err(syn::Error::new(sig.span(), "i64 rowid 반환은 #[insert] 메서드에서만 지원됩니다"));
         }
-        RetShape::Live(..) => unreachable!("Live 형태는 live_method_body에서 처리"),
+        RetShape::Live(..) => {
+            return Err(syn::Error::new(sig.span(), "LiveQuery 반환은 라이브 쿼리 경로에서만 처리할 수 있습니다"));
+        }
     };
     Ok(quote! { #params #call })
 }
 
 /// 관계 로딩 메서드 본문 (명세 결정 로그 7) — 부모 조회 + RelationView::load를
 /// 자동 트랜잭션으로 래핑. is_async = 워커 위임 버전.
-fn relation_method_body(
-    sql: &str,
-    names: &[String],
-    shape: &RetShape,
-    sig: &syn::Signature,
-    is_async: bool,
-) -> syn::Result<TokenStream> {
+fn relation_method_body(sql: &str, names: &[String], shape: &RetShape, sig: &syn::Signature, is_async: bool) -> syn::Result<TokenStream> {
     // 뷰 타입 + 형태 어댑터
     let (view_ty, adapt) = match shape {
         RetShape::Many(t) => (t.clone(), quote! { Ok(__views) }),
@@ -558,10 +510,7 @@ fn relation_method_body(
             },
         ),
         _ => {
-            return Err(syn::Error::new(
-                sig.span(),
-                "with_relations는 Result<Vec<V>|Option<V>|V> 반환만 지원합니다",
-            ));
+            return Err(syn::Error::new(sig.span(), "with_relations는 Result<Vec<V>|Option<V>|V> 반환만 지원합니다"));
         }
     };
 
@@ -619,15 +568,10 @@ fn relation_method_body(
     }
 }
 
-/// 라이브 쿼리 메서드 본문 (명세 §5.6) — 동기/비동기 공용(WatchContext), 수신자만 다름
-fn live_method_body(
-    sql: &str,
-    names: &[String],
-    shape: &RetShape,
-    tables: &[String],
-    receiver: TokenStream,
-) -> syn::Result<TokenStream> {
-    // 소유 명명 파라미터 추출 (재조회에 필요)
+/// 라이브 쿼리 메서드 본문 (명세 §5.6) — 동기/비동기 공용(WatchContext), 수신자만 다름.
+/// `filter_idents` 가 비어 있지 않으면 filtered watch 경로로 연결한다 (filter 간 OR).
+fn live_method_body(sql: &str, names: &[String], shape: &RetShape, tables: &[String], receiver: TokenStream, sig: &syn::Signature, filter_idents: &[syn::Ident]) -> syn::Result<TokenStream> {
+    // 소유 명명 파라미터 추출 (재조회에 필요) — filter 인자는 제외
     let extracts: Vec<TokenStream> = names
         .iter()
         .map(|n| {
@@ -639,46 +583,45 @@ fn live_method_body(
     let table_lits: Vec<TokenStream> = tables.iter().map(|t| quote! { #t }).collect();
 
     let RetShape::Live(kind, t) = shape else {
-        unreachable!("live_method_body는 Live 형태 전용");
+        return Err(syn::Error::new(sig.span(), "LiveQuery 반환이 필요합니다"));
     };
-    let call = match kind {
-        LiveShape::Many => quote! { ctx_watch_all_named::<#t> },
-        LiveShape::Optional => quote! { ctx_watch_optional_named::<#t> },
-        LiveShape::Scalar => quote! { ctx_watch_scalar_named::<#t> },
+    let call = match (kind, !filter_idents.is_empty()) {
+        (LiveShape::Many, false) => quote! { ctx_watch_all_named::<#t> },
+        (LiveShape::Optional, false) => quote! { ctx_watch_optional_named::<#t> },
+        (LiveShape::Scalar, false) => quote! { ctx_watch_scalar_named::<#t> },
+        (LiveShape::Many, true) => quote! { ctx_watch_all_named_filtered::<#t> },
+        (LiveShape::Optional, true) => quote! { ctx_watch_optional_named_filtered::<#t> },
+        (LiveShape::Scalar, true) => quote! { ctx_watch_scalar_named_filtered::<#t> },
     };
 
-    Ok(quote! {
-        let __params: ::roomrs::Result<Vec<(String, ::roomrs::rusqlite::types::Value)>> =
-            (|| Ok(vec![#(#extracts),*]))();
-        ::roomrs::WatchContext::#call(&#receiver, #sql, __params, &[#(#table_lits),*])
+    Ok(if filter_idents.is_empty() {
+        quote! {
+            let __params: ::roomrs::Result<Vec<(String, ::roomrs::rusqlite::types::Value)>> =
+                (|| Ok(vec![#(#extracts),*]))();
+            ::roomrs::WatchContext::#call(&#receiver, #sql, __params, &[#(#table_lits),*])
+        }
+    } else {
+        quote! {
+            let __params: ::roomrs::Result<Vec<(String, ::roomrs::rusqlite::types::Value)>> =
+                (|| Ok(vec![#(#extracts),*]))();
+            let __filters = vec![#(#filter_idents),*];
+            ::roomrs::WatchContext::#call(&#receiver, #sql, __params, &[#(#table_lits),*], __filters)
+        }
     })
 }
 
 /// #[insert] 메서드 본문 생성 — 엔티티 타입은 유일한 참조 인자에서 추론
-fn insert_method_body(
-    on_conflict: &Option<String>,
-    keep_pk: bool,
-    sig: &syn::Signature,
-) -> syn::Result<TokenStream> {
+fn insert_method_body(on_conflict: &Option<String>, keep_pk: bool, sig: &syn::Signature) -> syn::Result<TokenStream> {
     // 인자: &self + 엔티티 참조 1개
     let mut args = sig.inputs.iter().skip(1);
     let (Some(FnArg::Typed(pt)), None) = (args.next(), args.next()) else {
-        return Err(syn::Error::new(
-            sig.span(),
-            "#[insert] 메서드는 엔티티 참조 인자 1개만 받아야 합니다: fn add(&self, e: &T) -> Result<i64>",
-        ));
+        return Err(syn::Error::new(sig.span(), "#[insert] 메서드는 엔티티 참조 인자 1개만 받아야 합니다: fn add(&self, e: &T) -> Result<i64>"));
     };
     let Pat::Ident(arg) = pt.pat.as_ref() else {
-        return Err(syn::Error::new(
-            pt.pat.span(),
-            "#[insert] 인자는 단순 식별자여야 합니다",
-        ));
+        return Err(syn::Error::new(pt.pat.span(), "#[insert] 인자는 단순 식별자여야 합니다"));
     };
     let Type::Reference(r) = pt.ty.as_ref() else {
-        return Err(syn::Error::new(
-            pt.ty.span(),
-            "#[insert] 인자는 &Entity 참조여야 합니다",
-        ));
+        return Err(syn::Error::new(pt.ty.span(), "#[insert] 인자는 &Entity 참조여야 합니다"));
     };
     let entity_ty = r.elem.as_ref();
     let arg_ident = &arg.ident;
@@ -728,12 +671,7 @@ fn async_sig(sig: &syn::Signature) -> syn::Result<TokenStream> {
 }
 
 /// 비동기 SQL 메서드 본문 — 소유 Value 추출(동기 단계) 후 워커 위임 (명세 §2.4)
-fn async_sql_method_body(
-    sql: &str,
-    names: &[String],
-    shape: &RetShape,
-    sig: &syn::Signature,
-) -> syn::Result<TokenStream> {
+fn async_sql_method_body(sql: &str, names: &[String], shape: &RetShape, sig: &syn::Signature) -> syn::Result<TokenStream> {
     // 동기 단계: 빌린 인자를 소유 Value로 변환
     let extracts: Vec<TokenStream> = names
         .iter()
@@ -756,12 +694,11 @@ fn async_sql_method_body(
         }
         RetShape::Affected => quote! { ::roomrs::SqlContext::ctx_execute(&__sh, #sql, __refs) },
         RetShape::InsertId => {
-            return Err(syn::Error::new(
-                sig.span(),
-                "i64 rowid 반환은 #[insert] 메서드에서만 지원됩니다",
-            ));
+            return Err(syn::Error::new(sig.span(), "i64 rowid 반환은 #[insert] 메서드에서만 지원됩니다"));
         }
-        RetShape::Live(..) => unreachable!("Live 형태는 live_method_body에서 처리"),
+        RetShape::Live(..) => {
+            return Err(syn::Error::new(sig.span(), "LiveQuery 반환은 라이브 쿼리 경로에서만 처리할 수 있습니다"));
+        }
     };
 
     Ok(quote! {
@@ -784,30 +721,17 @@ fn async_sql_method_body(
 }
 
 /// 비동기 #[insert] 본문 — insert_params를 소유 Value로 변환 후 워커 위임
-fn async_insert_method_body(
-    on_conflict: &Option<String>,
-    keep_pk: bool,
-    sig: &syn::Signature,
-) -> syn::Result<TokenStream> {
+fn async_insert_method_body(on_conflict: &Option<String>, keep_pk: bool, sig: &syn::Signature) -> syn::Result<TokenStream> {
     // 동기 본문 생성 로직과 동일한 검증·SQL 조립 재사용을 위해 인자 재파싱
     let mut args = sig.inputs.iter().skip(1);
     let (Some(FnArg::Typed(pt)), None) = (args.next(), args.next()) else {
-        return Err(syn::Error::new(
-            sig.span(),
-            "#[insert] 메서드는 엔티티 참조 인자 1개만 받아야 합니다",
-        ));
+        return Err(syn::Error::new(sig.span(), "#[insert] 메서드는 엔티티 참조 인자 1개만 받아야 합니다"));
     };
     let Pat::Ident(arg) = pt.pat.as_ref() else {
-        return Err(syn::Error::new(
-            pt.pat.span(),
-            "#[insert] 인자는 단순 식별자여야 합니다",
-        ));
+        return Err(syn::Error::new(pt.pat.span(), "#[insert] 인자는 단순 식별자여야 합니다"));
     };
     let Type::Reference(r) = pt.ty.as_ref() else {
-        return Err(syn::Error::new(
-            pt.ty.span(),
-            "#[insert] 인자는 &Entity 참조여야 합니다",
-        ));
+        return Err(syn::Error::new(pt.ty.span(), "#[insert] 인자는 &Entity 참조여야 합니다"));
     };
     let entity_ty = r.elem.as_ref();
     let arg_ident = &arg.ident;
@@ -860,10 +784,7 @@ fn insert_verb(on_conflict: &Option<String>, sig: &syn::Signature) -> syn::Resul
         Some("rollback") => "INSERT OR ROLLBACK".to_string(),
         Some("fail") => "INSERT OR FAIL".to_string(),
         Some(other) => {
-            return Err(syn::Error::new(
-                sig.span(),
-                format!("알 수 없는 on_conflict 값 '{other}' — replace/ignore/abort/rollback/fail"),
-            ));
+            return Err(syn::Error::new(sig.span(), format!("알 수 없는 on_conflict 값 '{other}' — replace/ignore/abort/rollback/fail")));
         }
     })
 }
@@ -871,17 +792,9 @@ fn insert_verb(on_conflict: &Option<String>, sig: &syn::Signature) -> syn::Resul
 /// keep_pk에 따른 Insertable 상수·메서드 선택
 fn insert_consts(keep_pk: bool) -> (TokenStream, TokenStream, TokenStream) {
     if keep_pk {
-        (
-            quote!(INSERT_COLUMNS_KEEP_PK),
-            quote!(INSERT_PLACEHOLDERS_KEEP_PK),
-            quote!(insert_params_keep_pk),
-        )
+        (quote!(INSERT_COLUMNS_KEEP_PK), quote!(INSERT_PLACEHOLDERS_KEEP_PK), quote!(insert_params_keep_pk))
     } else {
-        (
-            quote!(INSERT_COLUMNS),
-            quote!(INSERT_PLACEHOLDERS),
-            quote!(insert_params),
-        )
+        (quote!(INSERT_COLUMNS), quote!(INSERT_PLACEHOLDERS), quote!(insert_params))
     }
 }
 
@@ -903,15 +816,11 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
 
     // 스냅샷 1회 로드 — 부재 = 정적 스키마 대조 스킵, 파손 = 하드 에러 (M-19).
     // db별 최신 버전 스냅샷 합집합으로 대조한다 (명세 §7.2, 결정 21)
-    let snapshots = crate::schema::load_validation_snapshots()
-        .map_err(|msg| syn::Error::new(trait_ident.span(), msg))?;
+    let snapshots = crate::schema::load_validation_snapshots().map_err(|msg| syn::Error::new(trait_ident.span(), msg))?;
 
     for ti in &item.items {
         let TraitItem::Fn(method) = ti else {
-            return Err(syn::Error::new(
-                ti.span(),
-                "#[dao] trait에는 메서드만 선언할 수 있습니다",
-            ));
+            return Err(syn::Error::new(ti.span(), "#[dao] trait에는 메서드만 선언할 수 있습니다"));
         };
         let kind = parse_method_kind(method)?;
         let sig = &method.sig;
@@ -921,16 +830,10 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         let is_tx = matches!(kind, MethodKind::Transaction);
         match (&method.default, is_tx) {
             (None, true) => {
-                return Err(syn::Error::new(
-                    sig.span(),
-                    "#[transaction] 메서드에는 본문이 필요합니다 — 본문이 트랜잭션 안에서 실행됩니다",
-                ));
+                return Err(syn::Error::new(sig.span(), "#[transaction] 메서드에는 본문이 필요합니다 — 본문이 트랜잭션 안에서 실행됩니다"));
             }
             (Some(_), false) => {
-                return Err(syn::Error::new(
-                    sig.span(),
-                    "#[dao] 메서드에 기본 구현을 둘 수 없습니다 — 매크로가 구현을 생성합니다 (#[transaction] 제외)",
-                ));
+                return Err(syn::Error::new(sig.span(), "#[dao] 메서드에 기본 구현을 둘 수 없습니다 — 매크로가 구현을 생성합니다 (#[transaction] 제외)"));
             }
             _ => {}
         }
@@ -938,25 +841,14 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         let is_insert = matches!(kind, MethodKind::Insert { .. });
         let shape = classify_return(&sig.output, is_insert)?;
         if !is_tx && matches!(&shape, RetShape::One(Type::Tuple(tuple)) if tuple.elems.is_empty()) {
-            return Err(syn::Error::new(
-                sig.output.span(),
-                "DAO 메서드는 Result<()>를 반환할 수 없습니다 — write 영향 행 수는 Result<u64>를 사용하세요",
-            ));
+            return Err(syn::Error::new(sig.output.span(), "DAO 메서드는 Result<()>를 반환할 수 없습니다 — write 영향 행 수는 Result<u64>를 사용하세요"));
         }
-        if matches!(kind, MethodKind::Insert { on_conflict: Some(ref value), .. } if value == "ignore")
-            && matches!(shape, RetShape::InsertId)
-        {
-            return Err(syn::Error::new(
-                sig.output.span(),
-                "on_conflict = \"ignore\"는 0행일 수 있어 Result<i64> rowid 반환을 지원하지 않습니다",
-            ));
+        if matches!(kind, MethodKind::Insert { on_conflict: Some(ref value), .. } if value == "ignore") && matches!(shape, RetShape::InsertId) {
+            return Err(syn::Error::new(sig.output.span(), "on_conflict = \"ignore\"는 0행일 수 있어 Result<i64> rowid 반환을 지원하지 않습니다"));
         }
         if let MethodKind::Write { sql, .. } = &kind {
             if !matches!(shape, RetShape::Affected) && !sql_has_returning(&sql.value()) {
-                return Err(syn::Error::new(
-                    sig.output.span(),
-                    "#[update]/#[delete]의 비-u64 반환에는 SQL RETURNING 절이 필요합니다",
-                ));
+                return Err(syn::Error::new(sig.output.span(), "#[update]/#[delete]의 비-u64 반환에는 SQL RETURNING 절이 필요합니다"));
             }
         }
 
@@ -973,13 +865,13 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         // 라이브 쿼리 메서드 (명세 §5.6) — 동기/비동기 모두 LiveQuery를 직접 반환
         if let RetShape::Live(..) = &shape {
             let MethodKind::Query { sql, unchecked, .. } = &kind else {
-                return Err(syn::Error::new(
-                    sig.span(),
-                    "LiveQuery 반환은 #[query] 메서드에서만 지원됩니다",
-                ));
+                return Err(syn::Error::new(sig.span(), "LiveQuery 반환은 #[query] 메서드에서만 지원됩니다"));
             };
             let sql_str = sql.value();
-            let names = check_params(sql, sig)?;
+            let filter_args = live_filter_args(sig)?;
+            let skip: Vec<syn::Ident> = filter_args.clone();
+            // SQL 바인드 정합성 — InvalidationFilter 인자는 제외
+            let names = check_params_excluding(sql, sig, &skip)?;
             if !unchecked && !snapshots.is_empty() {
                 if let Some(msg) = crate::schema::validate_sql(&sql_str, &snapshots) {
                     return Err(syn::Error::new(sql.span(), msg));
@@ -990,8 +882,8 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
             // 자체 추출을 시도하고, 그마저 실패하면 UnknownDependencies 경로로
             // 라우팅한다(.watching()으로 해소 가능, H-9 계약 유지)
             let tables = crate::schema::depends_on(&sql_str).unwrap_or_default();
-            let body = live_method_body(&sql_str, &names, &shape, &tables, quote!(self.cx))?;
-            let abody = live_method_body(&sql_str, &names, &shape, &tables, quote!(self.h))?;
+            let body = live_method_body(&sql_str, &names, &shape, &tables, quote!(self.cx), sig, &filter_args)?;
+            let abody = live_method_body(&sql_str, &names, &shape, &tables, quote!(self.h), sig, &filter_args)?;
 
             trait_methods.push(quote! { #(#kept_attrs)* #sig; });
             impl_methods.push(quote! { #(#kept_attrs)* #sig { #body } });
@@ -1002,11 +894,7 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         }
 
         let (body, async_body) = match &kind {
-            MethodKind::Query {
-                sql,
-                unchecked,
-                with_relations,
-            } => {
+            MethodKind::Query { sql, unchecked, with_relations } => {
                 let sql_str = sql.value();
                 let names = check_params(sql, sig)?;
                 if !unchecked && !snapshots.is_empty() {
@@ -1017,21 +905,12 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                 // #[query] SELECT + u64/usize = 영향 행 수 오분류 — 런타임
                 // ExecuteReturnedResults 대신 컴파일 에러 (M-12)
                 if matches!(shape, RetShape::Affected) && !sql_is_write(&sql_str) {
-                    return Err(syn::Error::new(
-                        sig.output.span(),
-                        "#[query] SELECT 는 u64/usize 반환을 지원하지 않습니다 — i64 를 사용하세요 (영향 행 수 반환은 INSERT/UPDATE/DELETE SQL 전용)",
-                    ));
+                    return Err(syn::Error::new(sig.output.span(), "#[query] SELECT 는 u64/usize 반환을 지원하지 않습니다 — i64 를 사용하세요 (영향 행 수 반환은 INSERT/UPDATE/DELETE SQL 전용)"));
                 }
                 if *with_relations {
-                    (
-                        relation_method_body(&sql_str, &names, &shape, sig, false)?,
-                        relation_method_body(&sql_str, &names, &shape, sig, true)?,
-                    )
+                    (relation_method_body(&sql_str, &names, &shape, sig, false)?, relation_method_body(&sql_str, &names, &shape, sig, true)?)
                 } else {
-                    (
-                        sql_method_body(&sql_str, &names, &shape, sig)?,
-                        async_sql_method_body(&sql_str, &names, &shape, sig)?,
-                    )
+                    (sql_method_body(&sql_str, &names, &shape, sig)?, async_sql_method_body(&sql_str, &names, &shape, sig)?)
                 }
             }
             MethodKind::Write { sql, unchecked } => {
@@ -1047,29 +926,17 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                     }
                 }
 
-                (
-                    sql_method_body(&sql_str, &names, &shape, sig)?,
-                    async_sql_method_body(&sql_str, &names, &shape, sig)?,
-                )
+                (sql_method_body(&sql_str, &names, &shape, sig)?, async_sql_method_body(&sql_str, &names, &shape, sig)?)
             }
-            MethodKind::Insert {
-                on_conflict,
-                keep_pk,
-            } => {
+            MethodKind::Insert { on_conflict, keep_pk } => {
                 if !matches!(shape, RetShape::InsertId) {
-                    return Err(syn::Error::new(
-                        sig.span(),
-                        "#[insert] 메서드는 Result<i64>(새 rowid)를 반환해야 합니다 (명세 §12c)",
-                    ));
+                    return Err(syn::Error::new(sig.span(), "#[insert] 메서드는 Result<i64>(새 rowid)를 반환해야 합니다 (명세 §12c)"));
                 }
-                (
-                    insert_method_body(on_conflict, *keep_pk, sig)?,
-                    async_insert_method_body(on_conflict, *keep_pk, sig)?,
-                )
+                (insert_method_body(on_conflict, *keep_pk, sig)?, async_insert_method_body(on_conflict, *keep_pk, sig)?)
             }
             MethodKind::Transaction => {
                 // 본문 재작성: self → tx-바운드 DAO (명세 §5.9 메커니즘 2)
-                let mut body = method.default.clone().expect("위에서 본문 존재 검증");
+                let mut body = method.default.clone().ok_or_else(|| syn::Error::new(method.sig.span(), "#[transaction] 메서드에는 기본 구현 본문이 필요합니다"))?;
                 let mut visitor = ReplaceSelf { errors: Vec::new() };
                 syn::visit_mut::VisitMut::visit_block_mut(&mut visitor, &mut body);
                 // 매크로 토큰 안의 self = 재작성 불가 — 하드 에러 (H-8)
@@ -1125,11 +992,7 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         });
     }
 
-    let trait_docs: Vec<&syn::Attribute> = item
-        .attrs
-        .iter()
-        .filter(|a| a.path().is_ident("doc"))
-        .collect();
+    let trait_docs: Vec<&syn::Attribute> = item.attrs.iter().filter(|a| a.path().is_ident("doc")).collect();
 
     // watch 메서드 존재 시 WatchContext 바운드 (feature live 필요 — 기본 on)
     let maybe_watch_bound = if has_live {
@@ -1199,19 +1062,13 @@ mod tests {
         assert!(sql_is_write("insert into t values (1)"));
         assert!(!sql_is_write("SELECT 1"));
         // CTE 뒤 최상위 DML = write (L-17)
-        assert!(sql_is_write(
-            "WITH x AS (SELECT 1) DELETE FROM t WHERE id IN (SELECT * FROM x)"
-        ));
+        assert!(sql_is_write("WITH x AS (SELECT 1) DELETE FROM t WHERE id IN (SELECT * FROM x)"));
         assert!(sql_is_write("with x as (select 1) update t set a = 1"));
         // CTE 뒤 SELECT = read — 본문 괄호 안 SELECT/문자열은 무시
         assert!(!sql_is_write("WITH x AS (SELECT 1) SELECT * FROM x"));
-        assert!(!sql_is_write(
-            "WITH x AS (SELECT 'delete') SELECT * FROM x -- update 주석"
-        ));
+        assert!(!sql_is_write("WITH x AS (SELECT 'delete') SELECT * FROM x -- update 주석"));
         // 인용 식별자 안의 DML 단어 = 무시
-        assert!(!sql_is_write(
-            r#"WITH x AS (SELECT 1) SELECT "delete" FROM x"#
-        ));
+        assert!(!sql_is_write(r#"WITH x AS (SELECT 1) SELECT "delete" FROM x"#));
     }
 
     /// 리터럴 `{self}` 포맷 캡처 탐지 — `{{self}}` 이스케이프 제외 (L-18)

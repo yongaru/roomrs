@@ -1,4 +1,4 @@
-# roomrs-cli — roomrs migrate generate / check
+# roomrs-cli — cargo roomrs schema / migrate
 [package]
 name = "roomrs-cli"
 description = "CLI for roomrs: migration generation and schema checks"
@@ -10,12 +10,18 @@ repository.workspace = true
 authors.workspace = true
 readme = "README.md"
 
+# `cargo roomrs …` 서브커맨드 (결정 47)
 [[bin]]
-name = "roomrs"
+name = "cargo-roomrs"
 path = "src/main.rs"
 
 [dependencies]
 roomrs-migrate = { workspace = true }
+log = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

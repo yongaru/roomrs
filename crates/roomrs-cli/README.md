@@ -11,9 +11,11 @@ cargo install roomrs-cli
 ## Commands
 
 ```text
-roomrs migrate diff <old.json> <new.json> [out.sql]
-roomrs migrate check <a.json> <b.json>
-roomrs migrate check-dir <schema_dir> <db_name> [--strict]
+cargo roomrs schema export [--package <name>] [--workspace]
+cargo roomrs schema check [--package <name>] [--workspace]
+cargo roomrs migrate diff <old.json> <new.json> [out.sql]
+cargo roomrs migrate check <a.json> <b.json>
+cargo roomrs migrate check-dir <schema_dir> <db_name> [--strict]
 ```
 
 See the [repository README](https://github.com/yongaru/roomrs#readme) for snapshot workflow and review guidance.

@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "tables": [
+    {
+      "name": "notes",
+      "columns": [
+        {
+          "name": "id",
+          "sql_type": "INTEGER",
+          "not_null": true,
+          "pk": true
+        },
+        {
+          "name": "body",
+          "sql_type": "TEXT",
+          "not_null": true,
+          "pk": false
+        }
+      ],
+      "ddl": [
+        "CREATE TABLE IF NOT EXISTS \"notes\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"body\" TEXT NOT NULL)"
+      ],
+      "triggers": [
+        {
+          "path": "migrations/triggers/note_audit.sql",
+          "content_hash": 11017437502583785110
+        }
+      ]
+    }
+  ]
+}

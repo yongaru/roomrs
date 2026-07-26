@@ -79,5 +79,5 @@ install(
     ARCHIVE DESTINATION lib
 )
 
-install(FILES sqlite3.h sqlite3ext.h DESTINATION include/sqlcipher CONFIGURATIONS Release)
+install(FILES sqlite3.h sqlite3ext.h DESTINATION include CONFIGURATIONS Release)
 install(EXPORT sqlcipher-targets NAMESPACE sqlcipher:: FILE sqlcipher-targets.cmake DESTINATION share/sqlcipher)

@@ -18,6 +18,21 @@ roomrs is a Rust library for working with local SQLite databases. If you have us
 
 Why build it? The Rust ecosystem has excellent general-purpose ORMs (diesel, SeaORM), but nothing that delivers the whole Room experience in one package: **live queries** (subscriptions that automatically re-notify when data changes), **compile-time SQL validation**, and a single codebase that covers desktop and mobile. roomrs fills that gap. It does not try to be a general-purpose ORM — the goal is to do **one thing well: SQLite-only local persistence**.
 
+## Quick start
+
+```toml
+[dependencies]
+roomrs = "0.3.0"
+```
+
+To clone the repository and run a working example immediately:
+
+```sh
+cargo run -p roomrs --example todo_sync
+```
+
+The default build bundles SQLite, so no system SQLite installation is required. Copy your first entity, DAO, and database declaration from the [detailed example](#detailed-example) below.
+
 A concept map for Room users:
 
 | Room | roomrs |
@@ -34,28 +49,32 @@ A concept map for Room users:
 | `suspend fun` | `async fn` on `db.run_async()` |
 | KSP | proc-macro |
 
+## Roadmap
+
+Public feature priorities and out-of-scope work are listed in [ROADMAP.md](ROADMAP.md). The implementation contract lives in the [development specification](roomrs-개발계획서.md), while released changes are recorded in [CHANGELOG](CHANGELOG.md).
+
 ---
 
 ## Key features
 
 - **Predictable SQLite concurrency — a unified read/write pool.** All N general-purpose connections can read and write, and a checkout guard gives one operation exclusive use of one connection. WAL and `busy_timeout` coordinate lock contention within and across processes; `SQLITE_BUSY` can still be returned when the timeout expires.
 - **Live queries.** A query that returns `LiveQuery<T>` automatically re-runs and emits fresh results whenever a dependent table changes. Both synchronous consumption (`recv`/`iter`/`subscribe` callbacks) and asynchronous consumption (`Stream`) are supported.
-- **Row-filtered invalidation.** `InvalidationFilter` compares preupdate-hook OLD/NEW rows so unrelated changes do not re-query a subscription. It observes roomrs connections in one process only.
+- **Row-filtered invalidation.** `InvalidationFilter` compares preupdate-hook OLD/NEW rows so unrelated changes do not re-query a subscription. Table/column names are validated against the live SQLite schema at subscription time; typos surface as `Error::InvalidationFilter`. `watch_*_filtered` is available on sync, async, and DAO paths; **multiple filters are OR-matched** so any matching filter re-queries. Invalidations are emitted per commit/statement and coalesced with a DB-wide default **fixed** 250ms debounce window (`.live_debounce(Duration)`; per-observer override via `.debounce(Duration)`). Re-queries run on `roomrs-live-worker` threads that checkout the unified connection pool (`.notifier_readers(N)`, default `min(2, connections)`). `db.live_metrics()` exposes receive/coalesce/refresh counters (no SQL parameters or row payloads). It observes roomrs connections in one process only.
 - **Compile-time SQL validation.** The SQL inside `#[query("...")]` is checked against a committed schema snapshot. Referencing a table or column that does not exist is a compile error. Parameter consistency (`:name` ↔ arguments) is also verified at compile time.
-- **Versioned schema snapshots + binary-embedded auto-migration.** Each schema version is committed as a `[db_name].[version].json` file, and all versions are compressed and embedded into your binary. With `.auto_migrate(true)`, version gaps with no registered migration step are filled automatically from the embedded snapshot diff — but only with **safe operations** (CREATE TABLE, nullable ADD COLUMN, CREATE INDEX, RENAME COLUMN from a valid rename hint). Destructive changes are never executed automatically; you get a clear error instead.
-- **Runtime-agnostic async.** The async API returns plain std `Future`s (`+ Send`), so you can await them on tokio, async-std, smol, or `futures::executor` alike. The tokio-optimized integration is an optional feature.
+- **Versioned schema snapshots + binary-embedded auto-migration.** Each schema version is committed as a `[db_name].[version].json` file, and all versions are compressed and embedded into your binary. With `.auto_migrate(true)`, version gaps with no registered migration step are filled automatically from the embedded snapshot diff — but only with **safe operations** (CREATE TABLE, nullable ADD COLUMN, `NOT NULL DEFAULT` ADD COLUMN, CREATE INDEX, RENAME COLUMN from a valid rename hint). Destructive changes are never executed automatically; you get a clear error instead.
+- **Runtime-agnostic async.** The async API returns plain std `Future`s (`+ Send`), so you can await them on tokio, async-std, smol, or `futures::executor` alike. The tokio-optimized integration is enabled by default and can be excluded with `default-features = false`.
 
-Under the hood: a synchronous [rusqlite](https://github.com/rusqlite/rusqlite) core plus a purpose-built mini pool. Bundled SQLite remains the default, while both SQLite and SQLCipher support bundled and system linkage. SQLite is synchronous at the C level, so any library's "async" is ultimately worker offloading — which is why roomrs is built as a **synchronous core with an async facade**.
+Under the hood: a synchronous [rusqlite](https://github.com/rusqlite/rusqlite) core plus a purpose-built mini pool. Bundled SQLite is the default, while both SQLite and SQLCipher support bundled and system linkage. SQLite is synchronous at the C level, so any library's "async" is ultimately worker offloading — which is why roomrs is built as a **synchronous core with an async facade**.
 
 ---
 
-## Quick start
+## Detailed example
 
 ### Installation
 
 ```toml
 [dependencies]
-roomrs = "1"
+roomrs = "0.3.0"
 ```
 
 > If it is not yet published on crates.io, you can use it as a git dependency:
@@ -105,6 +124,24 @@ fn main() -> roomrs::Result<()> {
 }
 ```
 
+### PRIMARY KEY syntax
+
+A PRIMARY KEY can be declared with field-level `#[pk]` attributes or once at the entity level. The entity-level list uses Rust field names, and its order defines the composite-key order.
+
+```rust
+#[entity(
+    table = "payments",
+    primary_key(store_id, payment_id)
+)]
+struct Payment {
+    store_id: String,
+    payment_id: String,
+    amount: i64,
+}
+```
+
+Both forms may be present, but their fields and order must match exactly. Otherwise, `cargo roomrs schema export` and `cargo roomrs schema check` return an error with corrective advice before writing files. Continue to place `#[pk(autoincrement)]` directly on its single integer field.
+
 ### Asynchronous usage
 
 Keep the exact same entity/DAO declarations and just switch the handle to `run_async()`. The method names are identical.
@@ -144,7 +181,7 @@ The full set of examples lives in [crates/roomrs/examples/](crates/roomrs/exampl
 
 Declare a return type of `LiveQuery<T>` and that query becomes a "subscription". You receive the current value immediately, and a re-queried result every time a dependent table is written to.
 
-For direct SQL subscriptions, `InvalidationFilter` limits re-queries to relevant row changes. Predicates inside a group are ANDed and groups are ORed. Complex SQL conditions are not inferred automatically; use table-level subscriptions when the filter cannot express the condition.
+For direct SQL subscriptions, `InvalidationFilter` limits re-queries to relevant row changes. A single filter still works; pass `vec![f1, f2]` (or an array) for OR matching across filters. DAO live methods accept one or more `InvalidationFilter` arguments with the same rules. Predicates inside a group are ANDed and groups are ORed; filter-to-filter AND and nested boolean trees are not supported. Complex SQL conditions are not inferred automatically; use table-level subscriptions when the filter cannot express the condition. Under bursty writes, set a DB-wide delay with `.live_debounce(...)` or override one observer with `.debounce(...)` (default 250ms fixed window — extra invalidations inside the window merge without extending the deadline).
 
 ```rust
 use roomrs::LiveQuery;
@@ -160,7 +197,7 @@ trait TodoDao {
 
 let live = db.run_sync().todo_dao().watch_count();
 
-// Callback subscription — invoked on the notifier thread
+// Callback subscription — invoked on a live-query worker thread
 let guard = live.subscribe(|n| println!("current todo count: {n}"));
 // Dropping the guard ends the subscription — beware `let _ = ...`, which drops immediately
 
@@ -249,7 +286,7 @@ let db = AppDb::builder()
     .build()?;
 ```
 
-The third path is the **auto-diff draft** — `roomrs migrate diff` (or `roomrs::diff_sql`) compares two snapshots and produces a draft migration SQL. Drafts are for review, are never executed automatically, and destructive changes are marked with TODO comments. There is also `migrations_dir!("path")`, which embeds a directory of SQL files at compile time (using the `{from}_{to}_name.sql` convention).
+The third path is the **auto-diff draft** — `cargo roomrs migrate diff` (or `roomrs::diff_sql`) compares two snapshots and produces a draft migration SQL. Drafts are for review, are never executed automatically, and destructive changes are marked with TODO comments. There is also `migrations_dir!("path")`, which embeds a directory of SQL files at compile time (using the `{from}_{to}_name.sql` convention).
 
 **Binary-embedded auto-migration (opt-in)** — since every snapshot version is embedded in the binary, gaps with no registered step can be filled automatically:
 
@@ -260,7 +297,7 @@ let db = AppDb::builder()
     .build()?;
 ```
 
-Automatic execution is limited to **safe operations** (CREATE TABLE, nullable ADD COLUMN, CREATE INDEX, RENAME COLUMN from a valid rename hint). A gap that requires DROP, a type change, or a rename is never executed automatically — you get an error telling you which gap failed and why. If you register a manual step for that gap, the registered step always wins. As a last resort there is an opt-in fallback that drops everything and recreates it:
+Automatic execution is limited to **safe operations** (CREATE TABLE, nullable ADD COLUMN, `NOT NULL DEFAULT` ADD COLUMN, CREATE INDEX, RENAME COLUMN from a valid rename hint). A gap that requires DROP, a type change, a DEFAULT change, or a definition-breaking rename is never executed automatically — you get an error telling you which gap failed and why. If you register a manual step for that gap, the registered step always wins. As a last resort there is an opt-in fallback that drops everything and recreates it:
 
 ```rust
 .fallback_to_destructive_migration(true) // drop + recreate when the chain is insufficient — data loss!
@@ -268,7 +305,7 @@ Automatic execution is limited to **safe operations** (CREATE TABLE, nullable AD
 
 ### Multi-process invalidation
 
-This is not currently supported. The SQLite trigger, change-log, and polling design has been removed. A future IPC broker will forward post-commit events from roomrs connections to Trackers in other processes. Raw SQLite writers are not observable until they participate in that IPC protocol.
+This is not currently supported. Background and reconsideration criteria are kept in the [multi-process LiveQuery invalidation note](docs/MULTI_PROCESS_INVALIDATION.md).
 
 ### Type converters
 
@@ -309,22 +346,24 @@ For the mobile FFI pattern (cdylib, `extern "C"`) and its stable negative error-
 
 | feature | default | description |
 |---|---|---|
-| `sqlite-bundled` | on (via `bundled`) | Compile SQLite source as part of the Cargo build |
+| `sqlite-bundled` | on | Compile SQLite source as part of the Cargo build |
 | `sqlite-system` | off | Link an OS package or vcpkg SQLite library |
 | `sqlcipher-bundled` | off | Build SQLCipher with vendored OpenSSL through Cargo |
 | `sqlcipher-system` | off | Link an OS package or vcpkg SQLCipher library |
-| `bundled` | on | Backward-compatible alias for `sqlite-bundled` |
+| `bundled` | off | Backward-compatible alias for `sqlite-bundled` |
 | `cipher` | off | Backward-compatible alias for `sqlcipher-bundled` |
 | `async` | on | Runtime-agnostic async facade. Turn off for pure sync |
-| `tokio` | off | tokio-optimized integration (implies `async`) — falls back to the built-in worker pool outside a tokio runtime |
+| `tokio` | on | tokio-optimized integration (implies `async`) — falls back to the built-in worker pool outside a tokio runtime |
 | `live` | on | Live queries / invalidation |
 | `time`, `uuid`, `json` | on | Type converters |
 
 A minimal pure-sync build:
 
 ```toml
-roomrs = { version = "0.2", default-features = false, features = ["sqlite-bundled"] }
+roomrs = { version = "0.3.0", default-features = false, features = ["sqlite-bundled"] }
 ```
+
+The complete default set is `sqlite-bundled`, `async`, `tokio`, `live`, `time`, `uuid`, and `json`. A default build compiles SQLite from source and does not depend on OpenSSL. Choose SQLCipher explicitly with `default-features = false` plus `sqlcipher-bundled` or `sqlcipher-system`. Selecting a SQLCipher backend does not encrypt a database automatically; encryption starts only when `.encryption_key(...)` is configured.
 
 No two canonical backend features may be selected together. A backend-free `roomrs-core` build is allowed, but an application that uses a database must select exactly one. Existing `bundled` and `cipher` users continue to use the same bundled backends.
 
@@ -334,26 +373,47 @@ System backends link an installed library instead of rebuilding the SQLite/SQLCi
 
 ```powershell
 $env:VCPKG_ROOT = "D:\tools\vcpkg"
-$env:VCPKGRS_TRIPLET = "x64-windows-static-md"
-& "$env:VCPKG_ROOT\vcpkg.exe" install "sqlite3[session]:x64-windows-static-md"
+$env:VCPKGRS_TRIPLET = "x64-windows-static-release"
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
+& "$env:VCPKG_ROOT\vcpkg.exe" install "sqlite3[session]:x64-windows-static-release"
 ```
 
 ```toml
-roomrs = { version = "0.2", default-features = false, features = ["sqlite-system", "async", "live", "time", "uuid", "json"] }
+roomrs = { version = "0.3.0", default-features = false, features = ["sqlite-system", "async", "live", "time", "uuid", "json"] }
 ```
 
-The official SQLCipher port does not enable the preupdate hook, so use the minimal overlay port included in the roomrs repository.
+The official SQLCipher port does not enable the preupdate hook. The repository's
+`vcpkg/build-sqlcipher-system.cmd` uses the adjacent `vcpkg/ports/sqlcipher` overlay,
+installs SQLCipher for `x64-windows-static-release`, and verifies `SQLITE_ENABLE_PREUPDATE_HOOK`.
+Set `VCPKG_ROOT` or add `vcpkg.exe` to PATH, then run it from the repository root.
+It installs every feature exposed by the overlay (`fts5`, `geopoly`, `json1`, and `tool`).
 
 ```powershell
-& "$env:VCPKG_ROOT\vcpkg.exe" install "sqlcipher:x64-windows-static-md" `
-  --overlay-ports="<roomrs-repo>\vcpkg\ports"
+$env:VCPKG_ROOT = "D:\tools\vcpkg"
+$env:VCPKGRS_TRIPLET = "x64-windows-static-release"
+$env:SQLCIPHER_STATIC = "1"
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
+vcpkg\build-sqlcipher-system.cmd
+```
+
+You may also run it from inside the `vcpkg` directory:
+
+```powershell
+cd vcpkg
+.\build-sqlcipher-system.cmd
+```
+
+Pass another static triplet as the first argument when needed:
+
+```powershell
+vcpkg\build-sqlcipher-system.cmd x64-windows-static
 ```
 
 ```toml
-roomrs = { version = "0.2", default-features = false, features = ["sqlcipher-system", "async", "live", "time", "uuid", "json"] }
+roomrs = { version = "0.3.0", default-features = false, features = ["sqlcipher-system", "async", "live", "time", "uuid", "json"] }
 ```
 
-These commands use the `x64-windows-static-md` triplet: static libraries with the dynamic CRT. Do not set `VCPKGRS_DYNAMIC`. No SQLite or SQLCipher DLL needs to be deployed. If you separately choose a dynamic-library triplet, deploying its DLLs is the application's responsibility.
+These commands use the `x64-windows-static-release` community triplet: release-only static libraries with the static CRT. Rust must use the same static CRT through `RUSTFLAGS=-C target-feature=+crt-static`; do not set `VCPKGRS_DYNAMIC`. No SQLite or SQLCipher DLL needs to be deployed. If you separately choose a dynamic-library triplet, deploying its DLLs is the application's responsibility.
 
 vcpkg compiles the C/C++ libraries on the first install and Cargo only links the resulting `.lib` files afterward. Therefore, `cargo clean` neither removes vcpkg artifacts nor rebuilds SQLite/SQLCipher. Set `VCPKG_DEFAULT_BINARY_CACHE` to a shared location to reuse the same ABI result across checkouts and CI. With a system backend, the linked library version, compile options, ABI, license acceptance, and deployment model are application acceptance criteria.
 
@@ -364,16 +424,19 @@ vcpkg compiles the C/C++ libraries on the first install and Cargo only links the
 The source of truth for compile-time SQL validation and auto-migration is the **schema snapshot files committed to your repository**.
 
 - Location and naming: `migrations/schema/[db_name].[version].json` — where db_name is the snake_case of your `#[database]` struct name (e.g. `AppDb` at v3 → `app_db.3.json`). The directory can be overridden with the `ROOMRS_SCHEMA_DIR` environment variable.
-- **Generation is automatic.** `#[database]` generates an export test (`__roomrs_schema_export_<db>`), so running `cargo test` creates the current-version snapshot if it is missing, and if it differs from the code, updates the file and fails the test (blocking stale commits in CI, regenerating locally). Disable with `ROOMRS_SCHEMA_EXPORT=0`.
+- **Generation is explicit.** `cargo test` and `cargo build` never create or modify snapshot or migration files. Only `cargo roomrs schema export` (or `export_schema_snapshot` / `run_registered_schema_export`) creates the current-version snapshot. If a same-version file already exists and differs from the code, it is **not overwritten** and guidance asks you to bump `version`. After export, run `cargo build` so macros re-embed snapshots.
+- `cargo roomrs schema export/check` compiles package lib and regular binary targets through a custom-cfg harness to discover `#[database]`. Apps with only `src/main.rs` are supported without modifying consumer source. Ordinary `cargo test` does not include this entry point.
 - When a snapshot is updated, the macros re-expand (file dependencies are registered via `include_bytes!`) and all versions are compressed and embedded into the binary. `build()` compares the embedded snapshot hash against the runtime entity-metadata hash and returns a clear error if they are stale.
-- To keep onboarding friction-free, if no snapshot file exists at all, static schema checking is skipped with a warning (parameter validation always runs).
+- **`build()` fails by default when the current-version snapshot is missing.** If the macro expanded without that file, startup returns `SnapshotStale` and asks you to run `export_schema_snapshot` and rebuild. Only special cases such as this repository’s integration tests set `ROOMRS_ALLOW_MISSING_SNAPSHOT=1`. Static SQL parameter checks always run regardless of snapshots.
 
 Snapshots can be managed from the CLI:
 
 ```
-roomrs migrate diff <old.json> <new.json> [out.sql]   # generate a draft migration SQL
-roomrs migrate check <a.json> <b.json>                # compare snapshot hashes (for CI)
-roomrs migrate check-dir <schema_dir> <db_name>       # scan version files — parse/consistency checks, destructive-change warnings
+cargo roomrs schema export                              # create snapshots/safe SQL drafts for every #[database]
+cargo roomrs schema check                               # read-only verification of every #[database]
+cargo roomrs migrate diff <old.json> <new.json> [out.sql]   # generate a draft migration SQL
+cargo roomrs migrate check <a.json> <b.json>                # compare snapshot hashes (for CI)
+cargo roomrs migrate check-dir <schema_dir> <db_name>       # scan version files — parse/consistency checks, destructive-change warnings
 ```
 
 ---
@@ -389,7 +452,7 @@ roomrs/
 │  ├─ roomrs-async/    # async facade — runtime-agnostic Future/Stream + optional tokio integration
 │  ├─ roomrs-macros/   # proc-macros: #[entity] #[dao] #[database] ...
 │  ├─ roomrs-migrate/  # SchemaSnapshot · diff · compression · codegen (shared by macros and runtime)
-│  └─ roomrs-cli/      # roomrs migrate diff / check / check-dir
+│  └─ roomrs-cli/      # cargo roomrs schema / migrate
 ├─ examples/           # mobile-ffi and friends
 └─ xtask/              # cross-build tasks
 ```
@@ -402,7 +465,16 @@ The heart of the concurrency model is a unified read/write mini pool of **N gene
 
 ## Logging
 
-roomrs emits logs exclusively through the [`log`](https://crates.io/crates/log) facade (messages are in English). Which logger to use is up to you — env_logger, tracing, anything works. If you use tracing, collect them via the `tracing-log` bridge:
+The roomrs libraries emit English messages exclusively through the [`log`](https://crates.io/crates/log) facade and never initialize a subscriber. `error` reports operation failures and fatal pool states; `warn` reports recovery, retries, and destructive changes; `info` covers database, pool, notifier, and snapshot lifecycles; `debug` covers migration plans, checkout waits, and subscriptions; and `trace` covers SQL structure, checkouts, async jobs, and invalidation details. SQL parameters, encryption keys, and row data are never logged.
+
+The CLI and every runnable example in this repository initialize a `tracing-log` bridge and `tracing-subscriber`. Control verbosity with `RUST_LOG`:
+
+```powershell
+$env:RUST_LOG = "info,roomrs_core=trace,roomrs_async=debug,roomrs_migrate=debug"
+cargo run --example live_query
+```
+
+Install the same bridge in a consumer application that uses tracing:
 
 ```rust
 /// Initialize the log → tracing bridge —
@@ -410,10 +482,12 @@ roomrs emits logs exclusively through the [`log`](https://crates.io/crates/log) 
 fn init_tracing() {
     // 1) Install the log → tracing converter (global log logger)
     tracing_log::LogTracer::init().expect("failed to init LogTracer");
-    // 2) Install the fmt subscriber with a debug filter —
+    // 2) Install the fmt subscriber with a RUST_LOG filter —
     //    fmt().init() would try to install LogTracer again and fail, so use set_global_default
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("roomrs_core=debug"));
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("debug"))
+        .with_env_filter(filter)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("failed to set tracing subscriber");
 }
@@ -427,9 +501,9 @@ With the debug level enabled you can see connection opens, transaction begin/com
 
 - **MSRV 1.85** (Edition 2024) — included in the CI matrix.
 - Tested on all three desktop OSes (Windows/macOS/Linux); mobile (Android/iOS) is supported through the FFI pattern.
-- The default bundled SQLite needs no system installation. System backends require the OS package or vcpkg setup above.
+- Default bundled SQLite needs no system library installation beyond a C compiler. Bundled SQLCipher additionally requires Perl; system backends require the OS package or vcpkg setup above.
 
-Cross-building from a Windows host uses zig/NDK. The bundled SQLite (C) is compiled along with it.
+Cross-building from a Windows host uses zig/NDK. The default configuration compiles bundled SQLite (C) along with it. Selecting SQLCipher additionally compiles OpenSSL (C).
 
 ```
 cargo xtask cross-linux      # x86_64/aarch64-linux-gnu + x86_64-musl (static CLI) — zig

@@ -85,35 +85,15 @@ pub enum Expr {
 
 impl Col {
     fn cmp(self, op: &'static str, v: impl IntoDbValue) -> Expr {
-        Expr::Cmp {
-            col: self.name,
-            op,
-            value: v.into_db_value(),
-        }
+        Expr::Cmp { col: self.name, op, value: v.into_db_value() }
     }
     pub fn eq(self, v: impl IntoDbValue) -> Expr {
         let value = v.into_db_value();
-        if value == Value::Null {
-            self.is_null()
-        } else {
-            Expr::Cmp {
-                col: self.name,
-                op: "=",
-                value,
-            }
-        }
+        if value == Value::Null { self.is_null() } else { Expr::Cmp { col: self.name, op: "=", value } }
     }
     pub fn ne(self, v: impl IntoDbValue) -> Expr {
         let value = v.into_db_value();
-        if value == Value::Null {
-            self.is_not_null()
-        } else {
-            Expr::Cmp {
-                col: self.name,
-                op: "<>",
-                value,
-            }
-        }
+        if value == Value::Null { self.is_not_null() } else { Expr::Cmp { col: self.name, op: "<>", value } }
     }
     pub fn lt(self, v: impl IntoDbValue) -> Expr {
         self.cmp("<", v)
@@ -136,11 +116,7 @@ impl Col {
     /// Both the pattern and the single Unicode escape character are bound as
     /// parameters. Existing [`like`](Self::like) behavior is unchanged.
     pub fn like_escaped(self, pattern: impl Into<String>, escape: char) -> Expr {
-        Expr::LikeEscaped {
-            col: self.name,
-            pattern: pattern.into(),
-            escape,
-        }
+        Expr::LikeEscaped { col: self.name, pattern: pattern.into(), escape }
     }
     pub fn in_list<V: IntoDbValue>(self, vs: impl IntoIterator<Item = V>) -> Expr {
         Expr::InList {
@@ -149,16 +125,10 @@ impl Col {
         }
     }
     pub fn is_null(self) -> Expr {
-        Expr::Null {
-            col: self.name,
-            not: false,
-        }
+        Expr::Null { col: self.name, not: false }
     }
     pub fn is_not_null(self) -> Expr {
-        Expr::Null {
-            col: self.name,
-            not: true,
-        }
+        Expr::Null { col: self.name, not: true }
     }
 }
 
@@ -175,10 +145,7 @@ impl Expr {
     /// 참조 컬럼 수집 — 스키마 검증용
     fn collect_cols<'a>(&'a self, out: &mut Vec<&'a str>) {
         match self {
-            Expr::Cmp { col, .. }
-            | Expr::LikeEscaped { col, .. }
-            | Expr::InList { col, .. }
-            | Expr::Null { col, .. } => {
+            Expr::Cmp { col, .. } | Expr::LikeEscaped { col, .. } | Expr::InList { col, .. } | Expr::Null { col, .. } => {
                 out.push(col);
             }
             Expr::And(a, b) | Expr::Or(a, b) => {
@@ -195,18 +162,12 @@ impl Expr {
                 params.push(value.clone());
                 sql.push_str(&format!("\"{col}\" {op} ?{}", params.len()));
             }
-            Expr::LikeEscaped {
-                col,
-                pattern,
-                escape,
-            } => {
+            Expr::LikeEscaped { col, pattern, escape } => {
                 params.push(Value::Text(pattern.clone()));
                 let pattern_index = params.len();
                 params.push(Value::Text(escape.to_string()));
                 let escape_index = params.len();
-                sql.push_str(&format!(
-                    "\"{col}\" LIKE ?{pattern_index} ESCAPE ?{escape_index}"
-                ));
+                sql.push_str(&format!("\"{col}\" LIKE ?{pattern_index} ESCAPE ?{escape_index}"));
             }
             Expr::InList { col, values } => {
                 if values.is_empty() {
@@ -216,17 +177,11 @@ impl Expr {
                 }
                 let start = params.len() + 1;
                 params.extend(values.iter().cloned());
-                let ph = (start..start + values.len())
-                    .map(|i| format!("?{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let ph = (start..start + values.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
                 sql.push_str(&format!("\"{col}\" IN ({ph})"));
             }
             Expr::Null { col, not } => {
-                sql.push_str(&format!(
-                    "\"{col}\" IS {}NULL",
-                    if *not { "NOT " } else { "" }
-                ));
+                sql.push_str(&format!("\"{col}\" IS {}NULL", if *not { "NOT " } else { "" }));
             }
             Expr::And(a, b) => {
                 sql.push('(');
@@ -350,18 +305,11 @@ impl<T: Entity> SelectBuilder<T> {
         }
         for c in cols {
             if !T::COLUMNS_META.iter().any(|m| m.name == c) {
-                return Err(Error::Config(format!(
-                    "엔티티 \"{}\"에 없는 컬럼: \"{c}\" (쿼리빌더 스키마 검증)",
-                    T::TABLE
-                )));
+                return Err(Error::Config(format!("엔티티 \"{}\"에 없는 컬럼: \"{c}\" (쿼리빌더 스키마 검증)", T::TABLE)));
             }
         }
 
-        let mut sql = if self.count {
-            format!("SELECT COUNT(*) FROM \"{}\"", T::TABLE)
-        } else {
-            format!("SELECT {} FROM \"{}\"", T::COLUMNS, T::TABLE)
-        };
+        let mut sql = if self.count { format!("SELECT COUNT(*) FROM \"{}\"", T::TABLE) } else { format!("SELECT {} FROM \"{}\"", T::COLUMNS, T::TABLE) };
         let mut params: Vec<Value> = Vec::new();
         if let Some(w) = &self.wheres {
             sql.push_str(" WHERE ");
@@ -443,16 +391,8 @@ pub trait Execute {
     /// 실행 결과 컨테이너
     type Out<R: Send + 'static>;
 
-    fn run_all<T: FromRow + Send + 'static>(
-        self,
-        sql: String,
-        params: Vec<Value>,
-    ) -> Self::Out<Vec<T>>;
-    fn run_optional<T: FromRow + Send + 'static>(
-        self,
-        sql: String,
-        params: Vec<Value>,
-    ) -> Self::Out<Option<T>>;
+    fn run_all<T: FromRow + Send + 'static>(self, sql: String, params: Vec<Value>) -> Self::Out<Vec<T>>;
+    fn run_optional<T: FromRow + Send + 'static>(self, sql: String, params: Vec<Value>) -> Self::Out<Option<T>>;
     fn run_one<T: FromRow + Send + 'static>(self, sql: String, params: Vec<Value>) -> Self::Out<T>;
     fn run_scalar(self, sql: String, params: Vec<Value>) -> Self::Out<i64>;
     /// 빌드 단계 에러를 결과 컨테이너로
@@ -462,18 +402,10 @@ pub trait Execute {
 impl Execute for SyncHandle<'_> {
     type Out<R: Send + 'static> = Result<R>;
 
-    fn run_all<T: FromRow + Send + 'static>(
-        self,
-        sql: String,
-        params: Vec<Value>,
-    ) -> Result<Vec<T>> {
+    fn run_all<T: FromRow + Send + 'static>(self, sql: String, params: Vec<Value>) -> Result<Vec<T>> {
         self.query_all(&sql, rusqlite::params_from_iter(params))
     }
-    fn run_optional<T: FromRow + Send + 'static>(
-        self,
-        sql: String,
-        params: Vec<Value>,
-    ) -> Result<Option<T>> {
+    fn run_optional<T: FromRow + Send + 'static>(self, sql: String, params: Vec<Value>) -> Result<Option<T>> {
         self.query_optional(&sql, rusqlite::params_from_iter(params))
     }
     fn run_one<T: FromRow + Send + 'static>(self, sql: String, params: Vec<Value>) -> Result<T> {
@@ -511,24 +443,13 @@ mod tests {
     fn escaped_like_binds_pattern_and_escape() {
         let mut sql = String::new();
         let mut params = vec![Value::Integer(7)];
-        col("name")
-            .like_escaped("100!%", '!')
-            .render(&mut sql, &mut params);
+        col("name").like_escaped("100!%", '!').render(&mut sql, &mut params);
         assert_eq!(sql, "\"name\" LIKE ?2 ESCAPE ?3");
-        assert_eq!(
-            params,
-            vec![
-                Value::Integer(7),
-                Value::Text("100!%".into()),
-                Value::Text("!".into())
-            ]
-        );
+        assert_eq!(params, vec![Value::Integer(7), Value::Text("100!%".into()), Value::Text("!".into())]);
 
         sql.clear();
         params.clear();
-        col("name")
-            .like_escaped("한界%", '界')
-            .render(&mut sql, &mut params);
+        col("name").like_escaped("한界%", '界').render(&mut sql, &mut params);
         assert_eq!(params[1], Value::Text("界".into()));
     }
 
@@ -550,6 +471,9 @@ mod tests {
                 not_null: true,
                 pk: true,
                 renamed_from: None,
+                default_sql: None,
+                collate: None,
+                generated: None,
             },
             crate::database::ColumnMeta {
                 name: "name",
@@ -557,6 +481,9 @@ mod tests {
                 not_null: true,
                 pk: false,
                 renamed_from: None,
+                default_sql: None,
+                collate: None,
+                generated: None,
             },
         ];
     }
@@ -564,37 +491,22 @@ mod tests {
     /// SQL 렌더 — 조건 조합·IN·정렬·페이지
     #[test]
     fn renders_sql() {
-        let (sql, params) = Query::select::<T0>()
-            .and_where(col("id").in_list([1i64, 2]).and(col("name").like("k%")))
-            .or_where(col("name").is_null())
-            .order_by("id", Order::Desc)
-            .limit(10)
-            .offset(5)
-            .build()
-            .unwrap();
-        assert_eq!(
-            sql,
-            "SELECT \"id\", \"name\" FROM \"t0\" WHERE ((\"id\" IN (?1, ?2) AND \"name\" LIKE ?3) OR \"name\" IS NULL) ORDER BY \"id\" DESC LIMIT 10 OFFSET 5"
-        );
+        let (sql, params) = Query::select::<T0>().and_where(col("id").in_list([1i64, 2]).and(col("name").like("k%"))).or_where(col("name").is_null()).order_by("id", Order::Desc).limit(10).offset(5).build().unwrap();
+        assert_eq!(sql, "SELECT \"id\", \"name\" FROM \"t0\" WHERE ((\"id\" IN (?1, ?2) AND \"name\" LIKE ?3) OR \"name\" IS NULL) ORDER BY \"id\" DESC LIMIT 10 OFFSET 5");
         assert_eq!(params.len(), 3);
     }
 
     /// 스키마 검증 — 미지 컬럼 = Config 에러
     #[test]
     fn unknown_column_rejected() {
-        let r = Query::select::<T0>()
-            .and_where(col("nope").eq(1i64))
-            .build();
+        let r = Query::select::<T0>().and_where(col("nope").eq(1i64)).build();
         assert!(matches!(r, Err(Error::Config(_))));
     }
 
     /// 빈 IN = 항상 거짓
     #[test]
     fn empty_in_list() {
-        let (sql, _) = Query::select::<T0>()
-            .and_where(col("id").in_list(Vec::<i64>::new()))
-            .build()
-            .unwrap();
+        let (sql, _) = Query::select::<T0>().and_where(col("id").in_list(Vec::<i64>::new())).build().unwrap();
         assert!(sql.contains("0 = 1"));
     }
 }

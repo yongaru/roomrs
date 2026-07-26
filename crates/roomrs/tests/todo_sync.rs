@@ -1,10 +1,6 @@
 // M1 검증 통합 테스트 (명세 §15 M1) —
 // todo CRUD · PK 생략 삽입+rowid 반환 · write 직렬성 · 통합 풀 · 트랜잭션
 
-// 함수 안 #[database]가 생성하는 export 테스트(명세 §7.4)는 중첩 항목이라
-// 수집 불가 — rustc unnameable_test_items 경고를 파일 단위로 허용한다.
-#![allow(unnameable_test_items)]
-
 use roomrs::{MigrationPolicy, dao, database, entity, params};
 
 #[entity(table = "todos")]
@@ -40,14 +36,14 @@ trait TodoDao {
 #[database(entities(Todo), daos(TodoDao), version = 1)]
 struct Db;
 
+/// 버전 불일치 시나리오용 — 동일 엔티티·version=2 (dao 없음 = Tx 트레이트 충돌 방지)
+#[database(entities(Todo), version = 2)]
+struct Db2;
+
 /// 테스트 DB — 임시 파일 (WAL 경로 포함 검증), 리포 밖 tempdir
 fn open_db() -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().expect("tempdir 생성 실패");
-    let db = Db::builder()
-        .sqlite(dir.path().join("test.db"))
-        .migrate(MigrationPolicy::Auto)
-        .build()
-        .expect("DB 오픈 실패");
+    let db = Db::builder().sqlite(dir.path().join("test.db")).migrate(MigrationPolicy::Auto).build().expect("DB 오픈 실패");
     (dir, db)
 }
 
@@ -59,20 +55,8 @@ fn crud_roundtrip() {
     let dao = h.todo_dao();
 
     // C — PK 생략 삽입, 새 rowid 반환 (id:0은 센티널이 아님 — 무시됨)
-    let id1 = dao
-        .add(&Todo {
-            id: 0,
-            title: "첫번째".into(),
-            done: false,
-        })
-        .unwrap();
-    let id2 = dao
-        .add(&Todo {
-            id: 0,
-            title: "두번째".into(),
-            done: false,
-        })
-        .unwrap();
+    let id1 = dao.add(&Todo { id: 0, title: "첫번째".into(), done: false }).unwrap();
+    let id2 = dao.add(&Todo { id: 0, title: "두번째".into(), done: false }).unwrap();
     assert!(id1 > 0, "rowid는 1 이상");
     assert_eq!(id2, id1 + 1, "autoincrement 연속");
 
@@ -98,33 +82,20 @@ fn direct_query_api() {
     let (_dir, db) = open_db();
     let h = db.run_sync();
 
-    let n = h
-        .execute(
-            "INSERT INTO todos (title, done) VALUES (?1, ?2)",
-            params!["직접", false],
-        )
-        .unwrap();
+    let n = h.execute("INSERT INTO todos (title, done) VALUES (?1, ?2)", params!["직접", false]).unwrap();
     assert_eq!(n, 1);
 
-    let cnt: i64 = h
-        .query_scalar("SELECT COUNT(*) FROM todos", params![])
-        .unwrap();
+    let cnt: i64 = h.query_scalar("SELECT COUNT(*) FROM todos", params![]).unwrap();
     assert_eq!(cnt, 1);
 
-    let row: (i64, String) = h
-        .query_one("SELECT id, title FROM todos LIMIT 1", params![])
-        .unwrap();
+    let row: (i64, String) = h.query_one("SELECT id, title FROM todos LIMIT 1", params![]).unwrap();
     assert_eq!(row.1, "직접");
 
-    let missing: Option<(i64, String)> = h
-        .query_optional("SELECT id, title FROM todos WHERE id = ?1", params![9999])
-        .unwrap();
+    let missing: Option<(i64, String)> = h.query_optional("SELECT id, title FROM todos WHERE id = ?1", params![9999]).unwrap();
     assert!(missing.is_none());
 
     // query_one 0건 = NotFound (명세 §5.2)
-    let err = h
-        .query_one::<(i64, String), _>("SELECT id, title FROM todos WHERE id = ?1", params![9999])
-        .unwrap_err();
+    let err = h.query_one::<(i64, String), _>("SELECT id, title FROM todos WHERE id = ?1", params![9999]).unwrap_err();
     assert!(matches!(err, roomrs::Error::NotFound));
 }
 
@@ -144,21 +115,13 @@ fn concurrent_inserts_complete_without_loss() {
                 let h = db.run_sync();
                 let dao = h.todo_dao();
                 for i in 0..PER_THREAD {
-                    dao.add(&Todo {
-                        id: 0,
-                        title: format!("t{t}-{i}"),
-                        done: false,
-                    })
-                    .expect("동시 insert 실패");
+                    dao.add(&Todo { id: 0, title: format!("t{t}-{i}"), done: false }).expect("동시 insert 실패");
                 }
             });
         }
     });
 
-    let cnt: i64 = db
-        .run_sync()
-        .query_scalar("SELECT COUNT(*) FROM todos", params![])
-        .unwrap();
+    let cnt: i64 = db.run_sync().query_scalar("SELECT COUNT(*) FROM todos", params![]).unwrap();
     assert_eq!(cnt as usize, THREADS * PER_THREAD, "insert 손실 없음");
 }
 
@@ -175,9 +138,7 @@ fn every_checked_out_connection_accepts_cud() {
     })
     .expect("통합 풀 커넥션 CUD");
 
-    let count: i64 = h
-        .query_scalar("SELECT count(*) FROM todos WHERE done = 1", params![])
-        .expect("CUD 결과 조회");
+    let count: i64 = h.query_scalar("SELECT count(*) FROM todos WHERE done = 1", params![]).expect("CUD 결과 조회");
     assert_eq!(count, 1);
 }
 
@@ -185,13 +146,7 @@ fn every_checked_out_connection_accepts_cud() {
 #[test]
 fn query_accepts_insert_returning() {
     let (_dir, db) = open_db();
-    let row: (i64, String) = db
-        .run_sync()
-        .query_one(
-            "INSERT INTO todos (title, done) VALUES (?1, 0) RETURNING id, title",
-            params!["returning"],
-        )
-        .expect("INSERT RETURNING");
+    let row: (i64, String) = db.run_sync().query_one("INSERT INTO todos (title, done) VALUES (?1, 0) RETURNING id, title", params!["returning"]).expect("INSERT RETURNING");
     assert!(row.0 > 0);
     assert_eq!(row.1, "returning");
 }
@@ -200,13 +155,7 @@ fn query_accepts_insert_returning() {
 #[test]
 fn query_accepts_complex_write_returning_without_routing() {
     let (_dir, db) = open_db();
-    let title: String = db
-        .run_sync()
-        .query_scalar(
-            "-- 첫 키워드로 판별할 수 없음\nWITH input(title) AS (VALUES (?1)) INSERT INTO todos(title, done) SELECT title, 0 FROM input RETURNING title",
-            params!["complex"],
-        )
-        .expect("복잡 SQL RETURNING");
+    let title: String = db.run_sync().query_scalar("-- 첫 키워드로 판별할 수 없음\nWITH input(title) AS (VALUES (?1)) INSERT INTO todos(title, done) SELECT title, 0 FROM input RETURNING title", params!["complex"]).expect("복잡 SQL RETURNING");
     assert_eq!(title, "complex");
 }
 
@@ -219,67 +168,39 @@ fn transactions() {
     // 커밋 — tx-바운드 DAO 사용 (명세 §5.9 한 메커니즘)
     use DbTxDaos as _;
     h.transaction(|tx| {
-        tx.todo_dao().add(&Todo {
-            id: 0,
-            title: "tx1".into(),
-            done: false,
-        })?;
-        tx.todo_dao().add(&Todo {
-            id: 0,
-            title: "tx2".into(),
-            done: false,
-        })?;
+        tx.todo_dao().add(&Todo { id: 0, title: "tx1".into(), done: false })?;
+        tx.todo_dao().add(&Todo { id: 0, title: "tx2".into(), done: false })?;
         Ok(())
     })
     .unwrap();
-    let cnt: i64 = h
-        .query_scalar("SELECT COUNT(*) FROM todos", params![])
-        .unwrap();
+    let cnt: i64 = h.query_scalar("SELECT COUNT(*) FROM todos", params![]).unwrap();
     assert_eq!(cnt, 2);
 
     // 에러 = 롤백
     let r: roomrs::Result<()> = h.transaction(|tx| {
-        tx.todo_dao().add(&Todo {
-            id: 0,
-            title: "롤백될 행".into(),
-            done: false,
-        })?;
+        tx.todo_dao().add(&Todo { id: 0, title: "롤백될 행".into(), done: false })?;
         Err(roomrs::Error::Config("의도적 실패".into()))
     });
     assert!(r.is_err());
-    let cnt: i64 = h
-        .query_scalar("SELECT COUNT(*) FROM todos", params![])
-        .unwrap();
+    let cnt: i64 = h.query_scalar("SELECT COUNT(*) FROM todos", params![]).unwrap();
     assert_eq!(cnt, 2, "롤백으로 개수 불변");
 
     // RAII — 미커밋 drop = 롤백
     {
         let tx = h.begin().unwrap();
-        tx.execute(
-            "INSERT INTO todos (title, done) VALUES ('drop', 0)",
-            params![],
-        )
-        .unwrap();
+        tx.execute("INSERT INTO todos (title, done) VALUES ('drop', 0)", params![]).unwrap();
         // commit 없이 drop
     }
-    let cnt: i64 = h
-        .query_scalar("SELECT COUNT(*) FROM todos", params![])
-        .unwrap();
+    let cnt: i64 = h.query_scalar("SELECT COUNT(*) FROM todos", params![]).unwrap();
     assert_eq!(cnt, 2, "RAII drop = 롤백");
 
     // RAII — 커밋
     {
         let tx = h.begin().unwrap();
-        tx.execute(
-            "INSERT INTO todos (title, done) VALUES ('commit', 0)",
-            params![],
-        )
-        .unwrap();
+        tx.execute("INSERT INTO todos (title, done) VALUES ('commit', 0)", params![]).unwrap();
         tx.commit().unwrap();
     }
-    let cnt: i64 = h
-        .query_scalar("SELECT COUNT(*) FROM todos", params![])
-        .unwrap();
+    let cnt: i64 = h.query_scalar("SELECT COUNT(*) FROM todos", params![]).unwrap();
     assert_eq!(cnt, 3);
 }
 
@@ -289,13 +210,7 @@ fn upsert_replace() {
     let (_dir, db) = open_db();
     let h = db.run_sync();
     let dao = h.todo_dao();
-    let id = dao
-        .upsert(&Todo {
-            id: 0,
-            title: "u1".into(),
-            done: false,
-        })
-        .unwrap();
+    let id = dao.upsert(&Todo { id: 0, title: "u1".into(), done: false }).unwrap();
     assert!(id > 0);
 }
 
@@ -307,8 +222,6 @@ fn version_mismatch_errors() {
     drop(Db::builder().sqlite(&path).build().unwrap());
 
     // 같은 파일을 다른 버전 스키마로 열기
-    #[database(entities(Todo), daos(TodoDao), version = 2)]
-    struct Db2;
     match Db2::builder().sqlite(&path).build() {
         Err(roomrs::Error::Migration(_)) => {}
         Err(other) => panic!("Migration 에러를 기대했으나: {other}"),

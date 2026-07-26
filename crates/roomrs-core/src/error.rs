@@ -3,6 +3,91 @@
 /// roomrs 공용 Result 별칭
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Stable subsystem where an [`Error`] originated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ErrorPath {
+    /// SQLite engine, connection, or SQL execution.
+    Database,
+    /// Query result shape or row lookup.
+    Query,
+    /// Connection-pool checkout, maintenance, or recovery.
+    ConnectionPool,
+    /// Versioned schema migration.
+    Migration,
+    /// Committed schema snapshot validation.
+    SchemaSnapshot,
+    /// Live-query lifecycle or dependency tracking.
+    LiveQuery,
+    /// Builder, macro, or caller-supplied configuration.
+    Configuration,
+    /// Data serialization or conversion.
+    Serialization,
+    /// roomrs invariant or isolated callback failure.
+    Internal,
+}
+
+impl ErrorPath {
+    /// Returns a stable machine-readable path identifier.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Database => "database",
+            Self::Query => "query",
+            Self::ConnectionPool => "connection_pool",
+            Self::Migration => "migration",
+            Self::SchemaSnapshot => "schema_snapshot",
+            Self::LiveQuery => "live_query",
+            Self::Configuration => "configuration",
+            Self::Serialization => "serialization",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// Recommended next action for an [`Error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ErrorAdvice {
+    /// Retry the operation after a short backoff.
+    Retry,
+    /// Check the query, parameters, and expected row count.
+    CheckQuery,
+    /// Check database permissions, connection state, and SQLite diagnostics.
+    CheckDatabase,
+    /// Review or add a forward migration before retrying.
+    ReviewMigration,
+    /// Generate and commit the current version schema snapshot.
+    RegenerateSnapshot,
+    /// Declare live-query dependencies with `watching` or `watching_all`.
+    DeclareDependencies,
+    /// Correct builder, macro, or runtime configuration.
+    CheckConfiguration,
+    /// Correct serialization format or custom SQL type conversion.
+    CheckDataFormat,
+    /// Inspect logs and report the invariant failure with reproduction details.
+    InspectLogs,
+    /// No retry is useful because the resource is closed.
+    ReopenDatabase,
+}
+
+impl ErrorAdvice {
+    /// Returns a stable machine-readable advice identifier.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::CheckQuery => "check_query",
+            Self::CheckDatabase => "check_database",
+            Self::ReviewMigration => "review_migration",
+            Self::RegenerateSnapshot => "regenerate_snapshot",
+            Self::DeclareDependencies => "declare_dependencies",
+            Self::CheckConfiguration => "check_configuration",
+            Self::CheckDataFormat => "check_data_format",
+            Self::InspectLogs => "inspect_logs",
+            Self::ReopenDatabase => "reopen_database",
+        }
+    }
+}
+
 /// roomrs 단일 에러 타입 — 공개 API는 전부 이 타입으로 반환한다
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -35,6 +120,10 @@ pub enum Error {
     #[error("쿼리의 의존 테이블을 알 수 없습니다: {0}")]
     UnknownDependencies(String),
 
+    /// InvalidationFilter 테이블·컬럼이 스키마에 없음 (명세 §9.5 P1)
+    #[error("무효화 필터 스키마 검증 실패: {0}")]
+    InvalidationFilter(String),
+
     /// 빌더/설정 오류
     #[error("설정 에러: {0}")]
     Config(String),
@@ -53,13 +142,47 @@ pub enum Error {
     Json(#[from] serde_json::Error),
 }
 
+impl Error {
+    /// Returns the stable subsystem that produced this error.
+    pub const fn path(&self) -> ErrorPath {
+        match self {
+            Self::Sqlite(_) | Self::ReadOnly(_) => ErrorPath::Database,
+            Self::NotFound => ErrorPath::Query,
+            Self::QueueTimeout(_) => ErrorPath::ConnectionPool,
+            Self::Migration(_) => ErrorPath::Migration,
+            Self::SnapshotStale(_) => ErrorPath::SchemaSnapshot,
+            Self::UnknownDependencies(_) | Self::InvalidationFilter(_) | Self::Closed => ErrorPath::LiveQuery,
+            Self::Config(_) => ErrorPath::Configuration,
+            Self::Internal(_) => ErrorPath::Internal,
+            #[cfg(feature = "json")]
+            Self::Json(_) => ErrorPath::Serialization,
+        }
+    }
+
+    /// Returns the recommended next action for this error.
+    pub const fn advice(&self) -> ErrorAdvice {
+        match self {
+            Self::Sqlite(_) | Self::ReadOnly(_) => ErrorAdvice::CheckDatabase,
+            Self::NotFound => ErrorAdvice::CheckQuery,
+            Self::QueueTimeout(_) => ErrorAdvice::Retry,
+            Self::Migration(_) => ErrorAdvice::ReviewMigration,
+            Self::SnapshotStale(_) => ErrorAdvice::RegenerateSnapshot,
+            Self::UnknownDependencies(_) => ErrorAdvice::DeclareDependencies,
+            Self::InvalidationFilter(_) => ErrorAdvice::CheckConfiguration,
+            Self::Config(_) => ErrorAdvice::CheckConfiguration,
+            Self::Internal(_) => ErrorAdvice::InspectLogs,
+            Self::Closed => ErrorAdvice::ReopenDatabase,
+            #[cfg(feature = "json")]
+            Self::Json(_) => ErrorAdvice::CheckDataFormat,
+        }
+    }
+}
+
 /// rusqlite 에러 변환 — SQLITE_READONLY는 공개 호환용 `ReadOnly`로 승격한다.
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         match &e {
-            rusqlite::Error::SqliteFailure(fe, _) if fe.code == rusqlite::ErrorCode::ReadOnly => {
-                Error::ReadOnly(e.to_string())
-            }
+            rusqlite::Error::SqliteFailure(fe, _) if fe.code == rusqlite::ErrorCode::ReadOnly => Error::ReadOnly(e.to_string()),
             _ => Error::Sqlite(e),
         }
     }

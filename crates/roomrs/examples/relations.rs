@@ -5,6 +5,7 @@
 //! 실행: cargo run --example relations
 
 use roomrs::{Relation, dao, database, entity, params};
+mod support;
 
 #[entity(table = "authors")]
 #[derive(Debug, Clone)]
@@ -85,45 +86,22 @@ trait LibraryDao {
     fn books(&self) -> roomrs::Result<Vec<BookView>>;
 }
 
-#[database(
-    entities(Author, Book, Profile, Genre, BookGenre),
-    daos(LibraryDao),
-    version = 1
-)]
+#[database(entities(Author, Book, Profile, Genre, BookGenre), daos(LibraryDao), version = 1)]
 struct Db;
 
 fn main() -> roomrs::Result<()> {
+    support::init_tracing();
     let db = Db::builder().in_memory().build()?;
     let h = db.run_sync();
-    h.execute(
-        "INSERT INTO authors (name) VALUES ('김작가'), ('이작가')",
-        params![],
-    )?;
-    h.execute(
-        "INSERT INTO books (author_id, title) VALUES (1,'첫 책'), (1,'둘째 책'), (2,'남의 책')",
-        params![],
-    )?;
-    h.execute(
-        "INSERT INTO profiles (author_id, bio) VALUES (1, '수필가')",
-        params![],
-    )?;
-    h.execute(
-        "INSERT INTO genres (label) VALUES ('에세이'), ('소설')",
-        params![],
-    )?;
-    h.execute(
-        "INSERT INTO book_genres (book_id, genre_id) VALUES (1,1), (1,2), (2,2)",
-        params![],
-    )?;
+    h.execute("INSERT INTO authors (name) VALUES ('김작가'), ('이작가')", params![])?;
+    h.execute("INSERT INTO books (author_id, title) VALUES (1,'첫 책'), (1,'둘째 책'), (2,'남의 책')", params![])?;
+    h.execute("INSERT INTO profiles (author_id, bio) VALUES (1, '수필가')", params![])?;
+    h.execute("INSERT INTO genres (label) VALUES ('에세이'), ('소설')", params![])?;
+    h.execute("INSERT INTO book_genres (book_id, genre_id) VALUES (1,1), (1,2), (2,2)", params![])?;
 
     // 1:N + 1:1 — 부모 수와 무관하게 쿼리 3개(작가 + 책 IN + 프로필 IN)
     for v in h.library_dao().authors()? {
-        println!(
-            "{} — 저서 {}권, 프로필: {}",
-            v.author.name,
-            v.books.len(),
-            v.profile.map(|p| p.bio).unwrap_or_else(|| "없음".into()),
-        );
+        println!("{} — 저서 {}권, 프로필: {}", v.author.name, v.books.len(), v.profile.map(|p| p.bio).unwrap_or_else(|| "없음".into()),);
     }
 
     // N:M

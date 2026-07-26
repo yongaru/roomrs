@@ -1,10 +1,6 @@
 // M3 검증 통합 테스트 (명세 §15 M3) —
 // 버전 체인 실행 · 중복/갭 에러 · destructive fallback · migrations_dir! · diff 초안
 
-// 함수 안 #[database]가 생성하는 export 테스트(명세 §7.4)는 중첩 항목이라
-// 수집 불가 — rustc unnameable_test_items 경고를 파일 단위로 허용한다.
-#![allow(unnameable_test_items)]
-
 use roomrs::{Migration, MigrationPolicy, dao, database, entity, migrations_dir, params};
 
 // ───── v1 스키마 ─────
@@ -44,16 +40,23 @@ trait DocV3Dao {
 #[database(entities(DocV3), daos(DocV3Dao), version = 3)]
 struct Db3;
 
+// ───── rename 힌트 diff 초안용 v2 (함수 안 #[database] 금지 — export mod 중첩 불가)
+#[entity(table = "docs")]
+struct DocRenamed {
+    #[pk(autoincrement)]
+    id: i64,
+    #[column(renamed_from = "title")]
+    subject: String,
+    note: String,
+}
+
+#[database(entities(DocRenamed), version = 2)]
+struct DbRenamed;
+
 /// v1 DB 생성 + 데이터 1건
 fn make_v1(path: &std::path::Path) {
     let db = Db1::builder().sqlite(path).build().unwrap();
-    db.run_sync()
-        .doc_v1_dao()
-        .add(&DocV1 {
-            id: 0,
-            title: "기존".into(),
-        })
-        .unwrap();
+    db.run_sync().doc_v1_dao().add(&DocV1 { id: 0, title: "기존".into() }).unwrap();
 }
 
 /// 체인 실행 (1→2→3) — 데이터 보존 + user_version 갱신
@@ -66,16 +69,8 @@ fn chain_upgrades_and_preserves_data() {
     let db = Db3::builder()
         .sqlite(&path)
         .migrate(MigrationPolicy::Auto)
-        .migration(Migration::sql(
-            1,
-            2,
-            r#"ALTER TABLE "docs" ADD COLUMN "note" TEXT NOT NULL DEFAULT ''"#,
-        ))
-        .migration(Migration::sql(
-            2,
-            3,
-            r#"ALTER TABLE "docs" ADD COLUMN "done" INTEGER NOT NULL DEFAULT 0"#,
-        ))
+        .migration(Migration::sql(1, 2, r#"ALTER TABLE "docs" ADD COLUMN "note" TEXT NOT NULL DEFAULT ''"#))
+        .migration(Migration::sql(2, 3, r#"ALTER TABLE "docs" ADD COLUMN "done" INTEGER NOT NULL DEFAULT 0"#))
         .build()
         .unwrap();
 
@@ -97,11 +92,7 @@ fn migrations_dir_embeds_files() {
     let path = dir.path().join("d.db");
     make_v1(&path);
 
-    let db = Db3::builder()
-        .sqlite(&path)
-        .migrations(migrations_dir!("tests/migrations_sql"))
-        .build()
-        .unwrap();
+    let db = Db3::builder().sqlite(&path).migrations(migrations_dir!("tests/migrations_sql")).build().unwrap();
     assert_eq!(db.run_sync().doc_v3_dao().all().unwrap().len(), 1);
 }
 
@@ -112,15 +103,8 @@ fn duplicate_segment_errors() {
     let path = dir.path().join("dup.db");
     make_v1(&path);
 
-    let r = Db3::builder()
-        .sqlite(&path)
-        .migration(Migration::sql(1, 2, "SELECT 1"))
-        .migration(Migration::sql(1, 3, "SELECT 1"))
-        .build();
-    assert!(
-        matches!(r, Err(roomrs::Error::Migration(_))),
-        "중복 from = 에러"
-    );
+    let r = Db3::builder().sqlite(&path).migration(Migration::sql(1, 2, "SELECT 1")).migration(Migration::sql(1, 3, "SELECT 1")).build();
+    assert!(matches!(r, Err(roomrs::Error::Migration(_))), "중복 from = 에러");
 }
 
 /// 체인 갭 = 에러, destructive fallback 옵트인 시 = drop+재생성
@@ -135,25 +119,13 @@ fn gap_errors_and_destructive_fallback() {
     assert!(matches!(r, Err(roomrs::Error::Migration(_))), "갭 = 에러");
 
     // destructive 폴백 = 성공, 데이터 소실 + 새 스키마
-    let db = Db3::builder()
-        .sqlite(&path)
-        .fallback_to_destructive_migration(true)
-        .build()
-        .unwrap();
+    let db = Db3::builder().sqlite(&path).fallback_to_destructive_migration(true).build().unwrap();
     let h = db.run_sync();
-    assert_eq!(
-        h.doc_v3_dao().all().unwrap().len(),
-        0,
-        "파괴적 재생성 = 데이터 소실"
-    );
+    assert_eq!(h.doc_v3_dao().all().unwrap().len(), 0, "파괴적 재생성 = 데이터 소실");
     let v: i64 = h.query_scalar("PRAGMA user_version", params![]).unwrap();
     assert_eq!(v, 3);
     // 새 스키마로 정상 동작
-    h.execute(
-        "INSERT INTO docs (title, note, done) VALUES (?1, ?2, ?3)",
-        params!["신규", "n", false],
-    )
-    .unwrap();
+    h.execute("INSERT INTO docs (title, note, done) VALUES (?1, ?2, ?3)", params!["신규", "n", false]).unwrap();
 }
 
 /// 코드 스텝 + MigrationStep trait 래핑
@@ -177,14 +149,7 @@ fn code_step_and_trait_step() {
     let path = dir.path().join("c.db");
     make_v1(&path);
 
-    let db = Db3::builder()
-        .sqlite(&path)
-        .migration(Migration::from_step(AddNote))
-        .migration(Migration::code(2, 3, |tx| {
-            tx.execute_batch(r#"ALTER TABLE "docs" ADD COLUMN "done" INTEGER NOT NULL DEFAULT 0"#)
-        }))
-        .build()
-        .unwrap();
+    let db = Db3::builder().sqlite(&path).migration(Migration::from_step(AddNote)).migration(Migration::code(2, 3, |tx| tx.execute_batch(r#"ALTER TABLE "docs" ADD COLUMN "done" INTEGER NOT NULL DEFAULT 0"#))).build().unwrap();
     assert_eq!(db.run_sync().doc_v3_dao().all().unwrap().len(), 1);
 }
 
@@ -193,32 +158,12 @@ fn code_step_and_trait_step() {
 fn diff_draft_generation() {
     use roomrs::DatabaseSpec;
 
-    #[entity(table = "docs")]
-    struct DocRenamed {
-        #[pk(autoincrement)]
-        id: i64,
-        #[column(renamed_from = "title")]
-        subject: String,
-        note: String,
-    }
-    #[database(entities(DocRenamed), version = 2)]
-    struct DbRenamed;
-
     let old = <Db1 as DatabaseSpec>::schema().to_snapshot();
     let new = <DbRenamed as DatabaseSpec>::schema().to_snapshot();
     let draft = roomrs::diff_sql(&old, &new);
 
-    assert!(
-        draft.contains(r#"RENAME COLUMN "title" TO "subject""#),
-        "renamed_from 힌트 = RENAME 제안: {draft}"
-    );
-    assert!(
-        draft.contains(r#"ADD COLUMN "note""#),
-        "신규 컬럼 = ADD: {draft}"
-    );
+    assert!(draft.contains(r#"RENAME COLUMN "title" TO "subject""#), "renamed_from 힌트 = RENAME 제안: {draft}");
+    assert!(draft.contains(r#"ADD COLUMN "note""#), "신규 컬럼 = ADD: {draft}");
     assert!(draft.contains("PRAGMA user_version = 2"), "{draft}");
-    assert!(
-        !draft.contains(r#"DROP COLUMN "title""#),
-        "rename된 컬럼은 DROP 제안 없음"
-    );
+    assert!(!draft.contains(r#"DROP COLUMN "title""#), "rename된 컬럼은 DROP 제안 없음");
 }

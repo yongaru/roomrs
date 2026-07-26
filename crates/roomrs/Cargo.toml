@@ -26,12 +26,20 @@ futures = "0.3"
 # log 파사드 통합 시연·테스트 (지시서 logging-log-crate) —
 # 예제는 tracing-log 브리지로 roomrs 내부 log 레코드를 수집한다
 log = { workspace = true }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-tracing-log = "0.2"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
 
 [features]
-default = ["bundled", "async", "live", "time", "uuid", "json"]
+default = [
+    "sqlite-bundled",
+    "async",
+    "tokio",
+    "live",
+    "time",
+    "uuid",
+    "json",
+]
 # SQLite/SQLCipher 링크 backend — canonical feature는 상호 배타
 sqlite-bundled = ["roomrs-core/sqlite-bundled"]
 sqlite-system = ["roomrs-core/sqlite-system"]

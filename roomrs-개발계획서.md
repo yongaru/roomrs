@@ -1,14 +1,14 @@
-# roomrs — 0.2.3 기능 명세 (Agent Spec) · **SQLite 전용 · 동기+비동기**
+# roomrs — 0.3.0 기능 명세 (Agent Spec) · **SQLite 전용 · 동기+비동기**
 
 > Android **Room** 과 동일한 개발 경험을 목표로 하는 Rust용 **로컬 SQLite 퍼시스턴스** 라이브러리.
-> 백엔드: **SQLite 전용 — bundled/system 링크 선택, 기본은 bundled**. 다른 DB 지원 없음. API: **동기 1급 + 비동기(런타임 무관 std Future + tokio 통합)**. 기반: **rusqlite** 동기 코어 + **자체 통합 미니 풀(N)**.
+> 백엔드: **SQLite 전용 — SQLite/SQLCipher bundled/system 링크 선택, 기본은 bundled SQLite**. 다른 DB 지원 없음. API: **동기 1급 + 비동기(런타임 무관 std Future + tokio 통합)**. 기반: **rusqlite** 동기 코어 + **자체 통합 미니 풀(N)**.
 >
 > 본 문서는 **에이전트/구현자 실행용 명세**다. 사람용 개요는 `README.md` 참조.
-> 제품 버전: **0.2.3**.
+> 제품 버전: **0.3.0**.
 >
 > **범위 확정**: roomrs는 **SQLite만** 지원한다. 다른 DB 백엔드는 지원하지 않으며 계획에도 없다.
 >
-> **기반 선택 근거**: SQLite는 C 레벨에서 동기라 어떤 라이브러리든 "async"는 워커 오프로드일 뿐 → **동기 코어(rusqlite) + 비동기 파사드**. 일반 커넥션은 모두 read/write 가능하게 해 SQL 의미 추측과 `RETURNING`·CTE·쓰기 PRAGMA 예외를 제거하고, SQLite WAL·busy handler가 실제 잠금을 조정한다. 비동기 파사드는 **런타임 무관(std `Future`)** 기본, tokio 통합은 선택 최적화(§2.4).
+> **기반 선택 근거**: SQLite는 C 레벨에서 동기라 어떤 라이브러리든 "async"는 워커 오프로드일 뿐 → **동기 코어(rusqlite) + 비동기 파사드**. 일반 커넥션은 모두 read/write 가능하게 해 SQL 의미 추측과 `RETURNING`·CTE·쓰기 PRAGMA 예외를 제거하고, SQLite WAL·busy handler가 실제 잠금을 조정한다. 비동기 파사드는 **런타임 무관(std `Future`)**이며 tokio 통합은 기본 on, 선택 해제 가능하다(§2.4).
 
 ---
 
@@ -20,13 +20,13 @@
 |---|------|------|------|
 | 1 | 기반 스택 | **rusqlite 동기 코어 + 자체 미니 풀** | SQLite/SQLCipher 각각 bundled/system 링크 선택. 기본은 bundled SQLite |
 | 1b | 쓰기 전략 | **통합 풀 N — 모든 일반 커넥션 read/write 가능, SQL 라우팅 없음** | `query`/`execute`는 반환 형태만 구분. WAL·`busy_timeout`으로 잠금 경합 처리 |
-| 2 | API 모델 | **동기 1급 + 비동기 파사드(런타임 무관 std Future 기본, tokio 통합 선택)** | 어떤 실행기에서도 await 가능 |
+| 2 | API 모델 | **동기 1급 + 비동기 파사드(런타임 무관 std Future, tokio 통합 기본)** | 어떤 실행기에서도 await 가능. `default-features = false`로 tokio 제외 가능 |
 | 2b | API 네임스페이스 | **`db.run_sync()` / `db.run_async()` 핸들 분리** — 양쪽 메서드명 동일 | 완전 대칭 쌍 + 예약어 `async` 충돌 회피(§5.0) |
 | 3 | 쿼리 정의 | **Room식 raw SQL 매크로** (`#[query("...")]`) | 동적 쿼리는 쿼리빌더/런타임 경로 |
 | 3b | 직접 쿼리 | **DAO/엔티티 없이 raw 쿼리 1급** (execute/단건/Option/스칼라/Vec + 라이브) | §5.7 |
 | 4 | SQL 검증 | **하이브리드**: 정적=**커밋된 스키마 스냅샷 파일 대조**, 동적=런타임(prepare) | 메커니즘 §7. 파서 실패=스킵+경고, `unchecked` 해치 |
 | 5 | 라이브 쿼리 | **핵심 필수** — 단일 구체 타입 `LiveQuery<T>` | 주 경로=문장 기반 무효화, 보조=`preupdate_hook` 행 필터(§9.2) |
-| 5b | 멀티 프로세스 무효화 | **현재 미지원**, IPC 브로커를 후속 로드맵으로 보류 | 단일 프로세스 `preupdate_hook` 필터만 제공(§9.5) |
+| 5b | 멀티 프로세스 무효화 | **현재 미지원**, 공개 로드맵 제외 | 단일 프로세스 `preupdate_hook` 필터만 제공. 보관 설계는 `docs/MULTI_PROCESS_INVALIDATION.md` |
 | 5c | 알림 콜백 모델 | **recv + subscribe 콜백 + Iterator / Stream** — 동기·비동기 핸들 양쪽 | 전용 노티파이어 스레드(§9.6) |
 | 6 | 마이그레이션 | **자동 + 반자동(직접 SQL) + 수동 코드** 3경로 | diff 초안 · `Migration::sql` · trait(§8) |
 | 6b | 마이그레이션 보조 | **rename 힌트**(`renamed_from`) + **`fallback_to_destructive_migration`**(옵트인) | |
@@ -42,29 +42,30 @@
 | 12c | autoincrement PK | insert 시 **PK 컬럼 항상 생략 + 새 id는 반환값으로** | `id:0` 센티널 금지. 명시 삽입은 `#[insert(keep_pk)]` |
 | 13 | 플랫폼 | 데스크톱(Win/Mac/Linux) + 모바일(Android/iOS) | 전 타깃 SQLite |
 | 13b | MSRV | **1.85 (Edition 2024)** | Rust 1.88 안정화 let-chain 금지. CI `cargo +1.85 build`를 릴리스 게이트로 포함 |
-| 14 | 암호화 | 선택적 SQLCipher backend | `sqlcipher-bundled` 또는 `sqlcipher-system`; `cipher`는 bundled 호환 alias |
-| 15 | SQLite 링크 | canonical backend feature 4종 중 최대 하나: `sqlite-bundled`, `sqlite-system`, `sqlcipher-bundled`, `sqlcipher-system` | 기본 `bundled`는 `sqlite-bundled` alias. core의 backend 없는 빌드는 허용 |
-| 16 | 에러 모델 | thiserror (`roomrs::Error`) | |
+| 14 | 암호화 | SQLCipher opt-in backend | `sqlcipher-bundled` 또는 `sqlcipher-system` 선택. 암호화 키 미설정 시 평문 DB도 사용 가능 |
+| 15 | SQLite 링크 | canonical backend feature 4종 중 최대 하나: `sqlite-bundled`, `sqlite-system`, `sqlcipher-bundled`, `sqlcipher-system` | 기본은 `sqlite-bundled`. `bundled`/`cipher` alias와 core의 backend 없는 빌드는 유지 |
+| 15b | 기본 feature | `sqlite-bundled`, `async`, `tokio`, `live`, `time`, `uuid`, `json` | backend alias와 다른 canonical backend는 기본 목록에서 제외 |
+| 16 | 에러 모델 | thiserror 단일 `roomrs::Error` + 구조화 `ErrorPath`·`ErrorAdvice` | `Error` variant 호환 유지. 모든 오류는 원인 하위 시스템과 권장 조치 제공(§12) |
 | 16b | 운영 훅 | `.on_create/.on_open/.query_logger` | Room Callback/QueryCallback 대응 |
 | 17 | 라이선스 | MIT / Apache-2.0 듀얼 | |
 | 18 | 배포 | crates.io 공개 | 최초 공개 버전은 `0.1.0` |
 | 19 | 문서 범위 | 풀 기능 아키텍처 설계서 | 0.1.0 전체 기능 기준 |
 | 20 | 이름 | **roomrs** | |
 | 21 | 스냅샷 저장 모델 | **버전별 파일 `[db이름].[버전].json`**(고정 디렉토리 `migrations/schema/`) | db이름 = `#[database]` 구조체명 snake_case(§7.2) |
-| 21b | 스냅샷 생성·검증 | `#[database]`가 **export 테스트를 생성** — `cargo test` 시 현재 버전 스냅샷 파일 생성/스테일 검증 | proc-macro 제약은 §7.1 참조 |
+| 21b | 스냅샷 생성·검증 | custom `cfg(roomrs_export)` harness는 명시 CLI에서만 활성화 | 생성은 명시 export API·registry가 담당한다. proc-macro 제약은 §7.1 참조 |
 | 21c | 스냅샷 내장 | 매크로가 존재하는 전 버전 스냅샷을 **압축(miniz_oxide)해 바이너리에 내장** + `include_bytes!`로 rustc 파일 의존성 등록 | §7.4/§8.4 |
 | 21d | 내장 자동 마이그레이션 | builder `.auto_migrate(true)`(옵트인) — 등록 스텝 없는 구간을 내장 스냅샷 diff의 **안전 연산**(CREATE TABLE/ADD COLUMN/CREATE INDEX)으로 자동 실행. 파괴적 구간 = 에러(destructive fallback 별도) | §8.4 |
 | 22 | 크레이트 구조 | SQL/DDL 렌더·hook·MI 소스는 **roomrs-core**에 통합 | §3 |
 | 23 | MI dedupe | **로그에 인스턴스 식별자(src) 컬럼을 두고 폴러가 자기 src를 제외해 소비** | §9.5 |
 | 24 | DDL 무효화 정책 | DML(SELECT/INSERT/UPDATE/DELETE)·무해 문장 외 = **전체 무효화**(None) | §9.2 |
 | 25 | 트랜잭션 시작 | **`BEGIN IMMEDIATE`** | 통합 풀의 checkout한 커넥션에서 실행. §10 |
-| 26 | CLI 명령 | `roomrs migrate diff / check / check-dir` | §3/§8 |
+| 26 | CLI 명령 | `cargo roomrs migrate diff / check / check-dir` | §3/§8 |
 | 27 | feature 범위 | `verify-live`·`decimal`·`migrate` feature는 제공하지 않음 | 구현된 feature만 공개. §7.5 |
-| 28 | export 생성 = 실패 | 스냅샷 export 테스트는 파일 **생성** 시에도 실패 반환("커밋 후 재빌드" 유도) | include_bytes 의존성 등록 보장. §7.4 |
+| 28 | export 후 재빌드 | 명시 export가 새 snapshot을 만들면 사용자는 후속 `cargo build`를 실행한다 | 신규 파일은 이전 매크로 전개에 등록되지 않았으므로 재전개·내장이 필요하다. §7.4 |
 | 29 | 0행 insert rowid | rowid insert는 실제 1행 성공만 허용: `changes()==0`이면 `NotFound`; do-nothing 가능 insert의 `Result<i64>`는 **컴파일 에러** | Optional rowid API는 범위 밖. §5.2/§12c |
 | 30 | LiveQuery 값 적재 | recv/Iterator/Stream 값 소비는 **keep-latest 단일 슬롯**; subscribe 콜백은 순차 호출 유지 | 느린 값 소비자는 중간 상태를 건너뛰고 최신 상태를 받음. §5.6 |
-| 31 | in-memory live 잠금 | shared-cache in-memory의 일반·노티파이어 연결은 **`read_uncommitted=1`** | in-memory 전용 절충. §10 |
-| 31b | in-memory write 직렬화 | in-memory DB의 **일반 풀은 1커넥션으로 고정**하고 notifier 전용 연결만 별도 유지 | `SQLITE_LOCKED` 경합 방지. §10 |
+| 31 | in-memory live 잠금 | shared-cache in-memory의 일반 풀 연결은 **`read_uncommitted=1`** | in-memory 전용 절충. 전용 live 연결 없음(결정 51). §10 |
+| 31b | in-memory write 직렬화 | in-memory DB의 **일반 풀은 1커넥션으로 고정** (live worker 도 동일 풀 checkout) | `SQLITE_LOCKED` 경합 방지. 전용 live 연결 없음(결정 51). §10 |
 | 32 | view watch 의존성 | 추출 이름을 `sqlite_master`의 실제 table과 대조; view·미존재 객체면 **`UnknownDependencies`**, 사용자가 `.watching(...)`으로 명시 | §5.6 |
 | 33 | 생성 SQL 식별자 | 생성 SQL 식별자에 U+0022(`"`)가 있으면 **원인 span 컴파일 에러** | 자동 escaping은 범위 밖 |
 | 34 | 생성 async Future 수명 | DAO 생성 Future는 소유값만 캡처해 **`Send + 'static`** 보장 | `tokio::spawn(dao.find(...))` 직접 지원. §2.4/§5.2 |
@@ -72,6 +73,26 @@
 | 36 | 쿼리빌더 LIKE ESCAPE | `like_escaped(pattern, escape: char)` — 패턴과 단일 Unicode escape 문자를 모두 파라미터 바인딩 | `%`·`_` 리터럴 검색 지원. §5.8 |
 | 37 | 풀 API | `connections`·`with_connection`만 제공 | 통합 풀의 단일 커넥션 모델을 노출. §10 |
 | 38 | 행 필터 무효화 | `InvalidationFilter`: 단일 테이블·AND/OR 그룹·`eq`/`neq`/NULL predicate | 단일 프로세스 `preupdate_hook`가 OLD/NEW를 매칭. 복잡 query 자동 분석 금지. §5.6/§9.2 |
+| 39 | 스냅샷 불변성·생성 권한 | 확정 version snapshot은 **덮어쓰지 않는다**. snapshot JSON 생성 권한은 `cargo roomrs schema export`에만 둔다 | `cargo test`·`cargo build`·매크로는 파일을 생성·수정하지 않는다. 수동 version은 불일치 시 version 증가가 필요하다. §7.4 |
+| 40 | 복합 PRIMARY KEY | 복수 `#[pk]` = 필드 선언 순서 table-level `PRIMARY KEY (…)` | 단일 `#[pk]`는 컬럼-level 유지(INTEGER PK affinity). `#[pk(autoincrement)]`와 다른 `#[pk]` 동시 사용 = 컴파일 에러 |
+| 41 | table-level UNIQUE | `#[entity(unique(col, …))]` 반복 가능 | 단일 필드 `#[column(unique)]` 유지. 기존 데이터 중복 시 생성 실패 가능 → 기존 DB는 수동 migration |
+| 42 | 복합·정렬·partial INDEX | `#[entity(index(name=…, columns(c, d desc), where=…))]` | 컬럼 순서 보존, ASC/DESC, partial `where` SQL 문자열. 일반 CREATE INDEX = auto 후보, UNIQUE INDEX = 수동 |
+| 43 | 복합 FOREIGN KEY | `#[entity(foreign_key(columns(…), references="t(c…)", on_delete=…, on_update=…))]` | 기존 table 추가는 대개 재작성 → 수동 migration |
+| 44 | CHECK 제약 | `#[entity(check = "expr")]` 반복 가능 | SQL 식 원문. 변경 시 수동 migration |
+| 45 | custom SQL type | `#[column(sql_type = "…")]` — DDL type name 오버라이드 | ToSql/FromSql은 사용자 책임. `"` 금지 |
+| 46 | trigger SQL file 훅 | `#[entity(trigger = "path.sql")]` 반복 가능 | 경로+내용 hash를 snapshot에 포함. 적용은 수동 forward migration만 |
+| 47 | 프로젝트 schema export 진입점 | 설치형 Cargo subcommand `cargo roomrs schema export` | 소비자 package의 schema target을 자동 준비·실행해 등록된 모든 `#[database]`를 export. build.rs 호출 금지. §7.4 |
+| 48 | `version = auto` | export 명령이 DB별 최신 snapshot hash와 엔티티 hash를 비교해 revision을 결정 | 일치면 no-op, 변경이면 다음 정수 version snapshot과 `{from}_{to}_roomrs_auto.sql` forward migration 초안을 함께 생성. 수동 `version = N`은 유지. §7.4 |
+| 49 | LiveQuery debounce | DB 전역 `live_debounce(Duration)` 기본값은 **250ms**. observer는 `.debounce(Duration)`로 개별 override 가능 | observer에 개별값이 없으면 DB 전역값을 복사한다. 첫 무효화가 고정 coalesce 창을 시작하며, 창 안의 추가 무효화는 만료를 연장하지 않고 병합만 한다. 초기 emit·rebind·watching은 즉시. §9.3 |
+| 50 | LiveQuery invalidation 집계 | commit/문장 단위 이벤트를 observer debounce 창에서 병합 | 행 필터는 preupdate OLD/NEW 값을 사용하고 재조회 예약은 결정 49를 따른다. §9.2 |
+| 51 | LiveQuery reader worker pool | notifier는 이벤트 병합·예약만, 재조회는 bounded worker가 기존 통합 read/write 풀에서 checkout해 담당 | 전용 read-only connection은 만들지 않는다. 기본 `notifier_readers = min(2, connections)`, `.notifier_readers(N)`로 override. §9.3 |
+| 52 | LiveQuery 다중 filter | `watch_*_filtered`는 복수 `InvalidationFilter`를 받고, 하나라도 변경 행에 매칭되면 재조회 | OR만 지원한다. filter 객체는 계속 단일 테이블·AND/OR group 모델을 유지한다. §5.6 |
+| 53 | SQLite schema DSL 정합 | 기존·신규 schema DSL은 `DSL → DDL → snapshot → hash → diff → auto migration 분류`를 모두 통과 | 불완전한 메타는 자동 migration 금지·수동 migration 안내. §7/§8 |
+| 54 | SQLite 고급 schema DSL | `collate`, generated column, `strict`, `without_rowid`, index column `COLLATE` 지원 | VIEW·FTS5·R*Tree 전용 DSL은 제공하지 않는다. VIEW는 직접 query struct + 수동 SQL로 충분. §5.1 |
+| 55 | schema export target 탐색 | `#[database]`가 custom `cfg(roomrs_export)`용 `#[roomrs_export]` 진입점을 자동 생성하고 CLI가 lib·bin target을 test harness로 실행 | 사용자 source 추가·main hook 불필요. 일반 build/test는 export 코드를 컴파일·실행하지 않고 파일을 쓰지 않는다. §7.4 |
+| 56 | entity-level PRIMARY KEY | `#[entity(primary_key(field, ...))]`로 단일·복합 PK 선언 가능 | 필드 `#[pk]`와 함께 쓰면 필드 선언 순서 목록과 정확히 같아야 한다. 다르면 일반 컴파일은 유지하고 `schema export/check`에서 오류와 수정 조언을 반환한다. §5.1 |
+| 57 | DB open 스키마 보존 | DB open은 선언된 migration 외 schema 객체를 자동 탐색하거나 DROP하지 않는다 | 기존 DB 정리는 사용자 forward migration 책임이다. §8·§9.5 |
+| 58 | CLI binary | 설치형 `cargo-roomrs` 하나만 제공 | schema와 migration 명령을 `cargo roomrs ...` 아래 통합해 설치·컴파일·문서 경로를 하나로 유지한다. §3·§8 |
 
 ---
 
@@ -144,7 +165,7 @@ roomrs/
 │  ├─ roomrs-async/          # 비동기 파사드: 런타임 무관 Future/Stream + tokio 통합(선택)
 │  ├─ roomrs-macros/         # proc-macro: #[entity] #[dao] #[query] #[database] …
 │  ├─ roomrs-migrate/        # SchemaSnapshot 모델 · diff · 압축 · 코드젠 (매크로와 **공유 크레이트**)
-│  └─ roomrs-cli/            # roomrs migrate diff / check
+│  └─ roomrs-cli/            # cargo roomrs schema / migrate
 ├─ examples/  todo-sync · todo-async · live-query · multi-process · mobile-ffi
 └─ xtask/
 ```
@@ -207,12 +228,43 @@ pub struct User {
     #[column(ignore)]                  // Room @Ignore 대응
     pub transient: Option<String>,
 }
+
+// 복합 PK · table UNIQUE · index · FK · CHECK · sql_type · trigger (결정 40–46)
+#[entity(
+    table = "t_payment",
+    unique(store_id, external_payment_id),
+    index(name = "idx_payment_store_created", columns(store_id, created_at desc)),
+    index(name = "idx_payment_active", columns(store_id), where = "deleted_at IS NULL"),
+    foreign_key(
+        columns(store_id, customer_id),
+        references = "customers(store_id, customer_id)",
+        on_delete = "CASCADE",
+        on_update = "NO ACTION"
+    ),
+    check = "amount >= 0",
+    trigger = "migrations/triggers/t_payment_audit.sql",
+)]
+struct Payment {
+    #[pk]
+    store_id: String,
+    #[pk]
+    payment_id: String,
+    customer_id: String,
+    external_payment_id: String,
+    #[column(sql_type = "DECIMAL(12,2)")]
+    amount: Money,
+    created_at: String,
+    deleted_at: Option<String>,
+}
 ```
 - **속성 표기 규칙**: 무시 필드는 `#[column(ignore)]`로 표기한다. `#[pk]`/`#[json]`은 짧은 표기를 유지한다.
+- **PRIMARY KEY[결정 40·56]**: 필드 `#[pk]` 또는 `#[entity(primary_key(field, ...))]`로 선언한다. 복수 필드 PK는 선언 목록 순서 table-level `PRIMARY KEY`, 단일 PK는 컬럼-level이다. 두 표기를 함께 쓰면 필드 선언 순서의 `#[pk]` 목록과 entity-level 목록이 정확히 같아야 하며, 다르면 `schema export/check`에서 오류를 반환한다. `#[pk(autoincrement)]`와 다른 PK 동시 = 컴파일 에러.
+- **table UNIQUE / INDEX / FK / CHECK / trigger[결정 41–44,46]**: 엔티티 수준 속성. UNIQUE·FK·CHECK·trigger 변경 및 UNIQUE INDEX = 수동 migration. 일반 CREATE INDEX = auto 후보.
+- **custom sql_type[결정 45]**: DDL type name만 오버라이드. 직렬화는 `ToSql`/`FromSql`.
 - **autoincrement PK 의미론**: `#[pk(autoincrement)]` 필드는 생성 SQL에서 항상 생략되고 새 rowid가 반환된다. PK를 명시 삽입해야 하면 `#[insert(keep_pk)]`를 사용한다.
 - **0행 insert 반환**: 0행 성공이 가능한 충돌 정책과 `Result<i64>` 반환을 함께 선언하면 컴파일 에러다.
 - **JSON Option**: `#[json] Option<T>`의 `None`은 SQL NULL로 저장한다. JSON text `null`도 읽을 때 `None`으로 해석한다. 따라서 `T = ()`처럼 JSON 표현 자체가 `null`인 `Some(T)`는 `None`으로 읽힌다.
-- WITHOUT ROWID 테이블은 0.1.0에서 지원하지 않으며 명시적 컴파일 에러를 반환한다.
+- **collate / generated / STRICT / WITHOUT ROWID / index COLLATE[결정 54]**: `#[column(collate)]`, `#[column(generated, stored)]`, `#[entity(strict)]`, `#[entity(without_rowid)]`, index `columns(name collate nocase)`. generated 는 DEFAULT·PK·autoincrement 와 비호환. 기존 테이블의 advanced 기능 변경은 자동 migration 금지·수동 안내.
 
 ### 5.2 DAO — 매크로가 동기/비동기 둘 다 생성
 
@@ -254,6 +306,8 @@ pub struct AppDb;
 let db = AppDb::builder()
     .sqlite("app.db")                     // WAL 기본
     .connections(4)                       // 통합 풀 크기
+    .live_debounce(Duration::from_millis(250)) // LiveQuery 전역 기본값(생략해도 250ms)
+    .notifier_readers(2)                  // LiveQuery 재조회 worker 수(기본 min(2, connections))
     .busy_timeout(Duration::from_secs(5)) // 프로세스 내·외부 writer 경합 대기
     .queue_timeout(Duration::from_secs(2)) // 통합 풀 checkout 제한
     .migrate(MigrationPolicy::Auto)
@@ -306,6 +360,7 @@ impl<T> LiveQuery<T> {
     // 제어
     pub fn rebind(&self, params: &[&dyn ToSql]) -> Result<()>; // 같은 SQL, 바인딩 교체(§5.6b)
     pub fn watching(self, tables: &[&str]) -> Self;        // 의존 명시(직접 쿼리용)
+    pub fn debounce(self, delay: Duration) -> Self;        // observer별 재조회 지연(기본 250ms, 결정 49)
 }
 
 pub struct InvalidationFilter { /* 단일 테이블 행 필터 */ }
@@ -327,8 +382,9 @@ impl FilterGroup {
 - `rebind` 는 SQL이 고정된 DAO watch에도 유효(바인딩 파라미터가 있는 경우).
 - **수명 계약**: guard drop은 신규 콜백 시작을 차단한다. 이미 실행 중인 콜백은 최대 1건 완료될 수 있다. 재조회는 노티파이어 스레드로 라우팅되며 epoch로 이전 세대 결과를 폐기한다.
 - **값 전달 계약[결정 30]**: 수신 대기열은 keep-latest 단일 슬롯이다. 생산자가 소비자보다 빠르면 미소비 중간 상태를 최신 상태로 덮어쓴다. `recv`/`try_recv`/`into_stream` 모두 같은 계약을 따른다.
+- **DB 전역·observer별 debounce[결정 49]**: Builder의 `live_debounce(Duration)` 전역 기본값은 생략 시 250ms다. `LiveQuery`는 생성 시 이 값을 사용하고, `.debounce(Duration)`가 있으면 해당 observer 값이 전역값을 override한다. 첫 무효화가 observer의 고정 coalesce 창을 시작하며, 창 안의 추가 무효화는 만료 시각을 연장하지 않고 병합만 한다. notifier는 가장 이른 만료 시각까지 대기해 만료 observer만 재조회한다.
 - `let _ = q.subscribe(…)` 는 즉시 drop되어 구독이 끝난다. 구독 guard를 변수나 구조체 필드에 보관해야 한다.
-- **행 필터 구독**: 직접 쿼리와 DAO는 `watch_*_filtered(..., filter)` 경로로 `InvalidationFilter`를 받는다. group 내부 predicate는 AND, group 사이는 OR다. `eq`/`neq`의 NULL 의미는 SQL과 같아 `is_null`/`is_not_null`을 별도로 쓴다. INSERT는 NEW, DELETE는 OLD, UPDATE는 OLD 또는 NEW가 filter에 매칭될 때만 재조회한다.
+- **행 필터 구독**: 직접 쿼리와 DAO는 `watch_*_filtered(..., filters)` 경로로 하나 이상의 `InvalidationFilter`를 받는다. filter 객체 중 하나라도 변경 행에 매칭되면 재조회(OR)한다. filter 객체 내부의 group은 AND/OR 모델을 유지한다. `eq`/`neq`의 NULL 의미는 SQL과 같아 `is_null`/`is_not_null`을 별도로 쓴다. INSERT는 NEW, DELETE는 OLD, UPDATE는 OLD 또는 NEW가 filter에 매칭될 때만 재조회한다. filter 객체 간 AND·중첩 boolean expression은 지원하지 않는다.
 - filter 없는 기존 `watch_*`는 의존 테이블 단위 무효화를 유지한다. JOIN·subquery·함수 등 복잡 query 자동 분석은 하지 않는다. 필요한 테이블마다 명시 filter를 제공하지 않으면 해당 테이블은 보수적으로 전체 무효화한다.
 
 ### 5.6b 페이지네이션 패턴
@@ -410,21 +466,36 @@ Rust proc-macro는 **자신이 붙은 아이템의 토큰만** 볼 수 있다. `
 - 정책: 파싱 실패 = **컴파일 에러가 아니라 "검증 스킵 + 경고"**(사용자를 막지 않음). 명시적 스킵은 `#[query(unchecked, "…")]`.
 
 ### 7.4 스냅샷 생성·스테일 대응
-- **생성**: proc-macro는 엔티티 필드를 볼 수 없어 전개 시 스냅샷을 직접 만들 수 없다(§7.1 제약).
-  대신 `#[database]`가 **export 테스트**(`__roomrs_schema_export_<db>`)를 생성한다 —
-  `cargo test` 실행 시 현재 버전 스냅샷 파일이 부재하면 **생성 후 테스트 실패**("커밋 후 재빌드" 안내 —
-  생성을 성공 처리하면 `include_bytes!` 에 미등록된 신규 파일이 재전개를 트리거하지 못해
-  SNAPSHOT_HASH·내장 체인이 스테일해진다, 결정 28), 존재하는데 코드와 다르면 **파일 갱신 후 테스트 실패**
-  (CI에서 스테일 커밋 차단, 로컬에서는 재생성). `ROOMRS_SCHEMA_EXPORT=0` 으로 비활성.
-  proc-macro는 디렉토리를 의존성으로 등록할 수 없다 — 신규 파일 추가 후 첫 재빌드는 export 테스트 실패가
-  강제하는 재빌드로 해결되는 구조이며, 이 한계는 rustdoc 에도 명시한다.
+- **생성 권한[결정 39]**: snapshot JSON을 생성·수정할 수 있는 명령은 `cargo roomrs schema export` 하나다.
+  `cargo test`, `cargo build`, proc-macro, `build.rs`와 런타임 API는 파일을 만들거나 고치지 않는다.
+  auto version의 forward migration SQL 초안도 이 명령만 생성한다. `cargo test`·`cargo build`는 JSON·SQL 어느 파일도 쓰지 않는다.
+- **프로젝트 schema target[결정 47·55]**: `cargo roomrs`는 설치형 `cargo-roomrs` 실행파일이다. `schema export/check`는
+  Cargo metadata로 대상 package와 lib·일반 bin target을 정하고, `roomrs_export` custom cfg를 켠 test harness를 실행한다.
+  `#[database]`는 이 cfg에서만 `#[roomrs_export]` 진입점을 자동 생성하며, 진입점은 해당 target에 링크된
+  `inventory`의 모든 `SchemaExportEntry`를 순회한다. 사용자 `lib.rs`나 `main()` 변경 없이 동작한다.
+  일반 `cargo build`·`cargo test`에는 custom cfg가 없으므로 export 진입점이 컴파일·실행되지 않고 파일을 쓰지 않는다.
+  workspace는 현재 package가 기본이며 `--package <name>` 또는 `--workspace`로 범위를 고른다. workspace 모드에서
+  `#[database]`가 없는 package는 건너뛰고, 명시 선택한 단일 package에 DB가 없으면 오류를 반환한다.
+- **자동 등록**: `#[database]`는 `DatabaseSpec` export entry와 custom cfg 전용 진입점을 함께 생성한다.
+  CLI가 선택한 target의 진입점은 링크된 모든 entry를 순회한다. 파라미터 검증·attribute 검증은 항상 유지한다.
+- **수동 version**: `#[database(version = N)]`은 `[db].N.json`이 없으면 export가 생성한다. 파일 hash가 같으면 no-op이다.
+  hash가 다르거나 파일이 파손되면 아무 파일도 덮어쓰지 않고 실패한다. 사용자는 `N`을 올린 뒤 다시 export한다.
+- **자동 version[결정 48]**: `#[database(version = auto)]`은 package에 저장된 해당 DB의 최대 version을 현재 version으로 사용한다.
+  snapshot이 없으면 `1`을 만든다. 최대 version snapshot hash가 엔티티 hash와 같으면 no-op이고, 다르면 다음 정수 version JSON과 `migrations/{from}_{to}_roomrs_auto.sql` forward migration 초안을 만든다.
+  export 뒤 `cargo build`가 새 파일을 읽어 version·내장 snapshot을 갱신한다. 여러 DB는 모두 preflight한 뒤 오류가 없을 때만 누락·다음 version 파일과 SQL 초안을 쓴다.
+  같은 이름의 migration SQL이 있으면 덮어쓰지 않고 실패한다. `diff_sql`이 파괴적·모호 변경을 표시하면 SQL에 TODO를 남기고 export는 비성공 상태로 끝내 사용자의 검토·보완을 요구한다.
+- **검사와 CI**: `cargo roomrs schema check`는 registry의 모든 DB와 snapshot을 비교하지만 쓰지 않는다. CI 순서는
+  `cargo roomrs schema check` → `cargo test --workspace` → `cargo build --workspace`다. test는 snapshot 부재·불일치면 실패할 수 있지만 파일 시스템을 변경하지 않는다.
+- **불변성**: 과거 스냅샷 수정은 기존 배포 DB와 migration 이력을 분기시키므로 금지한다.
 - **유효성 체크(빌드 시)**: `#[database]` 전개가 존재하는 전 버전 스냅샷을 로드해
   버전 단조성·파스 유효성을 검증. **파일이 존재하는데 파손 = 컴파일 하드 에러** —
   "부재 = 스킵"과 구분한다.
 - 스테일 3중 방어(유지):
-  (a) export 테스트 + `roomrs migrate check`(CLI/CI — 파일 기반 해시 비교·디렉토리 검사).
+  (a) `cargo roomrs schema check` + `cargo roomrs migrate check`(CLI/CI — registry·파일 기반 해시 비교·디렉토리 검사).
   (b) `Database::build()` 런타임 검증 — 매크로가 임베드한 현재 버전 스냅샷 해시 vs 런타임 엔티티 메타 해시 비교, 불일치 시 명확한 에러(§5.4).
   (c) 스냅샷 파일 부재 시: 정적 스키마 대조는 경고와 함께 스킵(신규 프로젝트 온보딩 마찰 방지), 파라미터 검증은 항상 수행.
+  단, `Database::build()`는 현재 버전 스냅샷이 매크로 전개 때 부재했다면 `SnapshotStale` 오류로
+  실행을 중단하고 `cargo roomrs schema export` 후 재빌드를 안내한다.
 
 ### 7.5 동적 경로
 - 쿼리빌더/직접 쿼리는 prepare 시 런타임 검증한다.
@@ -453,13 +524,15 @@ pub trait Migration {
   각 원본 파일은 `include_bytes!`로 의존성 등록(§7.2) — 사장 상수는 링커가 제거.
 - **자동 마이그레이션(옵트인)**: builder `.auto_migrate(true)`.
   `plan_chain`에 갭이 있는 구간을 내장 스냅샷의 연속 버전 diff로 메운다.
-  - **안전 연산만 자동 실행**: CREATE TABLE · ADD COLUMN(NOT NULL은 DEFAULT 보유 시) · CREATE INDEX.
-  - 파괴적 연산(DROP/타입 변경/rename)이 필요한 구간 = **명확한 에러**
+  - **안전 연산만 자동 실행**: CREATE TABLE · ADD COLUMN(nullable, 또는 NOT NULL + `default_sql` 보유) · CREATE INDEX · 유효 rename 힌트.
+  - 컬럼 `default_sql`은 스냅샷·hash에 보존된다(결정 53). DEFAULT 변경·제약 변경·삭제·타입 변경·추정 rename은 자동 실행 금지.
+  - 파괴적 연산(DROP/타입·DEFAULT 변경/제약 재작성/이름 추정 rename)이 필요한 구간 = **명확한 에러**
     (수동 스텝 등록 또는 `fallback_to_destructive_migration` 유도). 자동 실행 금지 원칙(§1.2) 유지.
+  - 구형 스냅샷(필드 부재)은 `default_sql = None`으로 읽고, 자동 판정 불가면 재생성(`cargo roomrs schema export`) 또는 수동 migration을 안내한다.
   - 등록 스텝이 있는 구간은 항상 등록 스텝이 우선 — 내장 diff는 갭 폴백.
-- **CLI**: `roomrs migrate diff <old.json> <new.json> [out.sql]`(초안),
-  `roomrs migrate check <a.json> <b.json>`(해시 비교),
-  `roomrs migrate check-dir <schema_dir> <db이름>`(버전 파일 스캔 — 단조성·파스·연속 diff 검증).
+- **CLI**: `cargo roomrs migrate diff <old.json> <new.json> [out.sql]`(초안),
+  `cargo roomrs migrate check <a.json> <b.json>`(해시 비교),
+  `cargo roomrs migrate check-dir <schema_dir> <db이름>`(버전 파일 스캔 — 단조성·파스·연속 diff 검증).
 
 ---
 
@@ -479,31 +552,29 @@ pub trait Migration {
 - **탈출구 경고[B-7]**: `db.run_sync().with_connection()` 으로 사용자가 자기 preupdate_hook을 등록하면 그 커넥션의 roomrs hook이 **교체**되어(커넥션당 1개) 행 필터 감지가 조용히 죽는다 — API 문서에 굵은 경고 + 전체 일반 커넥션에 hook을 재설치하는 `db.rearm_hooks()` 복구 제공.
 
 ### 9.3 InvalidationTracker
-(동일 — 테이블→구독 역인덱스, 디바운스 병합, 정적=컴파일 타임 `DEPENDS_ON`, 동적=런타임 수집.)
+테이블→구독 역인덱스와 정적 `DEPENDS_ON`·동적 런타임 의존 수집을 사용한다. notifier는 DB당 하나이며 이벤트 수신, observer별 고정 coalesce 예약, worker 작업 제출만 한다. DB 전역 debounce는 Builder `live_debounce`로 정하고, observer `.debounce`가 있으면 그것을 우선한다. 재조회는 bounded `roomrs-live-worker-{n}`이 기존 통합 read/write 풀에서 checkout하여 수행하고, 완료 즉시 반납한다. 전용 read-only 연결·별도 DB 풀은 만들지 않는다.
 
 ### 9.4 백프레셔/정합성
 (동일 — 최신값 우선, 최종 일관성 명시.)
 
-### 9.5 멀티 프로세스 무효화 — 로드맵
+### 9.5 멀티 프로세스 무효화
 
 | 중요도 | 단계 | 상태 | 내용 |
 |---|---|---|---|
 | P0 | 단일 프로세스 테이블 무효화 | **구현됨** | commit 성공 뒤 영향 테이블을 Tracker에 방출 |
 | P0 | 단일 프로세스 행 필터 | **구현됨** | `preupdate_hook` OLD/NEW와 `InvalidationFilter`로 관련 변경만 재조회 |
-| P0 | legacy trigger·로그 정리 | **미구현** | 구버전 `__roomrs_inv_*` trigger·로그 테이블을 탐지·삭제해 `roomrs_src()` 부재로 인한 write 실패를 막는 hotfix |
-| P1 | Filter API 대칭 | **미구현** | `watch_one/all/optional_filtered`, async, DAO macro까지 filtered watch API 확장 |
-| P1 | 필터 스키마 검증 | **미구현** | 구독 등록 때 filter table·column 존재를 검증해 오타에 의한 조용한 미통지를 차단 |
-| P1 | 대량 변경 보호 | **미구현** | row event 임계치 초과 시 테이블 전체 무효화로 전환해 메모리·노티파이어 지연을 제한 |
-| P2 | 무효화 관측성 | **미구현** | filter 매칭·table fallback·debounce/drop 통계를 trace/debug로 제공 |
-| P3 | IPC 이벤트 브로커 | **미구현** | roomrs 커넥션 commit 성공 뒤 테이블/행 변경 이벤트를 프로세스 간 전파 |
-| P3 | IPC 수신 Tracker 연동 | **미구현** | 수신 프로세스가 기존 필터·디바운스·재조회 흐름을 재사용 |
-| P4 | raw SQLite writer 감지 | **미구현** | IPC 프로토콜에 참여하지 않는 writer 관찰. SQLite 확장·WAL 감시 등 별도 설계 필요 |
-| — | SQLite trigger·변경 로그·poller | **제거됨** | write 경로 영구 부하·스키마 잔재·외부 writer 호환 문제로 미사용 |
+| P1 | Filter API 대칭 | **구현됨** | `watch_all/optional/scalar_filtered` sync·async + DAO `InvalidationFilter` 인자 |
+| P1 | 다중 LiveQuery filter | **구현됨** | 복수 `InvalidationFilter` OR 매칭. filter 간 AND·중첩 boolean expression은 제외(결정 52). |
+| P1 | 필터 스키마 검증 | **구현됨** | 등록 시 table/column 존재 검증. 실패 = `Error::InvalidationFilter` (`path=live_query`, `advice=check_configuration`) |
+| P1 | observer debounce | **구현됨** | DB 전역 `.live_debounce`(기본 250ms) + observer `.debounce` override, 고정 coalesce (결정 49) |
+| P1 | live worker pool | **구현됨** | notifier 스케줄 전용 + 통합 풀 checkout worker, `.notifier_readers(N)` (결정 51) |
+| P2 | 무효화 관측성 | **구현됨** | `Database::live_metrics()` → `LiveMetrics`(events/coalesce/queue/refresh_ok·err/stale). 파라미터·행 데이터 미포함 |
+| — | 다중 프로세스 LiveQuery 무효화 | **현재 미지원** | 단일 프로세스 roomrs 연결만 관찰한다. trigger·변경 로그·poller는 사용하지 않는다. |
 
-현재는 단일 프로세스까지만 지원한다. IPC 브로커 구현 시 roomrs 커넥션의 commit 성공 뒤 이벤트를 전송하고, 수신 프로세스의 Tracker에 전달한다.
+다중 프로세스·raw SQLite writer 관찰은 공개 로드맵 범위 밖이다. 배경, trigger 방식의 제외 이유, 재검토 조건은 `docs/MULTI_PROCESS_INVALIDATION.md`에 보관한다.
 
-### 9.6 노티파이어 스레드
-(동일 — DB당 1개, 수신→디바운스→재조회→sync 채널/콜백 + 런타임 중립 async 채널 팬아웃. **재조회 전용 커넥션 1개 고정**(일반 풀과 경합 없음). rebind 재조회도 이 스레드로 라우팅[C-8].)
+### 9.6 노티파이어·재조회 worker
+DB당 notifier 스레드는 1개다. notifier는 수신→고정 coalesce→worker 제출만 수행한다. 재조회 worker 수 기본값은 `min(2, connections)`이고 Builder `.notifier_readers(N)`로 변경한다. worker는 기존 통합 read/write 풀에서만 커넥션을 checkout하며 재조회 후 즉시 반납한다. worker가 느려도 notifier와 다른 observer 작업이 막히지 않아야 하며, 해제·종료·generation 변경 뒤 도착한 결과는 폐기한다. rebind 재조회도 이 경로로 라우팅한다.
 
 ---
 
@@ -520,7 +591,15 @@ pub trait Migration {
 (동일 — rusqlite `ToSql`/`FromSql` 위임, `#[json]`, `#[derive(SqlType)]`. `time`/`uuid` 기본 on.)
 
 ## 12. 에러 모델
-(동일 + 추가: `Error::SnapshotStale`(§7.4), `Error::QueueTimeout`(풀 checkout), `Error::UnknownDependencies`.)
+
+- 공개 fallible API는 단일 `roomrs::Result<T, roomrs::Error>`를 반환한다.
+- `Error`는 `thiserror`로 Display와 source chain을 유지한다. 기존 variant(`Sqlite`, `Migration`, `Config` 등)는 호환을 위해 유지한다.
+- 모든 `Error`는 `error.path() -> ErrorPath`와 `error.advice() -> ErrorAdvice`를 제공한다.
+  - `ErrorPath`는 `database`, `query`, `connection_pool`, `migration`, `schema_snapshot`, `live_query`, `configuration`, `serialization`, `internal` 중 오류 발생 하위 시스템을 나타낸다.
+  - `ErrorAdvice`는 retry, DB·쿼리·설정 점검, migration 검토, snapshot 재생성, live dependency 선언, 로그 확인, DB 재오픈 중 권장 다음 조치를 나타낸다.
+- 호출자는 display 문자열을 파싱하지 않고 `ErrorPath`·`ErrorAdvice`로 로그, UI, 재시도 정책을 분기한다.
+- `Error::SnapshotStale`(§7.4), `Error::QueueTimeout`(풀 checkout), `Error::UnknownDependencies`를 포함한다.
+- `Drop`, 전용 스레드, callback, FFI처럼 `Result`를 반환할 수 없는 경로의 복구·로그 정책은 [반환 불가 경로와 크래시 정책](docs/RETURN_UNAVAILABLE.md)을 따른다.
 
 ## 13. 플랫폼
 (동일 — 데스크톱 1급 + 모바일 FFI. MSRV **1.85/Edition 2024** 를 CI 매트릭스에 포함.)
@@ -529,19 +608,19 @@ pub trait Migration {
 
 | feature | 기본 | 설명 |
 |---|---|---|
-| `sqlite-bundled` | on(`bundled` 경유) | rusqlite가 SQLite를 함께 빌드 |
+| `sqlite-bundled` | on | rusqlite가 SQLite를 함께 빌드 |
 | `sqlite-system` | off | OS package 또는 vcpkg SQLite에 링크 |
 | `sqlcipher-bundled` | off | vendored OpenSSL을 포함한 SQLCipher를 함께 빌드 |
 | `sqlcipher-system` | off | OS package 또는 vcpkg SQLCipher에 링크 |
-| `bundled` | on | `sqlite-bundled` 하위 호환 alias |
+| `bundled` | off | `sqlite-bundled` 하위 호환 alias |
 | `cipher` | off | `sqlcipher-bundled` 하위 호환 alias |
 | `async` | on | 런타임 무관 비동기 파사드. 끄면 순수 동기 |
-| `tokio` | off | tokio 통합 최적화(`async` 포함) |
+| `tokio` | on | tokio 통합 최적화(`async` 포함) |
 | `live` | on | 라이브 쿼리/무효화 |
 | `time`, `uuid` | **on** | 기본 예시가 기본 설정에서 컴파일되도록 승격[C-4] |
 | `json` | on | `#[json]` |
 
-backend canonical feature는 동시에 둘 이상 활성화할 수 없다. `roomrs-core`를 backend feature 없이 빌드하는 구성은 유지한다. Windows MSVC system backend는 vcpkg `x64-windows-static-md` 라이브러리를 사용하며, `live`에는 `SQLITE_ENABLE_PREUPDATE_HOOK`가 포함된 port가 필요하다. CI는 네 backend 각각의 check/test/clippy/fmt/doc/feature graph와 canonical backend 충돌 6쌍을 검증한다.
+backend canonical feature는 동시에 둘 이상 활성화할 수 없다. 기본 빌드는 bundled SQLite만 컴파일하며 OpenSSL을 의존하지 않는다. SQLCipher는 명시적으로 선택한 경우에만 OpenSSL과 함께 빌드된다. `roomrs-core`를 backend feature 없이 빌드하는 구성은 유지한다. Windows MSVC system backend는 vcpkg `x64-windows-static-release` community triplet의 release-only 정적 라이브러리·정적 CRT를 사용하고 Rust도 `-C target-feature=+crt-static`으로 CRT를 일치시킨다. `live`에는 `SQLITE_ENABLE_PREUPDATE_HOOK`가 포함된 port가 필요하다. CI는 기본 feature graph, 네 backend 각각의 check/test/clippy/fmt/doc/feature graph와 canonical backend 충돌 6쌍을 검증한다.
 
 
 ## 15. 0.1.0 기능 범위
@@ -557,7 +636,7 @@ backend canonical feature는 동시에 둘 이상 활성화할 수 없다. `room
 - 운영 훅 · 모바일 FFI · 선택적 SQLCipher
 
 ## 16. 테스트 전략
-실행기 3종 매트릭스 · MSRV 잡 · 통합 풀 checkout 공정성/타임아웃·동시 독점 · 모든 일반 커넥션 hook 설치 · truncate/트리거 간접 write 무효화 · 스냅샷 스테일 시나리오 · 멀티프로세스 dedupe/busy_timeout · LIKE 검색 라이브 쿼리를 검증한다.
+실행기 3종 매트릭스 · MSRV 잡 · 통합 풀 checkout 공정성/타임아웃·동시 독점 · 모든 일반 커넥션 hook 설치 · truncate/트리거 간접 write 무효화 · 스냅샷 스테일 시나리오 · `busy_timeout` · LIKE 검색 라이브 쿼리를 검증한다.
 
 ## 17. 리스크 & 완화
 | 리스크 | 완화 |
@@ -565,16 +644,14 @@ backend canonical feature는 동시에 둘 이상 활성화할 수 없다. `room
 | 자체 풀 구현 버그 | 요구 최소화(동일 권한 커넥션 N + 독점 checkout) · 동시성 스트레스 테스트 |
 | 스냅샷 스테일로 잘못된 검증 | 3중 방어(§7.4) · check CLI를 CI 필수로 |
 | sqlparser 커버리지 구멍 | 실패=스킵+경고(막지 않음) · `unchecked` · SQLite 관용구 테스트 |
-| 동시 write 경합·풀 점유(장시간 tx) | `BEGIN IMMEDIATE` · `busy_timeout` · 짧은 tx 권고 · checkout 타임아웃/진단 로그 · 멀티프로세스 스트레스 테스트 |
+| 동시 write 경합·풀 점유(장시간 tx) | `BEGIN IMMEDIATE` · `busy_timeout` · 짧은 tx 권고 · checkout 타임아웃/진단 로그 · 동시성 스트레스 테스트 |
 | 사용자 hook 교체로 보조 경로 사망 | 문서 경고 + `rearm_hooks()` · 주 경로(문장 기반)는 영향 없음 |
-| 멀티인스턴스 트리거 스큐/소실 | 버전 태깅 · Validate가 존재 검사 · 옵트인으로 노출면 축소 |
 | 비동기 클로저 미지원 | 0.1.0 제약 명시 · 후속 액터 설계 검토 |
 | system SQLite/SQLCipher ABI·compile option 차이 | 지원 버전과 compile option을 애플리케이션 acceptance 대상으로 검증 · Windows CI는 고정 vcpkg triplet와 feature graph 검사 |
 
 ## 18. 미해결 이슈
-- `#[pk]`/`#[json]` 표기 확장 여부.
 - 디바운스/폴링 기본값, N:M `through`, 타임스탬프·Uuid 저장 표준.
-- 노티파이어 재조회 병렬화 임계(`notifier_readers`).
+
 - 비동기 async-클로저 트랜잭션(후속): 커넥션 액터 + 커맨드 채널 설계.
 
 ---

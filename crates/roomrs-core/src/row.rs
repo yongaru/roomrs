@@ -27,28 +27,10 @@ macro_rules! impl_from_row_scalar {
     )+};
 }
 
-impl_from_row_scalar!(
-    bool,
-    i8,
-    i16,
-    i32,
-    i64,
-    u8,
-    u16,
-    u32,
-    f32,
-    f64,
-    String,
-    Vec<u8>
-);
+impl_from_row_scalar!(bool, i8, i16, i32, i64, u8, u16, u32, f32, f64, String, Vec<u8>);
 
 #[cfg(feature = "time")]
-impl_from_row_scalar!(
-    time::OffsetDateTime,
-    time::PrimitiveDateTime,
-    time::Date,
-    time::Time
-);
+impl_from_row_scalar!(time::OffsetDateTime, time::PrimitiveDateTime, time::Date, time::Time);
 
 #[cfg(feature = "uuid")]
 impl_from_row_scalar!(uuid::Uuid);

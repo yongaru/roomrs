@@ -40,16 +40,11 @@ struct Db;
 
 /// emit 대기 헬퍼 — 최대 2초
 fn next<T: Clone + Send + 'static>(q: &LiveQuery<T>) -> T {
-    q.recv_timeout(Duration::from_secs(2))
-        .expect("수신 에러")
-        .expect("emit 타임아웃")
+    q.recv_timeout(Duration::from_secs(2)).expect("수신 에러").expect("emit 타임아웃")
 }
 
 /// 기대값 수렴 대기 — 과잉 emit(§9.4 최종 일관성)을 흡수하며 기대값 도달 확인
-fn wait_for<T: Clone + Send + 'static + PartialEq + std::fmt::Debug>(
-    q: &LiveQuery<T>,
-    expected: T,
-) {
+fn wait_for<T: Clone + Send + 'static + PartialEq + std::fmt::Debug>(q: &LiveQuery<T>, expected: T) {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut last: Option<T> = None;
     while std::time::Instant::now() < deadline {
@@ -69,10 +64,7 @@ fn wait_for<T: Clone + Send + 'static + PartialEq + std::fmt::Debug>(
 
 fn open() -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::builder()
-        .sqlite(dir.path().join("l.db"))
-        .build()
-        .unwrap();
+    let db = Db::builder().sqlite(dir.path().join("l.db")).build().unwrap();
     (dir, db)
 }
 
@@ -86,79 +78,26 @@ fn initial_and_write_emit() {
     let live = dao.watch_by_done(false);
     assert_eq!(next(&live).len(), 0, "구독 즉시 1회 emit (빈 결과)");
 
-    dao.add(&Item {
-        id: 0,
-        name: "a".into(),
-        done: false,
-    })
-    .unwrap();
+    dao.add(&Item { id: 0, name: "a".into(), done: false }).unwrap();
     assert_eq!(next(&live).len(), 1, "write 후 재조회 emit");
 
     // 무관 테이블 write는 emit 없음
-    h.execute("INSERT INTO audit (note) VALUES ('x')", params![])
-        .unwrap();
-    assert!(
-        live.recv_timeout(Duration::from_millis(300))
-            .unwrap()
-            .is_none(),
-        "무관 테이블 = emit 없음"
-    );
+    h.execute("INSERT INTO audit (note) VALUES ('x')", params![]).unwrap();
+    assert!(live.recv_timeout(Duration::from_millis(300)).unwrap().is_none(), "무관 테이블 = emit 없음");
 }
 
-/// notifier 전용 커넥션은 write LiveQuery 실행을 거부한다.
+/// live refresh 는 통합 풀 checkout — on_open 설정·일반 SELECT 재조회 가능 (결정 51)
 #[test]
-fn notifier_rejects_write_watch() {
-    let (_d, db) = open();
-    let h = db.run_sync();
-
-    let assert_rejected = |sql: &'static str| {
-        let live: LiveQuery<i64> = h.watch_scalar(sql, &[]).watching(&["audit"]);
-        let error = live
-            .recv_timeout(Duration::from_secs(2))
-            .expect_err("write watch는 실패해야 함");
-        assert!(
-            error.to_string().contains("readonly database"),
-            "예상하지 못한 오류: {error}"
-        );
-    };
-
-    assert_rejected("INSERT INTO audit (note) VALUES ('notifier-write') RETURNING id");
-    h.execute("INSERT INTO audit (note) VALUES ('seed')", params![])
-        .unwrap();
-    assert_rejected("UPDATE audit SET note = 'notifier-write' WHERE note = 'seed' RETURNING id");
-    assert_rejected("DELETE FROM audit WHERE note = 'seed' RETURNING id");
-    assert_rejected("CREATE TABLE notifier_write (id INTEGER)");
-
-    let count: i64 = h
-        .with_connection(|conn| {
-            conn.query_row("SELECT COUNT(*) FROM audit", [], |row| row.get(0))
-                .map_err(Into::into)
-        })
-        .unwrap();
-    assert_eq!(count, 1, "notifier에서 DML이 실행되면 안 됨");
-    let table_count: i64 = h
-        .with_connection(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'notifier_write'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-        })
-        .unwrap();
-    assert_eq!(table_count, 0, "notifier에서 DDL이 실행되면 안 됨");
-}
-
-/// notifier on_open은 write를 허용한 뒤 read-only 상태를 복원한다.
-#[test]
-fn notifier_on_open_can_write_then_restores_read_only() {
+fn live_refresh_uses_unified_pool_on_open_state() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::builder()
         .sqlite(dir.path().join("l.db"))
+        .connections(2)
+        .notifier_readers(2)
         .on_open(|conn| {
             conn.execute_batch(
-                "CREATE TEMP TABLE notifier_on_open (id INTEGER); \
-                 INSERT INTO notifier_on_open DEFAULT VALUES",
+                "CREATE TEMP TABLE live_on_open (id INTEGER); \
+                 INSERT INTO live_on_open DEFAULT VALUES",
             )?;
             Ok(())
         })
@@ -166,22 +105,41 @@ fn notifier_on_open_can_write_then_restores_read_only() {
         .unwrap();
     let h = db.run_sync();
 
-    let read: LiveQuery<i64> = h
-        .watch_scalar("SELECT COUNT(*) FROM notifier_on_open NOT INDEXED", &[])
-        .watching(&["notifier_on_open"]);
-    assert_eq!(next(&read), 1, "notifier on_open write 결과");
+    let read: LiveQuery<i64> = h.watch_scalar("SELECT COUNT(*) FROM live_on_open NOT INDEXED", &[]).watching(&["live_on_open"]);
+    assert_eq!(next(&read), 1, "통합 풀 on_open TEMP 테이블을 live 재조회가 본다");
+}
 
-    let write: LiveQuery<i64> = h.watch_scalar(
-        "INSERT INTO audit (note) VALUES ('after-on-open') RETURNING id",
-        &[],
-    );
-    let error = write
-        .recv_timeout(Duration::from_secs(2))
-        .expect_err("on_open 뒤 write watch는 실패해야 함");
-    assert!(
-        error.to_string().contains("readonly database"),
-        "예상하지 못한 오류: {error}"
-    );
+/// 느린 LiveQuery 가 다른 observer 재조회를 막지 않는다 (결정 51 worker pool)
+#[test]
+fn slow_live_query_does_not_block_other_observer() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::builder().sqlite(dir.path().join("slow.db")).connections(3).notifier_readers(2).build().unwrap();
+    let h = db.run_sync();
+    h.execute("INSERT INTO items(name, done) VALUES ('seed', 0)", params![]).unwrap();
+
+    // 느린 재조회 — busy-wait 로 worker 를 점유
+    let slow: LiveQuery<i64> = h
+        .watch_scalar(
+            "WITH RECURSIVE t(x) AS ( \
+               SELECT 1 \
+               UNION ALL \
+               SELECT x+1 FROM t WHERE x < 8000000 \
+             ) \
+             SELECT COUNT(*) FROM t, items",
+            &[],
+        )
+        .watching(&["items"])
+        .debounce(Duration::ZERO);
+    let _ = next(&slow); // 초기 emit (느릴 수 있음)
+
+    let fast: LiveQuery<i64> = h.watch_scalar("SELECT COUNT(*) FROM items", &[]).debounce(Duration::ZERO);
+    assert_eq!(next(&fast), 1);
+
+    // 느린 쿼리 무효화 후 즉시 빠른 쿼리 write — 빠른 쪽이 먼저 emit 되어야 함
+    h.execute("INSERT INTO items(name, done) VALUES ('a', 0)", params![]).unwrap();
+    let t0 = std::time::Instant::now();
+    assert_eq!(next(&fast), 2, "느린 재조회와 병렬로 빠른 LiveQuery emit");
+    assert!(t0.elapsed() < Duration::from_secs(2), "빠른 observer 가 느린 쿼리에 막히면 안 됨: {:?}", t0.elapsed());
 }
 
 /// WHERE 없는 DELETE(truncate 최적화) — 문장 기반 주 경로가 잡는다 (명세 §9.2)
@@ -190,12 +148,7 @@ fn truncate_delete_invalidates() {
     let (_d, db) = open();
     let h = db.run_sync();
     let dao = h.item_dao();
-    dao.add(&Item {
-        id: 0,
-        name: "x".into(),
-        done: false,
-    })
-    .unwrap();
+    dao.add(&Item { id: 0, name: "x".into(), done: false }).unwrap();
 
     let live = dao.watch_count();
     wait_for(&live, 1);
@@ -225,13 +178,7 @@ fn trigger_indirect_write_detected() {
     assert_eq!(next(&live), 0);
 
     // items에만 쓰지만 트리거가 audit을 수정 — hook이 잡아야 함
-    h.item_dao()
-        .add(&Item {
-            id: 0,
-            name: "t".into(),
-            done: false,
-        })
-        .unwrap();
+    h.item_dao().add(&Item { id: 0, name: "t".into(), done: false }).unwrap();
     assert_eq!(next(&live), 1, "트리거 간접 write 감지");
 }
 
@@ -244,26 +191,15 @@ fn rollback_does_not_emit() {
     assert_eq!(next(&live), 0);
 
     let r: roomrs::Result<()> = h.transaction(|tx| {
-        tx.execute(
-            "INSERT INTO items (name, done) VALUES ('롤백', 0)",
-            params![],
-        )?;
+        tx.execute("INSERT INTO items (name, done) VALUES ('롤백', 0)", params![])?;
         Err(roomrs::Error::Config("의도적".into()))
     });
     assert!(r.is_err());
-    assert!(
-        live.recv_timeout(Duration::from_millis(300))
-            .unwrap()
-            .is_none(),
-        "롤백 = emit 없음"
-    );
+    assert!(live.recv_timeout(Duration::from_millis(300)).unwrap().is_none(), "롤백 = emit 없음");
 
     // 커밋되는 트랜잭션은 emit
     h.transaction(|tx| {
-        tx.execute(
-            "INSERT INTO items (name, done) VALUES ('커밋', 0)",
-            params![],
-        )?;
+        tx.execute("INSERT INTO items (name, done) VALUES ('커밋', 0)", params![])?;
         Ok(())
     })
     .unwrap();
@@ -285,9 +221,7 @@ fn drop_stops_emissions() {
     });
     // 초기 emit 폴링 수렴 — 고정 sleep은 느린 러너에서 플레이키 (L-19)
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while counter.load(std::sync::atomic::Ordering::SeqCst) == 0
-        && std::time::Instant::now() < deadline
-    {
+    while counter.load(std::sync::atomic::Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     let before = counter.load(std::sync::atomic::Ordering::SeqCst);
@@ -296,25 +230,13 @@ fn drop_stops_emissions() {
     drop(guard);
     // 프로브 구독의 수렴으로 노티파이어가 write를 처리했음을 보장 — 고정 sleep 대체 (L-19)
     let probe = h.item_dao().watch_count();
-    h.execute(
-        "INSERT INTO items (name, done) VALUES ('после', 0)",
-        params![],
-    )
-    .unwrap();
+    h.execute("INSERT INTO items (name, done) VALUES ('после', 0)", params![]).unwrap();
     wait_for(&probe, 1); // 노티파이어 write 처리 완료 시점
-    assert_eq!(
-        counter.load(std::sync::atomic::Ordering::SeqCst),
-        before,
-        "가드 drop 후 콜백 emit 0"
-    );
+    assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), before, "가드 drop 후 콜백 emit 0");
 
     // LiveQuery 자체 drop — 구독 해제 후 write가 노티파이어를 방해하지 않음
     drop(live);
-    h.execute(
-        "INSERT INTO items (name, done) VALUES ('추가', 0)",
-        params![],
-    )
-    .unwrap();
+    h.execute("INSERT INTO items (name, done) VALUES ('추가', 0)", params![]).unwrap();
 }
 
 /// rebind — 새 바인딩 재조회, 스테일 폐기 (명세 §5.6/C-8)
@@ -323,18 +245,8 @@ fn rebind_requeries() {
     let (_d, db) = open();
     let h = db.run_sync();
     let dao = h.item_dao();
-    dao.add(&Item {
-        id: 0,
-        name: "미완".into(),
-        done: false,
-    })
-    .unwrap();
-    dao.add(&Item {
-        id: 0,
-        name: "완료".into(),
-        done: true,
-    })
-    .unwrap();
+    dao.add(&Item { id: 0, name: "미완".into(), done: false }).unwrap();
+    dao.add(&Item { id: 0, name: "완료".into(), done: true }).unwrap();
 
     let live = dao.watch_by_done(false);
     let first = next(&live);
@@ -359,11 +271,9 @@ fn direct_watch_and_watching() {
     let (_d, db) = open();
     let h = db.run_sync();
 
-    let live: LiveQuery<i64> =
-        h.watch_scalar("SELECT COUNT(*) FROM items WHERE done = ?1", params![false]);
+    let live: LiveQuery<i64> = h.watch_scalar("SELECT COUNT(*) FROM items WHERE done = ?1", params![false]);
     assert_eq!(next(&live), 0);
-    h.execute("INSERT INTO items (name, done) VALUES ('d', 0)", params![])
-        .unwrap();
+    h.execute("INSERT INTO items (name, done) VALUES ('d', 0)", params![]).unwrap();
     assert_eq!(next(&live), 1);
 }
 
@@ -379,15 +289,13 @@ fn panicking_callback_does_not_kill_notifier() {
     let guard = bad.subscribe(|_| panic!("의도적 콜백 panic"));
     assert_eq!(next(&good), 0, "정상 구독 초기 emit");
 
-    h.execute("INSERT INTO items (name, done) VALUES ('p', 0)", params![])
-        .unwrap();
+    h.execute("INSERT INTO items (name, done) VALUES ('p', 0)", params![]).unwrap();
     wait_for(&good, 1); // 노티파이어 생존 — 다른 구독 emit 계속
 
     // panic 이후에도 가드 drop/추가 write 정상 (락 poison 복구)
     drop(guard);
     drop(bad);
-    h.execute("INSERT INTO items (name, done) VALUES ('q', 0)", params![])
-        .unwrap();
+    h.execute("INSERT INTO items (name, done) VALUES ('q', 0)", params![]).unwrap();
     wait_for(&good, 2);
 }
 
@@ -408,21 +316,14 @@ fn callback_reentrancy_no_deadlock() {
             return;
         }
         // 재진입: 콜백 안에서 새 구독 등록(레지스트리 락) 후 즉시 해제
-        let inner: LiveQuery<i64> = db2
-            .run_sync()
-            .watch_scalar("SELECT COUNT(*) FROM items", &[]);
+        let inner: LiveQuery<i64> = db2.run_sync().watch_scalar("SELECT COUNT(*) FROM items", &[]);
         drop(inner);
         let _ = tx.send(v);
     });
 
-    assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2)).expect("교착 없음"),
-        0,
-        "콜백 내 재진입 완료"
-    );
+    assert_eq!(rx.recv_timeout(Duration::from_secs(2)).expect("교착 없음"), 0, "콜백 내 재진입 완료");
     // 노티파이어 생존 확인
-    h.execute("INSERT INTO items (name, done) VALUES ('r', 0)", params![])
-        .unwrap();
+    h.execute("INSERT INTO items (name, done) VALUES ('r', 0)", params![]).unwrap();
     wait_for(&live, 1);
     drop(guard);
 }
@@ -434,16 +335,10 @@ fn watching_clears_pending_unknown_deps() {
     let h = db.run_sync();
 
     // CTE = 의존 추출 실패 경로 → watching으로 즉시 해소
-    let live: LiveQuery<i64> = h
-        .watch_scalar(
-            "WITH t AS (SELECT COUNT(*) AS c FROM items) SELECT c FROM t",
-            &[],
-        )
-        .watching(&["items"]);
+    let live: LiveQuery<i64> = h.watch_scalar("WITH t AS (SELECT COUNT(*) AS c FROM items) SELECT c FROM t", &[]).watching(&["items"]);
     assert_eq!(next(&live), 0, "watching 후 첫 수신 = 값 (에러 아님)");
 
-    h.execute("INSERT INTO items (name, done) VALUES ('w', 0)", params![])
-        .unwrap();
+    h.execute("INSERT INTO items (name, done) VALUES ('w', 0)", params![]).unwrap();
     wait_for(&live, 1);
 }
 
@@ -452,15 +347,9 @@ fn watching_clears_pending_unknown_deps() {
 fn unknown_deps_error_on_first_recv() {
     let (_d, db) = open();
     let h = db.run_sync();
-    let live: LiveQuery<i64> = h.watch_scalar(
-        "WITH t AS (SELECT COUNT(*) AS c FROM items) SELECT c FROM t",
-        &[],
-    );
+    let live: LiveQuery<i64> = h.watch_scalar("WITH t AS (SELECT COUNT(*) AS c FROM items) SELECT c FROM t", &[]);
     let r = live.recv_timeout(Duration::from_secs(1));
-    assert!(
-        matches!(r, Err(roomrs::Error::UnknownDependencies(_))),
-        "의존 미상 = UnknownDependencies"
-    );
+    assert!(matches!(r, Err(roomrs::Error::UnknownDependencies(_))), "의존 미상 = UnknownDependencies");
 }
 
 /// DDL(ALTER TABLE) = 보수적 전체 무효화 — 워처 깨움 (M-3)
@@ -471,13 +360,8 @@ fn ddl_triggers_full_invalidation() {
     let live = h.item_dao().watch_count();
     assert_eq!(next(&live), 0);
 
-    h.execute("ALTER TABLE items ADD COLUMN extra TEXT", params![])
-        .unwrap();
-    assert_eq!(
-        live.recv_timeout(Duration::from_secs(2)).unwrap(),
-        Some(0),
-        "DDL 후 재조회 emit"
-    );
+    h.execute("ALTER TABLE items ADD COLUMN extra TEXT", params![]).unwrap();
+    assert_eq!(live.recv_timeout(Duration::from_secs(2)).unwrap(), Some(0), "DDL 후 재조회 emit");
 }
 
 /// DB drop 후 recv = Closed 에러 — 영구 블로킹 없음 (M-7)
@@ -490,10 +374,7 @@ fn recv_errors_after_db_drop() {
     drop(db);
     let start = std::time::Instant::now();
     let r = live.recv();
-    assert!(
-        matches!(r, Err(roomrs::Error::Closed)),
-        "DB 종료 = Closed 에러"
-    );
+    assert!(matches!(r, Err(roomrs::Error::Closed)), "DB 종료 = Closed 에러");
     assert!(start.elapsed() < Duration::from_secs(2), "즉시 반환");
     // 이후 호출도 계속 에러
     assert!(matches!(live.recv(), Err(roomrs::Error::Closed)));
@@ -522,8 +403,7 @@ fn on_open_update_hook_does_not_disable_live_invalidation() {
     let db = Db::builder()
         .sqlite(dir.path().join("on-open-hook.db"))
         .on_open(|conn| {
-            let _previous =
-                conn.update_hook(Some(|_action, _db: &str, _table: &str, _rowid: i64| {}));
+            let _previous = conn.update_hook(Some(|_action, _db: &str, _table: &str, _rowid: i64| {}));
             Ok(())
         })
         .build()
@@ -552,17 +432,8 @@ fn subscribe_no_duplicate_emit() {
     let guard = live.subscribe(move |v| {
         let _ = tx.send(v);
     });
-    assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-        0,
-        "새 콜백은 현재 값(캐시) 수신"
-    );
-    assert!(
-        live.recv_timeout(Duration::from_millis(400))
-            .unwrap()
-            .is_none(),
-        "기존 recv 채널 재-emit 없음"
-    );
+    assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0, "새 콜백은 현재 값(캐시) 수신");
+    assert!(live.recv_timeout(Duration::from_millis(400)).unwrap().is_none(), "기존 recv 채널 재-emit 없음");
     drop(guard);
 }
 
@@ -583,16 +454,10 @@ fn savepoint_rollback_no_spurious_invalidation() {
         Ok(())
     })
     .unwrap();
-    assert!(
-        live.recv_timeout(Duration::from_millis(400))
-            .unwrap()
-            .is_none(),
-        "롤백된 savepoint write = emit 없음"
-    );
+    assert!(live.recv_timeout(Duration::from_millis(400)).unwrap().is_none(), "롤백된 savepoint write = emit 없음");
 
     // 정상 write는 emit — 채널 정상 동작 확인
-    h.execute("INSERT INTO items (name, done) VALUES ('ok', 0)", params![])
-        .unwrap();
+    h.execute("INSERT INTO items (name, done) VALUES ('ok', 0)", params![]).unwrap();
     wait_for(&live, 1);
 }
 
@@ -608,21 +473,11 @@ fn into_stream_consumption() {
         let live = h.item_dao().watch_count();
         let mut stream = live.into_stream();
 
-        let first = stream
-            .next()
-            .await
-            .expect("스트림 열림")
-            .expect("쿼리 성공");
+        let first = stream.next().await.expect("스트림 열림").expect("쿼리 성공");
         assert_eq!(first, 0, "초기 emit");
 
-        h.execute("INSERT INTO items (name, done) VALUES ('s', 0)", ())
-            .await
-            .unwrap();
-        let second = stream
-            .next()
-            .await
-            .expect("스트림 열림")
-            .expect("쿼리 성공");
+        h.execute("INSERT INTO items (name, done) VALUES ('s', 0)", ()).await.unwrap();
+        let second = stream.next().await.expect("스트림 열림").expect("쿼리 성공");
         assert_eq!(second, 1, "write 후 스트림 emit");
     });
 }
@@ -641,11 +496,7 @@ fn recv_keeps_only_latest_value() {
     let _ = rx.recv_timeout(Duration::from_secs(1));
 
     for i in 0..8 {
-        h.execute(
-            "INSERT INTO items(name, done) VALUES (?1, 0)",
-            params![format!("latest-{i}")],
-        )
-        .unwrap();
+        h.execute("INSERT INTO items(name, done) VALUES (?1, 0)", params![format!("latest-{i}")]).unwrap();
         while rx.recv_timeout(Duration::from_secs(1)).unwrap() != i + 1 {}
     }
 
@@ -658,13 +509,9 @@ fn recv_keeps_only_latest_value() {
 fn view_watch_requires_explicit_dependencies() {
     let (_d, db) = open();
     let h = db.run_sync();
-    h.execute("CREATE VIEW item_view AS SELECT * FROM items", params![])
-        .unwrap();
+    h.execute("CREATE VIEW item_view AS SELECT * FROM items", params![]).unwrap();
     let live: LiveQuery<i64> = h.watch_scalar("SELECT COUNT(*) FROM item_view", &[]);
-    assert!(matches!(
-        live.recv_timeout(Duration::from_secs(1)),
-        Err(roomrs::Error::UnknownDependencies(_))
-    ));
+    assert!(matches!(live.recv_timeout(Duration::from_secs(1)), Err(roomrs::Error::UnknownDependencies(_))));
 
     let live = live.watching(&["items"]);
     assert_eq!(next(&live), 0);
@@ -675,8 +522,7 @@ fn view_watch_requires_explicit_dependencies() {
 fn cte_dml_execute_invalidates_live_query() {
     let (_d, db) = open();
     let h = db.run_sync();
-    h.execute("INSERT INTO items(name, done) VALUES ('cte', 0)", params![])
-        .unwrap();
+    h.execute("INSERT INTO items(name, done) VALUES ('cte', 0)", params![]).unwrap();
     let live: LiveQuery<i64> = h.watch_scalar("SELECT COUNT(*) FROM items", &[]);
     assert_eq!(next(&live), 1);
 
@@ -696,19 +542,14 @@ fn in_memory_connection_enables_read_uncommitted() {
         let db = Db::builder().in_memory().build().unwrap();
         db.run_sync()
             .with_connection(|conn| {
-                let enabled: i64 =
-                    conn.query_row("PRAGMA read_uncommitted", [], |row| row.get(0))?;
+                let enabled: i64 = conn.query_row("PRAGMA read_uncommitted", [], |row| row.get(0))?;
                 assert_eq!(enabled, 1);
                 Ok(())
             })
             .unwrap();
-        let live: LiveQuery<i64> = db
-            .run_sync()
-            .watch_scalar("SELECT COUNT(*) FROM items", &[]);
+        let live: LiveQuery<i64> = db.run_sync().watch_scalar("SELECT COUNT(*) FROM items", &[]);
         assert_eq!(next(&live), 0);
-        db.run_sync()
-            .execute("INSERT INTO items(name, done) VALUES ('x', 0)", params![])
-            .unwrap();
+        db.run_sync().execute("INSERT INTO items(name, done) VALUES ('x', 0)", params![]).unwrap();
         assert_eq!(next(&live), 1);
     }
 }

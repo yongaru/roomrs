@@ -68,6 +68,9 @@ fn snap_of<E: Entity>(version: u32) -> roomrs::SchemaSnapshot {
             name: E::TABLE,
             columns: E::COLUMNS_META,
             ddl: E::DDL,
+            triggers: E::TRIGGERS,
+            strict: E::STRICT,
+            without_rowid: E::WITHOUT_ROWID,
         }],
     }
     .to_snapshot()
@@ -79,27 +82,15 @@ fn ui() {
     // 임시 스키마 디렉토리 — 케이스 크레이트의 CARGO_MANIFEST_DIR과 무관하게 env로 주입
     let dir = tempfile::tempdir().expect("tempdir");
     // 검증 케이스용 (struct Db, version = 1)
-    <SnapDb as DatabaseSpec>::schema()
-        .to_snapshot()
-        .write_to(&dir.path().join("db.1.json"))
-        .expect("db 스냅샷 저장");
+    <SnapDb as DatabaseSpec>::schema().to_snapshot().write_to(&dir.path().join("db.1.json")).expect("db 스냅샷 저장");
     // 내장/자동 마이그레이션 케이스용 (struct EmbedDb·GadgetDb, version = 2)
-    snap_of::<EmbedItemV1>(1)
-        .write_to(&dir.path().join("embed_db.1.json"))
-        .expect("embed v1 저장");
-    snap_of::<EmbedItemV2>(2)
-        .write_to(&dir.path().join("embed_db.2.json"))
-        .expect("embed v2 저장");
-    snap_of::<GadgetV1>(1)
-        .write_to(&dir.path().join("gadget_db.1.json"))
-        .expect("gadget v1 저장");
-    snap_of::<GadgetV2>(2)
-        .write_to(&dir.path().join("gadget_db.2.json"))
-        .expect("gadget v2 저장");
+    snap_of::<EmbedItemV1>(1).write_to(&dir.path().join("embed_db.1.json")).expect("embed v1 저장");
+    snap_of::<EmbedItemV2>(2).write_to(&dir.path().join("embed_db.2.json")).expect("embed v2 저장");
+    snap_of::<GadgetV1>(1).write_to(&dir.path().join("gadget_db.1.json")).expect("gadget v1 저장");
+    snap_of::<GadgetV2>(2).write_to(&dir.path().join("gadget_db.2.json")).expect("gadget v2 저장");
 
     // SAFETY: trybuild가 띄우는 자식 cargo/rustc에 상속시키기 위한 프로세스 전역 env.
-    // 이 테스트 파일은 단일 #[test]라 동시 변경 경합 없음 (매크로 생성 export
-    // 테스트는 리포 설정 ROOMRS_SCHEMA_EXPORT=0 으로 항상 스킵된다).
+    // 이 테스트 파일은 단일 #[test]라 동시 변경 경합 없음.
     #[allow(unsafe_code)]
     unsafe {
         std::env::set_var("ROOMRS_SCHEMA_DIR", dir.path());
@@ -135,6 +126,12 @@ fn ui() {
     t.compile_fail("tests/ui/fail/entity_duplicate_column.rs");
     // [M-16] default = "nan" — SQLite DEFAULT 표현 불가
     t.compile_fail("tests/ui/fail/entity_default_nan.rs");
+    // [결정 54] advanced schema DSL
+    t.pass("tests/ui/pass/entity_advanced_dsl.rs");
+    t.compile_fail("tests/ui/fail/entity_generated_with_default.rs");
+    t.compile_fail("tests/ui/fail/entity_generated_pk.rs");
+    t.compile_fail("tests/ui/fail/entity_bad_collate.rs");
+    t.compile_fail("tests/ui/fail/entity_without_rowid_no_pk.rs");
     // [M-17] SQL 속성 2개 = 침묵 승자 대신 에러
     t.compile_fail("tests/ui/fail/dao_two_sql_attrs.rs");
     // [§12c] #[insert] 시그니처 위반

@@ -14,6 +14,7 @@ readme = "README.md"
 roomrs-migrate = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+inventory = { workspace = true }
 rusqlite = { version = "0.38", features = ["hooks"] }
 serde_json = { version = "1", optional = true }
 time = { version = "0.3", optional = true }

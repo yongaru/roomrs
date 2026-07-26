@@ -16,15 +16,11 @@ struct Db;
 /// 지정한 통합 커넥션 수로 임시 DB를 연다.
 fn open_db(connections: usize) -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().expect("임시 디렉터리 생성");
-    let db = Db::builder()
-        .sqlite(dir.path().join("pool.db"))
-        .connections(connections)
-        .build()
-        .expect("DB 열기");
+    let db = Db::builder().sqlite(dir.path().join("pool.db")).connections(connections).build().expect("DB 열기");
     (dir, db)
 }
 
-/// on_open은 모든 일반 커넥션과 notifier 연결에 각각 적용된다.
+/// on_open은 통합 풀의 모든 일반 커넥션에만 적용된다 (전용 live 연결 없음, 결정 51).
 #[test]
 fn on_open_runs_for_every_internal_connection() {
     let dir = tempfile::tempdir().expect("임시 디렉터리 생성");
@@ -36,11 +32,7 @@ fn on_open_runs_for_every_internal_connection() {
         .connections(2)
         .on_open(move |conn| {
             callback_opens.fetch_add(1, Ordering::SeqCst);
-            let table_exists: i64 = conn.query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='items'",
-                [],
-                |row| row.get(0),
-            )?;
+            let table_exists: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='items'", [], |row| row.get(0))?;
             assert_eq!(table_exists, 1, "on_open은 migration 뒤 실행되어야 함");
             conn.pragma_update(None, "cache_size", -321)?;
             Ok(())
@@ -48,17 +40,16 @@ fn on_open_runs_for_every_internal_connection() {
         .build()
         .expect("DB 열기");
 
-    let expected = if cfg!(feature = "live") { 3 } else { 2 };
-    assert_eq!(opens.load(Ordering::SeqCst), expected);
+    assert_eq!(opens.load(Ordering::SeqCst), 2, "on_open = 통합 풀 커넥션 수");
 }
 
-/// notifier 전용 연결에서도 callback의 연결 로컬 설정을 실제 조회에 사용한다.
+/// live worker 가 통합 풀 checkout 으로 on_open 연결 로컬 설정을 본다 (결정 51).
 #[cfg(feature = "live")]
 #[test]
-fn notifier_uses_on_open_configuration() {
+fn live_refresh_uses_on_open_configuration() {
     let dir = tempfile::tempdir().expect("임시 디렉터리 생성");
     let db = Db::builder()
-        .sqlite(dir.path().join("notifier-hook.db"))
+        .sqlite(dir.path().join("live-hook.db"))
         .on_open(|conn| {
             conn.pragma_update(None, "cache_size", -654)?;
             Ok(())
@@ -67,10 +58,7 @@ fn notifier_uses_on_open_configuration() {
         .expect("DB 열기");
 
     let live = db.run_sync().watch_scalar::<i64>("PRAGMA cache_size", &[]);
-    let value = live
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .expect("초기 조회")
-        .expect("초기 값");
+    let value = live.recv_timeout(std::time::Duration::from_secs(1)).expect("초기 조회").expect("초기 값");
     assert_eq!(value, -654);
 }
 
@@ -97,12 +85,7 @@ fn on_open_connection_state_is_sanitized() {
             Ok(())
         })
         .expect("통합 풀 불변식 확인");
-    let count = db
-        .run_sync()
-        .with_connection(|conn| {
-            Ok(conn.query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))?)
-        })
-        .expect("행 수 확인");
+    let count = db.run_sync().with_connection(|conn| Ok(conn.query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))?)).expect("행 수 확인");
     assert_eq!(count, 0);
 }
 
@@ -110,18 +93,10 @@ fn on_open_connection_state_is_sanitized() {
 #[test]
 fn on_open_failure_is_returned_without_panic() {
     let dir = tempfile::tempdir().expect("임시 디렉터리 생성");
-    let error = Db::builder()
-        .sqlite(dir.path().join("error-hook.db"))
-        .on_open(|_| Err(roomrs::Error::Config("의도적 callback 실패".into())))
-        .build();
+    let error = Db::builder().sqlite(dir.path().join("error-hook.db")).on_open(|_| Err(roomrs::Error::Config("의도적 callback 실패".into()))).build();
     assert!(error.is_err());
 
-    let panic = std::panic::catch_unwind(|| {
-        Db::builder()
-            .sqlite(dir.path().join("panic-hook.db"))
-            .on_open(|_| panic!("의도적 callback panic"))
-            .build()
-    });
+    let panic = std::panic::catch_unwind(|| Db::builder().sqlite(dir.path().join("panic-hook.db")).on_open(|_| panic!("의도적 callback panic")).build());
     assert!(panic.is_ok(), "callback panic은 build 경계를 넘으면 안 됨");
     assert!(panic.expect("직전 검사").is_err());
 }
@@ -150,11 +125,7 @@ fn checked_out_connection_is_writable_after_restore() {
         })
         .expect("복구 상태 확인");
 
-    let count = handle
-        .with_connection(|conn| {
-            Ok(conn.query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))?)
-        })
-        .expect("행 수 확인");
+    let count = handle.with_connection(|conn| Ok(conn.query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))?)).expect("행 수 확인");
     assert_eq!(count, 1, "미완료 트랜잭션만 롤백되어야 함");
 }
 
@@ -194,12 +165,7 @@ fn checked_out_connection_is_writable_after_error_and_panic() {
 #[test]
 fn pool_checkout_is_exclusive_and_uses_builder_queue_timeout() {
     let dir = tempfile::tempdir().expect("임시 디렉터리 생성");
-    let db = Db::builder()
-        .sqlite(dir.path().join("reader-timeout.db"))
-        .connections(1)
-        .queue_timeout(std::time::Duration::from_millis(20))
-        .build()
-        .expect("DB 열기");
+    let db = Db::builder().sqlite(dir.path().join("reader-timeout.db")).connections(1).queue_timeout(std::time::Duration::from_millis(20)).build().expect("DB 열기");
     let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {

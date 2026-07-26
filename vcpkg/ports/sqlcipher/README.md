@@ -14,3 +14,11 @@ SQLCipher system backend에서도 preupdate API를 사용하기 때문입니다.
 반영합니다. `portfile.cmake`는 upstream SQLCipher `LICENSE.md`를 package의
 `share/sqlcipher/copyright`로 설치하며, `vcpkg.json`은 BSD-3-Clause를
 명시합니다.
+
+저장소 루트에서 아래 스크립트를 실행하면 이 overlay와 전체 feature를 사용해
+설치하고 preupdate hook까지 검증합니다.
+
+```powershell
+$env:VCPKG_ROOT = "D:\tools\vcpkg"
+vcpkg\build-sqlcipher-system.cmd
+```

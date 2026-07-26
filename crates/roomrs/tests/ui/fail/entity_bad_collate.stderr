@@ -1,0 +1,5 @@
+error: collate 이름이 비어 있습니다
+ --> tests/ui/fail/entity_bad_collate.rs:7:24
+  |
+7 |     #[column(collate = "")]
+  |                        ^^

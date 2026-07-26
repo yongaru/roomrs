@@ -9,11 +9,12 @@ members = [
     "crates/roomrs-migrate",
     "crates/roomrs-cli",
     "examples/mobile-ffi",
+    "examples/schema-export",
     "xtask",
 ]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -22,16 +23,20 @@ authors = ["김용일(Kim Yong-il) <akira76@gmail.com>"]
 
 # 내부 크레이트 버전은 여기 한 곳에서만 갱신한다
 [workspace.dependencies]
-roomrs-core = { path = "crates/roomrs-core", version = "0.2.4" }
-roomrs-async = { path = "crates/roomrs-async", version = "0.2.4" }
-roomrs-macros = { path = "crates/roomrs-macros", version = "0.2.4" }
-roomrs-migrate = { path = "crates/roomrs-migrate", version = "0.2.4" }
-roomrs = { path = "crates/roomrs", version = "0.2.4" }
+roomrs-core = { path = "crates/roomrs-core", version = "0.3.0" }
+roomrs-async = { path = "crates/roomrs-async", version = "0.3.0" }
+roomrs-macros = { path = "crates/roomrs-macros", version = "0.3.0" }
+roomrs-migrate = { path = "crates/roomrs-migrate", version = "0.3.0" }
+roomrs = { path = "crates/roomrs", version = "0.3.0" }
 
 syn = { version = "2", features = ["full", "visit-mut"] }
 quote = "1"
 proc-macro2 = "1"
 thiserror = "2"
 log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-log = "0.2"
 trybuild = "1"
 tempfile = "3"
+inventory = "0.3"

@@ -5,8 +5,6 @@
 use crate::error::{Error, Result};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -47,32 +45,30 @@ pub(crate) struct ConnectionPool {
     preserve_on_reopen: bool,
     queue_timeout: Option<Duration>,
     reopen: Arc<dyn Fn() -> Result<Connection> + Send + Sync>,
-    #[cfg(test)]
-    pub(crate) force_restore_failure: AtomicBool,
-    #[cfg(test)]
-    force_log_panic: AtomicBool,
 }
 
 impl ConnectionPool {
-    /// 격리된 커넥션을 1회 재오픈하고 실패 시 fatal로 전환한다.
-    #[cfg(test)]
-    fn reopen_or_fatal(&self, state: &mut ConnectionState, message: String) {
-        match (self.reopen)() {
-            Ok(conn) => state.idle.push_back(conn),
-            Err(e) => state.fatal = Some(format!("{message}; 재오픈 실패: {e}")),
-        }
+    /// 풀 상태 락을 얻고 poison은 호출자 오류로 전환한다.
+    fn lock_state(&self) -> Result<MutexGuard<'_, ConnectionState>> {
+        self.state.lock().map_err(|_| Error::Internal("connection pool 락이 poison되었습니다".into()))
+    }
+
+    /// 대기 뒤 풀 상태 락을 복구한다.
+    fn wait_state<'a>(&self, state: MutexGuard<'a, ConnectionState>) -> Result<MutexGuard<'a, ConnectionState>> {
+        self.cv.wait(state).map_err(|_| Error::Internal("connection pool 락이 poison되었습니다".into()))
+    }
+
+    /// 시간 제한 대기 뒤 풀 상태 락을 복구한다.
+    fn wait_state_timeout<'a>(&self, state: MutexGuard<'a, ConnectionState>, timeout: Duration) -> Result<MutexGuard<'a, ConnectionState>> {
+        self.cv.wait_timeout(state, timeout).map(|(state, _)| state).map_err(|_| Error::Internal("connection pool 락이 poison되었습니다".into()))
     }
 
     /// 초기 read/write 커넥션들과 재오픈 수명 정책으로 풀을 구성한다.
-    pub(crate) fn new_with_preservation(
-        conns: Vec<Connection>,
-        read_uncommitted: bool,
-        preserve_on_reopen: bool,
-        queue_timeout: Option<Duration>,
-        reopen: Arc<dyn Fn() -> Result<Connection> + Send + Sync>,
-    ) -> Self {
+    pub(crate) fn new_with_preservation(conns: Vec<Connection>, read_uncommitted: bool, preserve_on_reopen: bool, queue_timeout: Option<Duration>, reopen: Arc<dyn Fn() -> Result<Connection> + Send + Sync>) -> Self {
+        let size = conns.len();
         #[cfg(any(feature = "live", test))]
-        let total = conns.len();
+        let total = size;
+        log::info!("connection pool initialized: size={size}, queue_timeout_ms={:?}", queue_timeout.map(|timeout| timeout.as_millis()));
         Self {
             state: Mutex::new(ConnectionState {
                 idle: conns.into(),
@@ -92,41 +88,24 @@ impl ConnectionPool {
             preserve_on_reopen,
             queue_timeout,
             reopen,
-            #[cfg(test)]
-            force_restore_failure: AtomicBool::new(false),
-            #[cfg(test)]
-            force_log_panic: AtomicBool::new(false),
         }
-    }
-
-    /// 파일 DB와 같은 drop-before-open 정책의 테스트 풀을 구성한다.
-    #[cfg(test)]
-    fn new(
-        conns: Vec<Connection>,
-        read_uncommitted: bool,
-        queue_timeout: Option<Duration>,
-        reopen: Arc<dyn Fn() -> Result<Connection> + Send + Sync>,
-    ) -> Self {
-        Self::new_with_preservation(conns, read_uncommitted, false, queue_timeout, reopen)
     }
 
     /// 커넥션 체크아웃 — 전부 사용 중이면 반납까지 블로킹
     pub(crate) fn acquire(&self) -> Result<ConnectionGuard<'_>> {
-        let mut state: MutexGuard<'_, ConnectionState> =
-            self.state.lock().expect("connection pool 락 poisoned");
+        let mut state = self.lock_state()?;
         let owner = std::thread::current().id();
         if state.maintenance && state.owners.get(&owner).copied().unwrap_or(0) != 0 {
-            return Err(Error::Internal(
-                "커넥션을 보유한 흐름에서 풀 유지보수 중 재진입할 수 없습니다".into(),
-            ));
+            return Err(Error::Internal("커넥션을 보유한 흐름에서 풀 유지보수 중 재진입할 수 없습니다".into()));
         }
         let my_ticket = state.next_ticket;
         state.next_ticket += 1;
-        let deadline = self
-            .queue_timeout
-            .map(|timeout| std::time::Instant::now() + timeout);
+        let deadline = self.queue_timeout.map(|timeout| std::time::Instant::now() + timeout);
+        let mut wait_logged = false;
         loop {
             if let Some(message) = state.fatal.clone() {
+                drop(state);
+                log::error!("pool checkout rejected: pool is fatal: {message}");
                 return Err(Error::Internal(message));
             }
             if state.maintenance && state.owners.get(&owner).copied().unwrap_or(0) != 0 {
@@ -137,25 +116,29 @@ impl ConnectionPool {
                 }
                 drop(state);
                 self.cv.notify_all();
-                return Err(Error::Internal(
-                    "커넥션을 보유한 흐름에서 풀 유지보수 중 재진입할 수 없습니다".into(),
-                ));
+                log::warn!("pool checkout rejected: maintenance reentry");
+                return Err(Error::Internal("커넥션을 보유한 흐름에서 풀 유지보수 중 재진입할 수 없습니다".into()));
             }
             if !state.maintenance && state.now_serving == my_ticket {
                 if let Some(conn) = state.idle.pop_front() {
                     *state.owners.entry(owner).or_insert(0) += 1;
+                    let idle_remaining = state.idle.len();
                     state.advance();
+                    let guard = ConnectionGuard { pool: self, conn: Some(conn), owner, _not_send: std::marker::PhantomData };
+                    drop(state);
                     self.cv.notify_all();
-                    return Ok(ConnectionGuard {
-                        pool: self,
-                        conn: Some(conn),
-                        owner,
-                        _not_send: std::marker::PhantomData,
-                    });
+                    log::trace!("pool connection acquired: ticket={my_ticket}, idle_remaining={idle_remaining}");
+                    if wait_logged {
+                        log::debug!("pool checkout wait completed: ticket={my_ticket}");
+                    }
+                    return Ok(guard);
                 }
             }
+            if !wait_logged {
+                wait_logged = true;
+            }
             state = match deadline {
-                None => self.cv.wait(state).expect("connection pool 락 poisoned"),
+                None => self.wait_state(state)?,
                 Some(deadline) => {
                     let now = std::time::Instant::now();
                     if now >= deadline {
@@ -166,15 +149,10 @@ impl ConnectionPool {
                         }
                         drop(state);
                         self.cv.notify_all();
-                        return Err(Error::QueueTimeout(
-                            self.queue_timeout.expect("deadline 존재"),
-                        ));
+                        log::warn!("pool checkout timed out: ticket={my_ticket}");
+                        return Err(Error::QueueTimeout(self.queue_timeout.ok_or_else(|| Error::Internal("queue timeout deadline이 없습니다".into()))?));
                     }
-                    let (state, _) = self
-                        .cv
-                        .wait_timeout(state, deadline - now)
-                        .expect("connection pool 락 poisoned");
-                    state
+                    self.wait_state_timeout(state, deadline - now)?
                 }
             };
         }
@@ -182,7 +160,7 @@ impl ConnectionPool {
 
     /// 빌드 중 idle 커넥션 전부에 초기화 함수를 적용한다.
     pub(crate) fn for_each_idle(&self, mut f: impl FnMut(&Connection) -> Result<()>) -> Result<()> {
-        let state = self.state.lock().expect("connection pool 락 poisoned");
+        let state = self.lock_state()?;
         if let Some(message) = &state.fatal {
             return Err(Error::Internal(message.clone()));
         }
@@ -194,37 +172,26 @@ impl ConnectionPool {
 
     /// 모든 checkout 반납을 기다린 뒤 전체 connection에 함수를 적용한다.
     #[cfg(any(feature = "live", test))]
-    pub(crate) fn for_each_connection(
-        &self,
-        mut f: impl FnMut(&Connection) -> Result<()>,
-    ) -> Result<()> {
+    pub(crate) fn for_each_connection(&self, mut f: impl FnMut(&Connection) -> Result<()>) -> Result<()> {
+        log::debug!("pool maintenance requested");
         let caller = std::thread::current().id();
         {
-            let state = self.state.lock().expect("connection pool 락 poisoned");
+            let state = self.lock_state()?;
             if state.owners.get(&caller).copied().unwrap_or(0) != 0 {
-                return Err(Error::Internal(
-                    "커넥션을 보유한 흐름에서 전체 풀 유지보수를 실행할 수 없습니다".into(),
-                ));
+                return Err(Error::Internal("커넥션을 보유한 흐름에서 전체 풀 유지보수를 실행할 수 없습니다".into()));
             }
         }
-        let _maintenance = self
-            .maintenance_lock
-            .lock()
-            .expect("connection pool maintenance 락 poisoned");
-        let mut state = self.state.lock().expect("connection pool 락 poisoned");
+        let _maintenance = self.maintenance_lock.lock().map_err(|_| Error::Internal("connection pool maintenance 락이 poison되었습니다".into()))?;
+        let mut state = self.lock_state()?;
         if let Some(message) = &state.fatal {
             return Err(Error::Internal(message.clone()));
         }
         if state.owners.get(&caller).copied().unwrap_or(0) != 0 {
-            return Err(Error::Internal(
-                "커넥션을 보유한 흐름에서 전체 풀 유지보수를 실행할 수 없습니다".into(),
-            ));
+            return Err(Error::Internal("커넥션을 보유한 흐름에서 전체 풀 유지보수를 실행할 수 없습니다".into()));
         }
         state.maintenance = true;
         self.cv.notify_all();
-        let deadline = self
-            .queue_timeout
-            .map(|timeout| std::time::Instant::now() + timeout);
+        let deadline = self.queue_timeout.map(|timeout| std::time::Instant::now() + timeout);
         while state.idle.len() != self.total {
             if let Some(message) = state.fatal.clone() {
                 state.maintenance = false;
@@ -233,37 +200,28 @@ impl ConnectionPool {
                 return Err(Error::Internal(message));
             }
             state = match deadline {
-                None => self.cv.wait(state).expect("connection pool 락 poisoned"),
+                None => self.wait_state(state)?,
                 Some(deadline) => {
                     let now = std::time::Instant::now();
                     if now >= deadline {
                         state.maintenance = false;
                         drop(state);
                         self.cv.notify_all();
-                        return Err(Error::QueueTimeout(
-                            self.queue_timeout.expect("deadline 존재"),
-                        ));
+                        log::warn!("pool maintenance timed out");
+                        return Err(Error::QueueTimeout(self.queue_timeout.ok_or_else(|| Error::Internal("queue timeout deadline이 없습니다".into()))?));
                     }
-                    self.cv
-                        .wait_timeout(state, deadline - now)
-                        .expect("connection pool 락 poisoned")
-                        .0
+                    self.wait_state_timeout(state, deadline - now)?
                 }
             };
         }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            state.idle.iter().try_for_each(&mut f)
-        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.idle.iter().try_for_each(&mut f)));
         state.maintenance = false;
         drop(state);
         self.cv.notify_all();
+        log::debug!("pool maintenance completed");
         match result {
             Ok(result) => result,
-            Err(payload) => {
-                // maintenance mutex가 poison되지 않도록 guard 해제 뒤 panic을 재개한다.
-                drop(_maintenance);
-                std::panic::resume_unwind(payload)
-            }
+            Err(_) => Err(Error::Internal("풀 유지보수 callback이 panic했습니다".into())),
         }
     }
 }
@@ -279,8 +237,8 @@ pub(crate) struct ConnectionGuard<'p> {
 
 impl ConnectionGuard<'_> {
     /// 커넥션 참조
-    pub(crate) fn conn(&self) -> &Connection {
-        self.conn.as_ref().expect("drop 전에는 항상 Some")
+    pub(crate) fn conn(&self) -> Result<&Connection> {
+        self.conn.as_ref().ok_or_else(|| Error::Internal("반납된 커넥션에 접근했습니다".into()))
     }
 }
 
@@ -317,14 +275,6 @@ impl Drop for ConnectionGuard<'_> {
                 }
             }
         }
-        #[cfg(test)]
-        if self
-            .pool
-            .force_restore_failure
-            .swap(false, Ordering::AcqRel)
-        {
-            restore_error = Some("테스트 강제 복구 실패".into());
-        }
         let replacement = restore_error.as_ref().map(|_| {
             if self.pool.preserve_on_reopen {
                 // 단일 shared-cache 인메모리 DB는 마지막 연결이 닫히면 사라진다.
@@ -338,7 +288,13 @@ impl Drop for ConnectionGuard<'_> {
                 (self.pool.reopen)()
             }
         });
-        let mut state = self.pool.state.lock().expect("connection pool 락 poisoned");
+        let mut state = match self.pool.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                log::error!("connection pool 락 poisoned while returning connection");
+                poisoned.into_inner()
+            }
+        };
         if let Some(count) = state.owners.get_mut(&self.owner) {
             *count -= 1;
             if *count == 0 {
@@ -346,19 +302,21 @@ impl Drop for ConnectionGuard<'_> {
             }
         }
         if let Some(message) = restore_error {
-            match replacement.expect("복구 실패 시 대체 결과 존재") {
-                Ok(conn) => state.idle.push_back(conn),
-                Err(e) => state.fatal = Some(format!("{message}; 재오픈 실패: {e}")),
+            match replacement {
+                Some(Ok(conn)) => state.idle.push_back(conn),
+                Some(Err(e)) => state.fatal = Some(format!("{message}; 재오픈 실패: {e}")),
+                None => state.fatal = Some(format!("{message}; 대체 커넥션 결과가 없습니다")),
             }
             drop(state);
             self.pool.cv.notify_all();
-            #[cfg(test)]
-            if self.pool.force_log_panic.swap(false, Ordering::AcqRel) {
-                panic!("테스트 logger panic");
-            }
             log::error!("pool connection quarantined after restore failure: {message}");
         } else {
-            state.idle.push_back(self.conn.take().expect("drop은 1회"));
+            if let Some(conn) = self.conn.take() {
+                state.idle.push_back(conn);
+            } else {
+                state.fatal = Some("반납할 커넥션이 없습니다".into());
+                log::error!("pool guard dropped without a connection");
+            }
             drop(state);
             // 티켓 head가 아닌 waiter만 깨우면 head가 잠든 채 교착 가능하다.
             self.pool.cv.notify_all();
@@ -370,42 +328,39 @@ impl Drop for ConnectionGuard<'_> {
 
 /// read/write 커넥션 N개 통합 풀
 pub(crate) struct Pool {
-    pub(crate) connections: ConnectionPool,
+    /// Arc — live worker 가 동일 풀을 checkout 한다 (결정 51)
+    pub(crate) connections: Arc<ConnectionPool>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     /// 테스트용 새 인메모리 connection factory.
     fn factory() -> Arc<dyn Fn() -> Result<Connection> + Send + Sync> {
         Arc::new(|| Ok(Connection::open_in_memory()?))
     }
 
+    impl ConnectionPool {
+        /// 테스트용 파일 DB 재오픈 정책 풀을 구성한다.
+        fn new(conns: Vec<Connection>, read_uncommitted: bool, queue_timeout: Option<Duration>, reopen: Arc<dyn Fn() -> Result<Connection> + Send + Sync>) -> Self {
+            Self::new_with_preservation(conns, read_uncommitted, false, queue_timeout, reopen)
+        }
+    }
+
     /// 풀 fatal 상태는 대기하지 않고 즉시 명시 오류로 반환된다.
     #[test]
     fn connection_fatal_state_returns_error() {
-        let connections = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            None,
-            factory(),
-        );
+        let connections = ConnectionPool::new(vec![Connection::open_in_memory().unwrap()], false, None, factory());
         connections.state.lock().unwrap().fatal = Some("connection 격리".into());
-        assert!(
-            matches!(connections.acquire(), Err(Error::Internal(message)) if message == "connection 격리")
-        );
+        assert!(matches!(connections.acquire(), Err(Error::Internal(message)) if message == "connection 격리"));
     }
 
     /// 풀 고갈 시 queue_timeout 안에 명시 오류를 반환한다.
     #[test]
     fn connection_checkout_times_out() {
-        let connections = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            Some(Duration::from_millis(20)),
-            factory(),
-        );
+        let connections = ConnectionPool::new(vec![Connection::open_in_memory().unwrap()], false, Some(Duration::from_millis(20)), factory());
         let _held = connections.acquire().unwrap();
         let started = std::time::Instant::now();
         assert!(matches!(connections.acquire(), Err(Error::QueueTimeout(_))));
@@ -415,12 +370,7 @@ mod tests {
     /// 커넥션 보유 흐름의 전체 풀 유지보수 재진입은 즉시 오류다.
     #[test]
     fn maintenance_reentry_returns_error() {
-        let pool = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            None,
-            factory(),
-        );
+        let pool = ConnectionPool::new(vec![Connection::open_in_memory().unwrap()], false, None, factory());
         let _held = pool.acquire().unwrap();
         assert!(matches!(
             pool.for_each_connection(|_| Ok(())),
@@ -431,12 +381,7 @@ mod tests {
     /// 다른 maintenance가 drain 중이어도 guard 보유 호출은 mutex 앞에서 즉시 오류다.
     #[test]
     fn maintenance_owner_does_not_wait_for_other_maintenance() {
-        let pool = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            Some(Duration::from_secs(5)),
-            factory(),
-        );
+        let pool = ConnectionPool::new(vec![Connection::open_in_memory().unwrap()], false, Some(Duration::from_secs(5)), factory());
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (run_tx, run_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -471,12 +416,7 @@ mod tests {
     /// checkout 대기 중 maintenance가 시작되어도 보유 흐름은 즉시 오류로 빠진다.
     #[test]
     fn waiting_owner_rechecks_maintenance() {
-        let pool = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            Some(Duration::from_secs(1)),
-            factory(),
-        );
+        let pool = ConnectionPool::new(vec![Connection::open_in_memory().unwrap()], false, Some(Duration::from_secs(1)), factory());
         std::thread::scope(|scope| {
             let maintenance_pool = &pool;
             let maintenance = scope.spawn(move || {
@@ -503,12 +443,7 @@ mod tests {
     /// 동시에 요청된 maintenance callback은 겹쳐 실행되지 않는다.
     #[test]
     fn concurrent_maintenance_is_serialized() {
-        let pool = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            Some(Duration::from_secs(1)),
-            factory(),
-        );
+        let pool = ConnectionPool::new(vec![Connection::open_in_memory().unwrap()], false, Some(Duration::from_secs(1)), factory());
         let active = std::sync::atomic::AtomicUsize::new(0);
         let max_active = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -528,76 +463,34 @@ mod tests {
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
-    /// maintenance callback panic 뒤에도 상태와 직렬화 락이 복구된다.
+    /// maintenance callback panic은 오류로 전환하고 풀 상태를 복구한다.
     #[test]
     fn maintenance_callback_panic_restores_pool_state() {
-        let pool = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            Some(Duration::from_secs(1)),
-            factory(),
-        );
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = pool.for_each_connection(|_| -> Result<()> {
-                panic!("테스트 maintenance callback panic")
-            });
-        }));
-        assert!(panic.is_err());
+        let pool = ConnectionPool::new(vec![Connection::open_in_memory().unwrap()], false, Some(Duration::from_secs(1)), factory());
+        let result = pool.for_each_connection(|_| -> Result<()> { panic!("테스트 maintenance callback panic") });
+        assert!(matches!(result, Err(Error::Internal(message)) if message.contains("callback")));
         assert!(!pool.state.lock().unwrap().maintenance);
         assert!(pool.acquire().is_ok());
         assert!(pool.for_each_connection(|_| Ok(())).is_ok());
     }
 
-    /// logger panic 뒤에도 pool mutex는 poison되지 않고 재사용된다.
-    #[test]
-    fn logger_panic_does_not_poison_pool_mutex() {
-        let pool = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            Some(Duration::from_secs(1)),
-            factory(),
-        );
-        let guard = pool.acquire().unwrap();
-        pool.force_restore_failure.store(true, Ordering::Release);
-        pool.force_log_panic.store(true, Ordering::Release);
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)));
-        assert!(panic.is_err());
-        assert!(pool.acquire().is_ok());
-    }
-
     /// 기존 checkout이 반환되지 않으면 maintenance도 queue_timeout으로 끝난다.
     #[test]
     fn maintenance_drain_times_out() {
-        let pool = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            Some(Duration::from_millis(20)),
-            factory(),
-        );
+        let pool = ConnectionPool::new(vec![Connection::open_in_memory().unwrap()], false, Some(Duration::from_millis(20)), factory());
         let held = pool.acquire().unwrap();
         std::thread::scope(|scope| {
-            let result = scope
-                .spawn(|| pool.for_each_connection(|_| Ok(())))
-                .join()
-                .unwrap();
+            let result = scope.spawn(|| pool.for_each_connection(|_| Ok(()))).join().unwrap();
             assert!(matches!(result, Err(Error::QueueTimeout(_))));
         });
         drop(held);
-        assert!(
-            pool.acquire().is_ok(),
-            "timeout 뒤 maintenance가 해제되어야 함"
-        );
+        assert!(pool.acquire().is_ok(), "timeout 뒤 maintenance가 해제되어야 함");
     }
 
     /// maintenance 실행 중 신규 checkout은 완료 전까지 차단된다.
     #[test]
     fn maintenance_blocks_new_checkout() {
-        let pool = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            Some(Duration::from_secs(1)),
-            factory(),
-        );
+        let pool = ConnectionPool::new(vec![Connection::open_in_memory().unwrap()], false, Some(Duration::from_secs(1)), factory());
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
@@ -631,26 +524,15 @@ mod tests {
         first.execute("CREATE TABLE items(id INTEGER)", []).unwrap();
         let connections = ConnectionPool::new(vec![first], false, None, factory());
         let guard = connections.acquire().unwrap();
-        guard
-            .conn()
-            .execute("INSERT INTO items(id) VALUES (1)", [])
-            .unwrap();
-        let count: i64 = guard
-            .conn()
-            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
-            .unwrap();
+        guard.conn().unwrap().execute("INSERT INTO items(id) VALUES (1)", []).unwrap();
+        let count: i64 = guard.conn().unwrap().query_row("SELECT count(*) FROM items", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
     }
 
     /// 대기 요청은 티켓 발급 순서대로 connection을 획득한다.
     #[test]
     fn connection_checkout_is_fifo() {
-        let connections = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            Some(Duration::from_secs(1)),
-            factory(),
-        );
+        let connections = ConnectionPool::new(vec![Connection::open_in_memory().unwrap()], false, Some(Duration::from_secs(1)), factory());
         let held = connections.acquire().unwrap();
         let order = Mutex::new(Vec::new());
         std::thread::scope(|scope| {
@@ -671,114 +553,16 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
     }
 
-    /// 커넥션 재오픈 실패 시 무한 재시도 없이 fatal 오류로 전환한다.
-    #[test]
-    fn connection_reopen_failure_becomes_fatal() {
-        let reopen: Arc<dyn Fn() -> Result<Connection> + Send + Sync> =
-            Arc::new(|| Err(Error::Internal("주입 실패".into())));
-        let connections = ConnectionPool::new(vec![], false, None, reopen);
-        let mut state = connections.state.lock().unwrap();
-        connections.reopen_or_fatal(&mut state, "격리".into());
-        assert!(state.idle.is_empty());
-        assert!(state.fatal.as_deref().unwrap().contains("주입 실패"));
-    }
-
-    /// 실제 ConnectionGuard::drop 복구 실패가 factory를 호출하고 용량을 복원한다.
-    #[test]
-    fn connection_guard_drop_reopens_connection() {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let count = Arc::clone(&calls);
-        let reopen: Arc<dyn Fn() -> Result<Connection> + Send + Sync> = Arc::new(move || {
-            count.fetch_add(1, Ordering::SeqCst);
-            Ok(Connection::open_in_memory()?)
-        });
-        let connections = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            None,
-            reopen,
-        );
-        connections
-            .force_restore_failure
-            .store(true, Ordering::Release);
-        drop(connections.acquire().unwrap());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(connections.acquire().is_ok());
-    }
-
-    /// 단일 shared-cache 인메모리 연결 교체 중 기존 연결이 DB 수명을 유지한다.
-    #[test]
-    fn connection_reopen_preserves_single_in_memory_database() {
-        let uri = "file:roomrs_pool_restore?mode=memory&cache=shared";
-        let first = Connection::open(uri).unwrap();
-        first
-            .execute_batch("CREATE TABLE items(id INTEGER); INSERT INTO items VALUES (7)")
-            .unwrap();
-        let reopen: Arc<dyn Fn() -> Result<Connection> + Send + Sync> =
-            Arc::new(move || Ok(Connection::open(uri)?));
-        let connections =
-            ConnectionPool::new_with_preservation(vec![first], true, true, None, reopen);
-        connections
-            .force_restore_failure
-            .store(true, Ordering::Release);
-        drop(connections.acquire().unwrap());
-
-        let guard = connections.acquire().unwrap();
-        let value: i64 = guard
-            .conn()
-            .query_row("SELECT id FROM items", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(value, 7);
-    }
-
-    /// 파일 DB 재오픈 정책은 factory 호출 전에 기존 연결을 폐기한다.
-    #[test]
-    fn non_preserving_reopen_drops_old_connection_first() {
-        let marker = Arc::new(());
-        let hook_marker = Arc::clone(&marker);
-        let first = Connection::open_in_memory().unwrap();
-        let _previous = first.update_hook(Some(
-            move |_action, _database: &str, _table: &str, _rowid| {
-                let _keep_alive = &hook_marker;
-            },
-        ));
-        let weak_marker = Arc::downgrade(&marker);
-        let old_alive_during_reopen = Arc::new(AtomicBool::new(true));
-        let observed = Arc::clone(&old_alive_during_reopen);
-        let reopen: Arc<dyn Fn() -> Result<Connection> + Send + Sync> = Arc::new(move || {
-            observed.store(weak_marker.strong_count() > 1, Ordering::Release);
-            Ok(Connection::open_in_memory()?)
-        });
-        let connections = ConnectionPool::new(vec![first], false, None, reopen);
-        connections
-            .force_restore_failure
-            .store(true, Ordering::Release);
-        drop(connections.acquire().unwrap());
-
-        assert!(!old_alive_during_reopen.load(Ordering::Acquire));
-    }
-
     /// 커넥션 탈출구가 query_only를 켜도 반납 시 OFF로 복구한다.
     #[test]
     fn connection_guard_restores_query_only_off() {
-        let connections = ConnectionPool::new(
-            vec![Connection::open_in_memory().unwrap()],
-            false,
-            None,
-            factory(),
-        );
+        let connections = ConnectionPool::new(vec![Connection::open_in_memory().unwrap()], false, None, factory());
         {
             let guard = connections.acquire().unwrap();
-            guard
-                .conn()
-                .pragma_update(None, "query_only", "ON")
-                .unwrap();
+            guard.conn().unwrap().pragma_update(None, "query_only", "ON").unwrap();
         }
         let guard = connections.acquire().unwrap();
-        let value: i64 = guard
-            .conn()
-            .query_row("PRAGMA query_only", [], |row| row.get(0))
-            .unwrap();
+        let value: i64 = guard.conn().unwrap().query_row("PRAGMA query_only", [], |row| row.get(0)).unwrap();
         assert_eq!(value, 0);
     }
 
@@ -786,22 +570,14 @@ mod tests {
     #[test]
     fn connection_guard_restores_foreign_keys_on() {
         let connection = Connection::open_in_memory().unwrap();
-        connection
-            .pragma_update(None, "foreign_keys", "ON")
-            .unwrap();
+        connection.pragma_update(None, "foreign_keys", "ON").unwrap();
         let connections = ConnectionPool::new(vec![connection], false, None, factory());
         {
             let guard = connections.acquire().unwrap();
-            guard
-                .conn()
-                .pragma_update(None, "foreign_keys", "OFF")
-                .unwrap();
+            guard.conn().unwrap().pragma_update(None, "foreign_keys", "OFF").unwrap();
         }
         let guard = connections.acquire().unwrap();
-        let value: i64 = guard
-            .conn()
-            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
-            .unwrap();
+        let value: i64 = guard.conn().unwrap().query_row("PRAGMA foreign_keys", [], |row| row.get(0)).unwrap();
         assert_eq!(value, 1);
     }
 }

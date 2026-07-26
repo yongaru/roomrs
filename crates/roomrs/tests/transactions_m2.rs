@@ -45,27 +45,10 @@ struct Db;
 /// 테스트 DB + 계좌 2개 (a=100, b=0)
 fn setup() -> (tempfile::TempDir, Db, i64, i64) {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::builder()
-        .sqlite(dir.path().join("t.db"))
-        .build()
-        .unwrap();
+    let db = Db::builder().sqlite(dir.path().join("t.db")).build().unwrap();
     let h = db.run_sync();
-    let a = h
-        .account_dao()
-        .add(&Account {
-            id: 0,
-            name: "a".into(),
-            balance: 100,
-        })
-        .unwrap();
-    let b = h
-        .account_dao()
-        .add(&Account {
-            id: 0,
-            name: "b".into(),
-            balance: 0,
-        })
-        .unwrap();
+    let a = h.account_dao().add(&Account { id: 0, name: "a".into(), balance: 100 }).unwrap();
+    let b = h.account_dao().add(&Account { id: 0, name: "b".into(), balance: 0 }).unwrap();
     (dir, db, a, b)
 }
 
@@ -85,10 +68,7 @@ fn transaction_method_rolls_back_atomically() {
     let (_d, db, a, b) = setup();
     let h = db.run_sync();
     // 잔액 부족 = 에러 (본문 초입 실패 경로)
-    assert!(
-        h.account_dao().transfer(a, b, 1000).is_err(),
-        "잔액 부족 = 에러"
-    );
+    assert!(h.account_dao().transfer(a, b, 1000).is_err(), "잔액 부족 = 에러");
     assert_eq!(h.account_dao().balance(a).unwrap(), 100);
 
     // 중간 실패: 첫 adjust 후 에러 — savepoint/rollback으로 첫 adjust도 취소돼야 함
@@ -98,11 +78,7 @@ fn transaction_method_rolls_back_atomically() {
         Err(roomrs::Error::Config("중간 실패".into()))
     });
     assert!(r.is_err());
-    assert_eq!(
-        h.account_dao().balance(a).unwrap(),
-        100,
-        "롤백으로 원상복구"
-    );
+    assert_eq!(h.account_dao().balance(a).unwrap(), 100, "롤백으로 원상복구");
 }
 
 /// 중첩 #[transaction] = savepoint — 내부 실패는 내부만 롤백
@@ -128,11 +104,7 @@ fn nested_savepoint() {
     .unwrap();
 
     assert_eq!(h.account_dao().balance(a).unwrap(), 90);
-    assert_eq!(
-        h.account_dao().balance(b).unwrap(),
-        10,
-        "내부 999는 롤백, 외부 10만 반영"
-    );
+    assert_eq!(h.account_dao().balance(b).unwrap(), 10, "내부 999는 롤백, 외부 10만 반영");
 }
 
 /// panic 시 롤백 — RAII drop 경로
@@ -158,27 +130,15 @@ fn begin_immediate_blocks_second_writer() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("imm.db");
     let db1 = Db::builder().sqlite(&path).build().unwrap();
-    let db2 = Db::builder()
-        .sqlite(&path)
-        .busy_timeout(std::time::Duration::from_millis(100))
-        .build()
-        .unwrap();
+    let db2 = Db::builder().sqlite(&path).busy_timeout(std::time::Duration::from_millis(100)).build().unwrap();
 
     let h1 = db1.run_sync();
     let tx = h1.begin().unwrap(); // IMMEDIATE = 문장 실행 전에도 write 락 보유
-    let r = db2.run_sync().execute(
-        "INSERT INTO accounts (name, balance) VALUES ('x', 1)",
-        params![],
-    );
+    let r = db2.run_sync().execute("INSERT INTO accounts (name, balance) VALUES ('x', 1)", params![]);
     assert!(r.is_err(), "IMMEDIATE 락으로 두 번째 프로세스 writer 차단");
 
     tx.rollback().unwrap();
-    db2.run_sync()
-        .execute(
-            "INSERT INTO accounts (name, balance) VALUES ('x', 1)",
-            params![],
-        )
-        .unwrap();
+    db2.run_sync().execute("INSERT INTO accounts (name, balance) VALUES ('x', 1)", params![]).unwrap();
 }
 
 /// 통합 풀 checkout 커넥션은 writable PRAGMA와 write를 허용한다.
@@ -202,9 +162,7 @@ fn concurrent_open_migration_race() {
     let mut handles = Vec::new();
     for _ in 0..4 {
         let p = path.clone();
-        handles.push(std::thread::spawn(move || {
-            Db::builder().sqlite(&p).build().map(|_| ())
-        }));
+        handles.push(std::thread::spawn(move || Db::builder().sqlite(&p).build().map(|_| ())));
     }
     for h in handles {
         h.join().expect("스레드 join").expect("동시 오픈 성공");

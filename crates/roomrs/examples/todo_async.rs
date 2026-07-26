@@ -2,6 +2,7 @@
 //! 필요 feature: async (기본 on)
 
 use roomrs::{BuildAsyncExt, MigrationPolicy, dao, database, entity};
+mod support;
 
 #[entity(table = "todos")]
 #[derive(Debug, Clone)]
@@ -26,22 +27,12 @@ struct Db;
 
 /// 실행: cargo run --example todo_async
 fn main() -> roomrs::Result<()> {
+    support::init_tracing();
     smol::block_on(async {
-        let db = Db::builder()
-            .in_memory()
-            .migrate(MigrationPolicy::Auto)
-            .build_async()
-            .await?;
+        let db = Db::builder().in_memory().migrate(MigrationPolicy::Auto).build_async().await?;
         let h = db.run_async();
 
-        let id = h
-            .todo_dao()
-            .add(&Todo {
-                id: 0,
-                title: "비동기".into(),
-                done: false,
-            })
-            .await?;
+        let id = h.todo_dao().add(&Todo { id: 0, title: "비동기".into(), done: false }).await?;
         println!("새 id = {id}");
         for t in h.todo_dao().by_done(false).await? {
             println!("- [{}] {}", t.id, t.title);

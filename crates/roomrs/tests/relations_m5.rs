@@ -88,11 +88,7 @@ trait UserDao {
     fn posts_with_tags(&self) -> roomrs::Result<Vec<PostWithTags>>;
 }
 
-#[database(
-    entities(User, Post, Profile, Tag, PostTag),
-    daos(UserDao),
-    version = 1
-)]
+#[database(entities(User, Post, Profile, Tag, PostTag), daos(UserDao), version = 1)]
 struct Db;
 
 /// 시드: 사용자 2, 글 3(u1:2 + u2:1), 프로필 1(u1), 태그 2, 정션(글1=태그2개, 글2=태그1개)
@@ -106,25 +102,11 @@ fn seed(logger_counter: Option<Arc<AtomicU64>>) -> (tempfile::TempDir, Db) {
     }
     let db = b.build().unwrap();
     let h = db.run_sync();
-    h.execute("INSERT INTO users (name) VALUES ('u1'), ('u2')", params![])
-        .unwrap();
-    h.execute(
-        "INSERT INTO posts (user_id, title) VALUES (1,'p1'), (1,'p2'), (2,'p3')",
-        params![],
-    )
-    .unwrap();
-    h.execute(
-        "INSERT INTO profiles (user_id, bio) VALUES (1, 'bio1')",
-        params![],
-    )
-    .unwrap();
-    h.execute("INSERT INTO tags (label) VALUES ('t1'), ('t2')", params![])
-        .unwrap();
-    h.execute(
-        "INSERT INTO post_tags (post_id, tag_id) VALUES (1,1), (1,2), (2,1)",
-        params![],
-    )
-    .unwrap();
+    h.execute("INSERT INTO users (name) VALUES ('u1'), ('u2')", params![]).unwrap();
+    h.execute("INSERT INTO posts (user_id, title) VALUES (1,'p1'), (1,'p2'), (2,'p3')", params![]).unwrap();
+    h.execute("INSERT INTO profiles (user_id, bio) VALUES (1, 'bio1')", params![]).unwrap();
+    h.execute("INSERT INTO tags (label) VALUES ('t1'), ('t2')", params![]).unwrap();
+    h.execute("INSERT INTO post_tags (post_id, tag_id) VALUES (1,1), (1,2), (2,1)", params![]).unwrap();
     (dir, db)
 }
 
@@ -149,20 +131,9 @@ fn one_to_many_and_one_to_one() {
 #[test]
 fn optional_shape() {
     let (_d, db) = seed(None);
-    let v = db
-        .run_sync()
-        .user_dao()
-        .one_with_posts(1)
-        .unwrap()
-        .expect("존재");
+    let v = db.run_sync().user_dao().one_with_posts(1).unwrap().expect("존재");
     assert_eq!(v.posts.len(), 2);
-    assert!(
-        db.run_sync()
-            .user_dao()
-            .one_with_posts(999)
-            .unwrap()
-            .is_none()
-    );
+    assert!(db.run_sync().user_dao().one_with_posts(999).unwrap().is_none());
 }
 
 /// N:M — junction 경유 조립
@@ -198,19 +169,11 @@ fn relation_keys_are_chunked() {
     let counter = Arc::new(AtomicU64::new(0));
     let (_d, db) = seed(Some(counter.clone()));
     let h = db.run_sync();
-    h.execute(
-        "WITH RECURSIVE n(x) AS (VALUES(3) UNION ALL SELECT x+1 FROM n WHERE x<1001) INSERT INTO users(id,name) SELECT x, 'bulk' FROM n",
-        params![],
-    )
-    .unwrap();
+    h.execute("WITH RECURSIVE n(x) AS (VALUES(3) UNION ALL SELECT x+1 FROM n WHERE x<1001) INSERT INTO users(id,name) SELECT x, 'bulk' FROM n", params![]).unwrap();
     counter.store(0, Ordering::SeqCst);
     let views = h.user_dao().users_with_posts().unwrap();
     assert_eq!(views.len(), 1001);
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        5,
-        "부모 1 + 관계별 청크 2개"
-    );
+    assert_eq!(counter.load(Ordering::SeqCst), 5, "부모 1 + 관계별 청크 2개");
 }
 
 /// 999개를 넘는 N:M 부모 키와 자식 키를 각각 청킹한다.
@@ -219,26 +182,13 @@ fn junction_keys_are_chunked() {
     let counter = Arc::new(AtomicU64::new(0));
     let (_d, db) = seed(Some(counter.clone()));
     let h = db.run_sync();
-    h.execute(
-        "WITH RECURSIVE n(x) AS (VALUES(4) UNION ALL SELECT x+1 FROM n WHERE x<1001) INSERT INTO posts(id,user_id,title) SELECT x, 1, 'bulk' FROM n",
-        params![],
-    ).unwrap();
-    h.execute(
-        "WITH RECURSIVE n(x) AS (VALUES(3) UNION ALL SELECT x+1 FROM n WHERE x<1001) INSERT INTO tags(id,label) SELECT x, 'bulk' FROM n",
-        params![],
-    ).unwrap();
-    h.execute(
-        "WITH RECURSIVE n(x) AS (VALUES(3) UNION ALL SELECT x+1 FROM n WHERE x<1001) INSERT INTO post_tags(post_id,tag_id) SELECT x, x FROM n",
-        params![],
-    ).unwrap();
+    h.execute("WITH RECURSIVE n(x) AS (VALUES(4) UNION ALL SELECT x+1 FROM n WHERE x<1001) INSERT INTO posts(id,user_id,title) SELECT x, 1, 'bulk' FROM n", params![]).unwrap();
+    h.execute("WITH RECURSIVE n(x) AS (VALUES(3) UNION ALL SELECT x+1 FROM n WHERE x<1001) INSERT INTO tags(id,label) SELECT x, 'bulk' FROM n", params![]).unwrap();
+    h.execute("WITH RECURSIVE n(x) AS (VALUES(3) UNION ALL SELECT x+1 FROM n WHERE x<1001) INSERT INTO post_tags(post_id,tag_id) SELECT x, x FROM n", params![]).unwrap();
     counter.store(0, Ordering::SeqCst);
     let views = h.user_dao().posts_with_tags().unwrap();
     assert_eq!(views.len(), 1001);
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        5,
-        "부모 1 + 정션 2 + 자식 2"
-    );
+    assert_eq!(counter.load(Ordering::SeqCst), 5, "부모 1 + 정션 2 + 자식 2");
 }
 
 /// 비동기 with_relations — 워커에서 자동 tx 래핑

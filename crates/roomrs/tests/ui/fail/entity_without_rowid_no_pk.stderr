@@ -1,0 +1,5 @@
+error: without_rowid 테이블에는 PRIMARY KEY 가 필요합니다
+ --> tests/ui/fail/entity_without_rowid_no_pk.rs:4:8
+  |
+4 | struct Bad {
+  |        ^^^

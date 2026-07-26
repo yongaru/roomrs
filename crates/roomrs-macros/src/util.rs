@@ -19,10 +19,7 @@ pub fn to_snake_case(s: &str) -> String {
 /// 자동 생성 SQL 식별자에 인용 종료 문자가 없는지 검증한다.
 pub fn validate_sql_identifier(value: &str, span: proc_macro2::Span) -> syn::Result<()> {
     if value.contains('"') {
-        return Err(syn::Error::new(
-            span,
-            "SQL 식별자에는 큰따옴표를 사용할 수 없습니다",
-        ));
+        return Err(syn::Error::new(span, "SQL 식별자에는 큰따옴표를 사용할 수 없습니다"));
     }
     Ok(())
 }
@@ -155,20 +152,14 @@ mod tests {
     /// 파라미터 추출 — 리터럴/주석/캐스트 무시
     #[test]
     fn params_extraction() {
-        assert_eq!(
-            extract_named_params("SELECT * FROM t WHERE a = :a AND b = ':not' AND c = :b -- :no"),
-            vec!["a", "b"]
-        );
+        assert_eq!(extract_named_params("SELECT * FROM t WHERE a = :a AND b = ':not' AND c = :b -- :no"), vec!["a", "b"]);
         assert_eq!(extract_named_params("SELECT :x, :x, \":q\""), vec!["x"]);
     }
 
     /// 백틱·대괄호 식별자 안의 `:`는 파라미터가 아니다 (L-11)
     #[test]
     fn params_skip_quoted_identifiers() {
-        assert_eq!(
-            extract_named_params("SELECT `a:b`, [c:d] FROM t WHERE x = :x"),
-            vec!["x"]
-        );
+        assert_eq!(extract_named_params("SELECT `a:b`, [c:d] FROM t WHERE x = :x"), vec!["x"]);
         // 닫히지 않은 인용부 — 나머지 전체 스킵(파라미터 오탐 없음)
         assert!(extract_named_params("SELECT `a:b FROM t WHERE x = :x").is_empty());
     }
@@ -176,9 +167,6 @@ mod tests {
     /// 지원하지 않는 SQLite 파라미터 형식도 침묵 누락하지 않는다.
     #[test]
     fn unsupported_parameter_forms_are_detected() {
-        assert_eq!(
-            extract_named_params("SELECT @id, $name, ?12"),
-            vec!["@id", "$name", "?12"]
-        );
+        assert_eq!(extract_named_params("SELECT @id, $name, ?12"), vec!["@id", "$name", "?12"]);
     }
 }

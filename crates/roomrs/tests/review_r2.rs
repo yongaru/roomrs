@@ -34,27 +34,19 @@ struct Db;
 #[cfg(feature = "live")]
 fn open() -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::builder()
-        .sqlite(dir.path().join("r2.db"))
-        .build()
-        .unwrap();
+    let db = Db::builder().sqlite(dir.path().join("r2.db")).build().unwrap();
     (dir, db)
 }
 
 /// emit 대기 헬퍼 — 최대 2초
 #[cfg(feature = "live")]
 fn next<T: Clone + Send + 'static>(q: &LiveQuery<T>) -> T {
-    q.recv_timeout(Duration::from_secs(2))
-        .expect("수신 에러")
-        .expect("emit 타임아웃")
+    q.recv_timeout(Duration::from_secs(2)).expect("수신 에러").expect("emit 타임아웃")
 }
 
 /// 기대값 수렴 대기 — 과잉 emit(§9.4 최종 일관성)을 흡수하며 기대값 도달 확인
 #[cfg(feature = "live")]
-fn wait_for<T: Clone + Send + 'static + PartialEq + std::fmt::Debug>(
-    q: &LiveQuery<T>,
-    expected: T,
-) {
+fn wait_for<T: Clone + Send + 'static + PartialEq + std::fmt::Debug>(q: &LiveQuery<T>, expected: T) {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut last: Option<T> = None;
     while std::time::Instant::now() < deadline {
@@ -82,21 +74,13 @@ fn returning_write_via_query_wakes_watcher() {
     assert_eq!(next(&live), 0);
 
     // 자동 커밋 경로 — SyncHandle 쿼리 함수의 writer 분기 (H-1)
-    let row: Item = h
-        .query_one(
-            "INSERT INTO items (name, done) VALUES ('r', 0) RETURNING *",
-            params![],
-        )
-        .unwrap();
+    let row: Item = h.query_one("INSERT INTO items (name, done) VALUES ('r', 0) RETURNING *", params![]).unwrap();
     assert_eq!(row.name, "r");
     wait_for(&live, 1);
 
     // 트랜잭션 경로 — Tx의 writer-형 쿼리도 커밋 후 무효화 (H-1)
     h.transaction(|tx| {
-        let _: Item = tx.query_one(
-            "INSERT INTO items (name, done) VALUES ('t', 0) RETURNING *",
-            params![],
-        )?;
+        let _: Item = tx.query_one("INSERT INTO items (name, done) VALUES ('t', 0) RETURNING *", params![])?;
         Ok(())
     })
     .unwrap();
@@ -113,10 +97,7 @@ fn or_fail_partial_insert_still_invalidates() {
     assert_eq!(next(&live), 0);
 
     // id 중복 — OR FAIL은 에러 시 선행 행 변경을 되돌리지 않는다
-    let r = h.execute(
-        "INSERT OR FAIL INTO items (id, name, done) VALUES (1, 'a', 0), (1, 'b', 0)",
-        params![],
-    );
+    let r = h.execute("INSERT OR FAIL INTO items (id, name, done) VALUES (1, 'a', 0), (1, 'b', 0)", params![]);
     assert!(r.is_err(), "중복 pk = 에러");
     wait_for(&live, 1); // 선행 1행 영속 + 무효화 방출 (R3-1)
 }
@@ -132,19 +113,13 @@ fn failed_mapping_returning_still_invalidates() {
     assert_eq!(next(&live), 0);
 
     // name(TEXT)을 i64로 매핑 → 타입 불일치 실패. INSERT 자체는 영속된다
-    let r: roomrs::Result<i64> = h.query_scalar(
-        "INSERT INTO items (name, done) VALUES ('불일치', 0) RETURNING name",
-        params![],
-    );
+    let r: roomrs::Result<i64> = h.query_scalar("INSERT INTO items (name, done) VALUES ('불일치', 0) RETURNING name", params![]);
     assert!(r.is_err(), "매핑 실패 기대");
     wait_for(&live, 1); // write 영속 + 무효화 방출 (R2-2)
 
     // 트랜잭션 경로 — Tx의 매핑 실패 write도 커밋 시 무효화
     h.transaction(|tx| {
-        let r: roomrs::Result<i64> = tx.query_scalar(
-            "INSERT INTO items (name, done) VALUES ('둘', 0) RETURNING name",
-            params![],
-        );
+        let r: roomrs::Result<i64> = tx.query_scalar("INSERT INTO items (name, done) VALUES ('둘', 0) RETURNING name", params![]);
         assert!(r.is_err(), "매핑 실패 기대");
         Ok(())
     })
@@ -158,22 +133,14 @@ fn failed_mapping_returning_still_invalidates() {
 fn subquery_dependency_refreshes() {
     let (_d, db) = open();
     let h = db.run_sync();
-    h.execute(
-        "INSERT INTO items (id, name, done) VALUES (1, 'a', 0)",
-        params![],
-    )
-    .unwrap();
+    h.execute("INSERT INTO items (id, name, done) VALUES (1, 'a', 0)", params![]).unwrap();
 
-    let live: LiveQuery<i64> = h.watch_scalar(
-        "SELECT COUNT(*) FROM items WHERE id IN (SELECT id FROM audit)",
-        &[],
-    );
+    let live: LiveQuery<i64> = h.watch_scalar("SELECT COUNT(*) FROM items WHERE id IN (SELECT id FROM audit)", &[]);
     // 의존 추출이 서브쿼리를 방문해야 첫 수신이 에러가 아니다 (H-2)
     assert_eq!(next(&live), 0, "초기 emit — audit 비어 있음");
 
     // 내부(서브쿼리) 테이블 write → 재조회
-    h.execute("INSERT INTO audit (id, note) VALUES (1, 'x')", params![])
-        .unwrap();
+    h.execute("INSERT INTO audit (id, note) VALUES (1, 'x')", params![]).unwrap();
     wait_for(&live, 1);
 }
 
@@ -185,9 +152,7 @@ fn drop_db_inside_callback_no_deadlock() {
     // 본문을 별도 스레드에서 실행 — 교착 시 감시 타임아웃으로 실패
     std::thread::spawn(move || {
         let db = Db::builder().in_memory().build().unwrap();
-        let live: LiveQuery<i64> = db
-            .run_sync()
-            .watch_scalar("SELECT COUNT(*) FROM items", &[]);
+        let live: LiveQuery<i64> = db.run_sync().watch_scalar("SELECT COUNT(*) FROM items", &[]);
         assert_eq!(next(&live), 0);
 
         let (cb_tx, cb_rx) = std::sync::mpsc::channel::<()>();
@@ -200,16 +165,12 @@ fn drop_db_inside_callback_no_deadlock() {
             }
             let _ = cb_tx.send(());
         });
-        cb_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("콜백 내 DB drop이 완료되지 않음 (H-3 교착 의심)");
+        cb_rx.recv_timeout(Duration::from_secs(5)).expect("콜백 내 DB drop이 완료되지 않음 (H-3 교착 의심)");
         drop(guard);
         drop(live);
         let _ = finished_tx.send(());
     });
-    finished_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("본문 타임아웃 — 노티파이어 self-join 교착 의심 (H-3)");
+    finished_rx.recv_timeout(Duration::from_secs(10)).expect("본문 타임아웃 — 노티파이어 self-join 교착 의심 (H-3)");
 }
 
 /// M-2 — Tx::execute_batch write도 커밋 후 무효화를 방출한다
@@ -241,18 +202,11 @@ fn execute_select_does_not_invalidate() {
     assert_eq!(next(&live), 0);
 
     // 행을 반환하지 않는 SELECT — execute 성공, 문장 기반 방출 없어야 함 (L-2)
-    h.execute("SELECT id FROM items WHERE 1 = 0", params![])
-        .unwrap();
-    assert!(
-        live.recv_timeout(Duration::from_millis(400))
-            .unwrap()
-            .is_none(),
-        "SELECT = 무효화 없음"
-    );
+    h.execute("SELECT id FROM items WHERE 1 = 0", params![]).unwrap();
+    assert!(live.recv_timeout(Duration::from_millis(400)).unwrap().is_none(), "SELECT = 무효화 없음");
 
     // write는 여전히 방출 — 채널 정상 확인
-    h.execute("INSERT INTO items (name, done) VALUES ('w', 0)", params![])
-        .unwrap();
+    h.execute("INSERT INTO items (name, done) VALUES ('w', 0)", params![]).unwrap();
     wait_for(&live, 1);
 }
 
@@ -261,9 +215,7 @@ fn execute_select_does_not_invalidate() {
 #[test]
 fn iter_fuses_after_closed() {
     let (_d, db) = open();
-    let live: LiveQuery<i64> = db
-        .run_sync()
-        .watch_scalar("SELECT COUNT(*) FROM items", &[]);
+    let live: LiveQuery<i64> = db.run_sync().watch_scalar("SELECT COUNT(*) FROM items", &[]);
     assert_eq!(next(&live), 0);
     drop(db);
 
@@ -338,9 +290,7 @@ fn concurrent_migration_chain_mismatch_detected() {
         MigDb2::builder()
             .sqlite(&p_a)
             .migration(roomrs::Migration::code(1, 2, move |tx| {
-                tx.execute_batch(
-                    r#"ALTER TABLE "docs" ADD COLUMN "note" TEXT NOT NULL DEFAULT ''"#,
-                )?;
+                tx.execute_batch(r#"ALTER TABLE "docs" ADD COLUMN "note" TEXT NOT NULL DEFAULT ''"#)?;
                 e2.store(true, AO::SeqCst);
                 // B가 current=1을 읽고 스텝 락에서 대기할 때까지 유지
                 while !g2.load(AO::SeqCst) {

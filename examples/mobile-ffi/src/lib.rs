@@ -34,7 +34,13 @@ static DB: Mutex<Option<Db>> = Mutex::new(None);
 /// DB 락 획득 — extern "C" 경계에서 panic = abort이므로 절대 panic하지 않는다.
 /// poison은 무해(보호 대상이 단순 Option 상태뿐)라 into_inner로 복구해 계속 진행 (M-23).
 fn db_lock() -> std::sync::MutexGuard<'static, Option<Db>> {
-    DB.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    match DB.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::error!("FFI database lock poisoned; recovering");
+            poisoned.into_inner()
+        }
+    }
 }
 
 /// DB 열기 — path는 UTF-8 NUL 종료 경로. 0=성공.
@@ -53,7 +59,10 @@ pub unsafe extern "C" fn roomrs_open(path: *const c_char) -> i32 {
             *db_lock() = Some(db);
             0
         }
-        Err(_) => -3,
+        Err(_) => {
+            log::error!("FFI database open failed");
+            -3
+        }
     }
 }
 
@@ -70,13 +79,13 @@ pub unsafe extern "C" fn roomrs_add_note(body: *const c_char) -> i64 {
     let Ok(body) = cstr.to_str() else { return -2 };
     let guard = db_lock();
     let Some(db) = guard.as_ref() else { return -3 };
-    db.run_sync()
-        .note_dao()
-        .add(&Note {
-            id: 0,
-            body: body.to_string(),
-        })
-        .unwrap_or(-4)
+    match db.run_sync().note_dao().add(&Note { id: 0, body: body.to_string() }) {
+        Ok(id) => id,
+        Err(_) => {
+            log::error!("FFI note insert failed");
+            -4
+        }
+    }
 }
 
 /// 노트 개수
@@ -84,16 +93,26 @@ pub unsafe extern "C" fn roomrs_add_note(body: *const c_char) -> i64 {
 pub extern "C" fn roomrs_note_count() -> i64 {
     let guard = db_lock();
     let Some(db) = guard.as_ref() else { return -3 };
-    db.run_sync().note_dao().count().unwrap_or(-4)
+    match db.run_sync().note_dao().count() {
+        Ok(count) => count,
+        Err(_) => {
+            log::error!("FFI note count failed");
+            -4
+        }
+    }
 }
 
 /// 마지막 에러 메시지 예시 — 실제 앱은 스레드로컬 에러 버퍼 권장.
 /// 반환 문자열은 호출자가 roomrs_string_free로 해제.
 #[unsafe(no_mangle)]
 pub extern "C" fn roomrs_version() -> *mut c_char {
-    CString::new(env!("CARGO_PKG_VERSION"))
-        .expect("버전 문자열에 NUL 없음")
-        .into_raw()
+    match CString::new(env!("CARGO_PKG_VERSION")) {
+        Ok(version) => CString::into_raw(version),
+        Err(e) => {
+            log::error!("FFI version CString construction failed: {e}");
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// roomrs_version 등이 반환한 문자열 해제

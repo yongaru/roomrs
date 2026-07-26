@@ -11,11 +11,7 @@
 use std::process::{Command, ExitCode};
 
 /// 리눅스 zig 타깃 (gnu 2종 + 정적 musl)
-const LINUX_TARGETS: &[&str] = &[
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-unknown-linux-musl",
-];
+const LINUX_TARGETS: &[&str] = &["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl"];
 
 /// Android ABI (cargo-ndk 표기)
 const ANDROID_ABIS: &[&str] = &["arm64-v8a", "armeabi-v7a", "x86_64"];
@@ -63,11 +59,7 @@ fn run(desc: &str, cmd: &mut Command) -> ExitCode {
 fn cross_linux() -> ExitCode {
     for target in LINUX_TARGETS {
         // musl은 cdylib 대신 CLI 정적 바이너리 검증에 사용
-        let packages: &[&str] = if target.contains("musl") {
-            &["roomrs", "roomrs-cli"]
-        } else {
-            &["roomrs", "roomrs-mobile-ffi-example"]
-        };
+        let packages: &[&str] = if target.contains("musl") { &["roomrs", "roomrs-cli"] } else { &["roomrs", "roomrs-mobile-ffi-example"] };
         let mut cmd = Command::new("cargo");
         cmd.args(["zigbuild", "--target", target]);
         for p in packages {

@@ -6,6 +6,7 @@
 //! 실행: cargo run --example query_builder
 
 use roomrs::{Order, Query, col, dao, database, entity};
+mod support;
 
 #[entity(table = "products")]
 #[derive(Debug, Clone, PartialEq)]
@@ -34,20 +35,11 @@ struct SearchForm {
 }
 
 fn main() -> roomrs::Result<()> {
+    support::init_tracing();
     let db = Db::builder().in_memory().build()?;
     let h = db.run_sync();
-    for (n, p, c) in [
-        ("기계식 키보드", 120_000, "입력장치"),
-        ("무선 마우스", 45_000, "입력장치"),
-        ("모니터 27인치", 300_000, "디스플레이"),
-        ("키보드 루프", 9_000, "액세서리"),
-    ] {
-        h.product_dao().add(&Product {
-            id: 0,
-            name: n.into(),
-            price: p,
-            category: c.into(),
-        })?;
+    for (n, p, c) in [("기계식 키보드", 120_000, "입력장치"), ("무선 마우스", 45_000, "입력장치"), ("모니터 27인치", 300_000, "디스플레이"), ("키보드 루프", 9_000, "액세서리")] {
+        h.product_dao().add(&Product { id: 0, name: n.into(), price: p, category: c.into() })?;
     }
 
     // 1) 동적 조건 조립 — Room의 SupportSQLiteQuery 대응
@@ -80,9 +72,10 @@ fn main() -> roomrs::Result<()> {
     }
 
     // 3) 스키마 인지 — 오타 컬럼은 실행 전에 잡힌다
-    let bad: roomrs::Result<Vec<Product>> = Query::select::<Product>()
-        .and_where(col("prise").gt(0i64))
-        .fetch_all(db.run_sync());
-    println!("오타 컬럼: {}", bad.unwrap_err());
+    let bad: roomrs::Result<Vec<Product>> = Query::select::<Product>().and_where(col("prise").gt(0i64)).fetch_all(db.run_sync());
+    match bad {
+        Ok(_) => println!("오타 컬럼 검증이 예상과 다르게 통과했습니다"),
+        Err(e) => println!("오타 컬럼: {e}"),
+    }
     Ok(())
 }

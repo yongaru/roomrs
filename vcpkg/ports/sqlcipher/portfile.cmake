@@ -11,7 +11,7 @@ find_program(NMAKE nmake REQUIRED)
 
 # SQLite amalgamation 생성에 필요한 tclsh를 찾는다.
 file(GLOB TCLSH_CMD
-    ${CURRENT_INSTALLED_DIR}/tools/tcl/bin/tclsh*${VCPKG_HOST_EXECUTABLE_SUFFIX}
+    ${CURRENT_HOST_INSTALLED_DIR}/tools/tcl/bin/tclsh*${VCPKG_HOST_EXECUTABLE_SUFFIX}
 )
 file(TO_NATIVE_PATH "${TCLSH_CMD}" TCLSH_CMD)
 
@@ -36,6 +36,12 @@ vcpkg_execute_required_process(
     LOGNAME pre-build-${TARGET_TRIPLET}
 )
 message(STATUS "Pre-building ${TARGET_TRIPLET} done")
+
+vcpkg_replace_string(
+    "${SOURCE_PATH}/sqlcipher.pc.in"
+    [[${includedir}/sqlcipher]]
+    [[${includedir}]]
+)
 
 file(COPY ${CMAKE_CURRENT_LIST_DIR}/CMakeLists.txt DESTINATION "${SOURCE_PATH}")
 

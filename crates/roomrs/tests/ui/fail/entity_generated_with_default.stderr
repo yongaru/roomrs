@@ -1,0 +1,5 @@
+error: generated 컬럼에 default 를 함께 쓸 수 없습니다
+ --> tests/ui/fail/entity_generated_with_default.rs:8:5
+  |
+8 |     v: i64,
+  |     ^

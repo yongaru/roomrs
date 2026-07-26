@@ -25,25 +25,22 @@ mod offload {
     pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
 
     /// 자체 워커 풀 — `tokio` feature에서도 런타임 밖 폴백용으로 항상 컴파일 (H-6)
-    mod pool {
+    pub(crate) mod pool {
         use super::Job;
         use std::sync::LazyLock;
         use std::sync::mpsc::{Sender, channel};
 
         /// 워커 수 상한 — 환경변수 폭주로 인한 스레드 폭탄·초기화 지연 방지 (M-7)
-        const MAX_WORKERS: usize = 1024;
+        pub(crate) const MAX_WORKERS: usize = 1024;
 
         /// 워커 수 결정(순수 함수) — env 값 우선(0·비숫자는 무시), 1024 초과는 클램프,
         /// 기본 max(4, parallelism). 단위 테스트 대상 (M-7)
-        fn effective_worker_count(env_val: Option<&str>, parallelism: usize) -> usize {
+        pub(crate) fn effective_worker_count(env_val: Option<&str>, parallelism: usize) -> usize {
             if let Some(v) = env_val {
                 if let Ok(n) = v.trim().parse::<usize>() {
                     if n > MAX_WORKERS {
                         // 상한 초과 — 클램프하고 경고
-                        log::warn!(
-                            "ROOMRS_ASYNC_WORKERS={n} exceeds the cap; \
-                             clamped to {MAX_WORKERS}"
-                        );
+                        log::warn!("ROOMRS_ASYNC_WORKERS={n} exceeds the cap; clamped to {MAX_WORKERS}");
                         return MAX_WORKERS;
                     }
                     if n > 0 {
@@ -57,110 +54,72 @@ mod offload {
         /// 워커 수 결정 — 환경변수 `ROOMRS_ASYNC_WORKERS` 우선(0·비숫자는 무시),
         /// 기본 max(4, 코어 수), 상한 1024 (L-10, M-7)
         fn worker_count() -> usize {
-            let parallelism = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
-            effective_worker_count(
-                std::env::var("ROOMRS_ASYNC_WORKERS").ok().as_deref(),
-                parallelism,
-            )
+            let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            effective_worker_count(std::env::var("ROOMRS_ASYNC_WORKERS").ok().as_deref(), parallelism)
         }
 
         /// 전역 워커 풀 — 프로세스 수명, 프로세스 내 모든 Database 인스턴스 공유 (명세 §2.4)
         static POOL: LazyLock<Sender<Job>> = LazyLock::new(|| {
             let (tx, rx) = channel::<Job>();
             let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-            for i in 0..worker_count() {
+            let workers = worker_count();
+            log::info!("async worker pool initialized: workers={workers}");
+            for i in 0..workers {
                 let rx = std::sync::Arc::clone(&rx);
                 // 스레드 생성 실패는 무시 — 전부 실패하면 수신단이 닫혀
                 // send 실패 → oneshot 취소 → Error::Internal 로 감지된다
-                let _ = std::thread::Builder::new()
-                    .name(format!("roomrs-worker-{i}"))
-                    .spawn(move || {
-                        loop {
-                            // 락 안에서 recv — 경합은 작업 분배 시점뿐이라 병목 아님
-                            let job = {
-                                rx.lock()
-                                    .expect(
-                                        "논리적 불가능: 락 구간은 recv뿐이고 사용자 코드는 \
-                                         catch_unwind로 격리되어 poisoned 될 수 없음",
-                                    )
-                                    .recv()
-                            };
-                            match job {
-                                // 사용자 클로저 패닉 격리 — 워커는 죽지 않고 다음 작업 계속 (H-5).
-                                // 패닉한 job은 oneshot 송신단을 drop → 수신측이 Internal로 매핑
-                                Ok(job) => {
-                                    if let Err(payload) =
-                                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
-                                    {
-                                        // 패닉 메시지 추출 — &str/String 페이로드만,
-                                        // 그 외 타입은 대체 문구 (L-9)
-                                        let msg = payload
-                                            .downcast_ref::<&str>()
-                                            .map(|s| (*s).to_owned())
-                                            .or_else(|| payload.downcast_ref::<String>().cloned())
-                                            .unwrap_or_else(|| {
-                                                "<non-string panic payload>".to_owned()
-                                            });
-                                        // 로거 백엔드가 패닉해도 워커가 죽지 않도록
-                                        // warn 호출 자체도 격리 (정보-1)
-                                        let _ = std::panic::catch_unwind(move || {
-                                            log::warn!(
-                                                "async job panicked — isolated, \
-                                                 worker continues: {msg}"
-                                            );
-                                        });
-                                    }
+                let _ = std::thread::Builder::new().name(format!("roomrs-worker-{i}")).spawn(move || {
+                    loop {
+                        // 락 안에서 recv — 경합은 작업 분배 시점뿐이라 병목 아님
+                        let job = {
+                            let receiver = match rx.lock() {
+                                Ok(receiver) => receiver,
+                                Err(poisoned) => {
+                                    log::error!("async worker receiver lock poisoned; recovering");
+                                    poisoned.into_inner()
                                 }
-                                Err(_) => break, // 송신단 소멸 = 프로세스 종료 중
+                            };
+                            receiver.recv()
+                        };
+                        match job {
+                            // 사용자 클로저 패닉 격리 — 워커는 죽지 않고 다음 작업 계속 (H-5).
+                            // 패닉한 job은 oneshot 송신단을 drop → 수신측이 Internal로 매핑
+                            Ok(job) => {
+                                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    log::trace!("async worker started job: worker={i}");
+                                    job();
+                                    log::trace!("async worker completed job: worker={i}");
+                                }));
+                                if let Err(payload) = outcome {
+                                    // 패닉 메시지 추출 — &str/String 페이로드만,
+                                    // 그 외 타입은 대체 문구 (L-9)
+                                    let msg = payload.downcast_ref::<&str>().map(|s| (*s).to_owned()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_else(|| "<non-string panic payload>".to_owned());
+                                    // 로거 백엔드가 패닉해도 워커가 죽지 않도록
+                                    // warn 호출 자체도 격리 (정보-1)
+                                    let _ = std::panic::catch_unwind(move || {
+                                        log::warn!(
+                                            "async job panicked — isolated, \
+                                                 worker continues: {msg}"
+                                        );
+                                    });
+                                }
                             }
+                            Err(_) => {
+                                log::debug!("async worker stopping: worker={i}");
+                                break;
+                            } // 송신단 소멸 = 프로세스 종료 중
                         }
-                    });
+                    }
+                });
             }
             tx
         });
 
         /// 작업 제출 — 실패 시 job drop → oneshot 취소로 호출측 Err 반환(패닉 금지, H-5)
         pub(crate) fn spawn(job: Job) {
-            let _ = POOL.send(job);
-        }
-
-        /// effective_worker_count 단위 테스트 (M-7)
-        #[cfg(test)]
-        mod tests {
-            use super::{MAX_WORKERS, effective_worker_count};
-
-            // env 미설정 — 기본 max(4, parallelism)
-            #[test]
-            fn default_is_max_of_4_and_parallelism() {
-                assert_eq!(effective_worker_count(None, 1), 4);
-                assert_eq!(effective_worker_count(None, 4), 4);
-                assert_eq!(effective_worker_count(None, 16), 16);
-            }
-
-            // 0·비숫자·음수 값 무시 — 기본값 사용
-            #[test]
-            fn zero_and_invalid_are_ignored() {
-                assert_eq!(effective_worker_count(Some("0"), 8), 8);
-                assert_eq!(effective_worker_count(Some("abc"), 8), 8);
-                assert_eq!(effective_worker_count(Some(""), 8), 8);
-                assert_eq!(effective_worker_count(Some("-3"), 8), 8);
-            }
-
-            // 유효 값 채택 — 앞뒤 공백 트림 포함
-            #[test]
-            fn valid_value_is_used() {
-                assert_eq!(effective_worker_count(Some("2"), 8), 2);
-                assert_eq!(effective_worker_count(Some(" 32 "), 8), 32);
-            }
-
-            // 1024 초과 클램프 — 스레드 폭탄 방지 (M-7)
-            #[test]
-            fn huge_value_is_clamped_to_1024() {
-                assert_eq!(effective_worker_count(Some("1024"), 8), 1024);
-                assert_eq!(effective_worker_count(Some("1025"), 8), MAX_WORKERS);
-                assert_eq!(effective_worker_count(Some("999999999"), 8), MAX_WORKERS);
+            log::trace!("async job submitted to self-managed pool");
+            if POOL.send(job).is_err() {
+                log::error!("async job submission failed: worker pool disconnected");
             }
         }
     }
@@ -174,9 +133,15 @@ mod offload {
     pub(crate) fn spawn(job: Job) {
         match tokio::runtime::Handle::try_current() {
             // spawn_blocking 핸들은 버린다 — 완료 통지는 oneshot이 담당
-            Ok(h) => drop(h.spawn_blocking(job)),
+            Ok(h) => {
+                log::trace!("async job submitted to tokio blocking pool");
+                drop(h.spawn_blocking(job));
+            }
             // tokio 런타임 밖 — 자체 풀로 폴백
-            Err(_) => pool::spawn(job),
+            Err(_) => {
+                log::debug!("tokio runtime unavailable: using self-managed worker pool");
+                pool::spawn(job);
+            }
         }
     }
 }
@@ -193,6 +158,7 @@ where
     R: Send + 'static,
     F: FnOnce(SyncHandle<'_>) -> Result<R> + Send + 'static,
 {
+    log::trace!("async database operation scheduled");
     let (tx, rx) = futures_channel::oneshot::channel::<Result<R>>();
     offload::spawn(Box::new(move || {
         let out = f(inner.sync_handle());
@@ -251,9 +217,7 @@ impl AsyncHandle {
     /// This method is intended for code generated by `#[database]`.
     #[doc(hidden)]
     pub fn from_database(db: &Database) -> Self {
-        Self {
-            inner: db.inner_arc(),
-        }
+        Self { inner: db.inner_arc() }
     }
 
     /// Runs an arbitrary synchronous operation on a worker.
@@ -275,11 +239,7 @@ impl AsyncHandle {
     /// Dropping the returned future after it has been polled does not cancel
     /// the write; it still runs on the worker and only the result is
     /// discarded (see the [`AsyncHandle`] cancellation notes).
-    pub fn execute<S: Into<String>, P>(
-        &self,
-        sql: S,
-        params: P,
-    ) -> impl Future<Output = Result<u64>> + Send + use<S, P>
+    pub fn execute<S: Into<String>, P>(&self, sql: S, params: P) -> impl Future<Output = Result<u64>> + Send + use<S, P>
     where
         P: Params + Send + 'static,
     {
@@ -288,11 +248,7 @@ impl AsyncHandle {
     }
 
     /// Queries exactly one row, returning `Error::NotFound` when no row exists.
-    pub fn query_one<S: Into<String>, T, P>(
-        &self,
-        sql: S,
-        params: P,
-    ) -> impl Future<Output = Result<T>> + Send + use<S, T, P>
+    pub fn query_one<S: Into<String>, T, P>(&self, sql: S, params: P) -> impl Future<Output = Result<T>> + Send + use<S, T, P>
     where
         T: FromRow + Send + 'static,
         P: Params + Send + 'static,
@@ -302,11 +258,7 @@ impl AsyncHandle {
     }
 
     /// Queries zero or one row.
-    pub fn query_optional<S: Into<String>, T, P>(
-        &self,
-        sql: S,
-        params: P,
-    ) -> impl Future<Output = Result<Option<T>>> + Send + use<S, T, P>
+    pub fn query_optional<S: Into<String>, T, P>(&self, sql: S, params: P) -> impl Future<Output = Result<Option<T>>> + Send + use<S, T, P>
     where
         T: FromRow + Send + 'static,
         P: Params + Send + 'static,
@@ -316,11 +268,7 @@ impl AsyncHandle {
     }
 
     /// Queries one scalar value.
-    pub fn query_scalar<S: Into<String>, T, P>(
-        &self,
-        sql: S,
-        params: P,
-    ) -> impl Future<Output = Result<T>> + Send + use<S, T, P>
+    pub fn query_scalar<S: Into<String>, T, P>(&self, sql: S, params: P) -> impl Future<Output = Result<T>> + Send + use<S, T, P>
     where
         T: FromSql + Send + 'static,
         P: Params + Send + 'static,
@@ -330,11 +278,7 @@ impl AsyncHandle {
     }
 
     /// Queries zero or more rows.
-    pub fn query_all<S: Into<String>, T, P>(
-        &self,
-        sql: S,
-        params: P,
-    ) -> impl Future<Output = Result<Vec<T>>> + Send + use<S, T, P>
+    pub fn query_all<S: Into<String>, T, P>(&self, sql: S, params: P) -> impl Future<Output = Result<Vec<T>>> + Send + use<S, T, P>
     where
         T: FromRow + Send + 'static,
         P: Params + Send + 'static,
@@ -376,59 +320,59 @@ impl AsyncHandle {
 #[cfg(feature = "live")]
 impl AsyncHandle {
     /// Creates a live query that returns zero or more rows.
-    pub fn watch_all<T: FromRow + Clone + Send + 'static>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-    ) -> roomrs_core::LiveQuery<Vec<T>> {
+    pub fn watch_all<T: FromRow + Clone + Send + 'static>(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> roomrs_core::LiveQuery<Vec<T>> {
         self.inner.__watch_all_dyn(sql, params)
     }
 
     /// Creates a live query that returns zero or one row.
-    pub fn watch_optional<T: FromRow + Clone + Send + 'static>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-    ) -> roomrs_core::LiveQuery<Option<T>> {
+    pub fn watch_optional<T: FromRow + Clone + Send + 'static>(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> roomrs_core::LiveQuery<Option<T>> {
         self.inner.__watch_optional_dyn(sql, params)
     }
 
     /// Creates a live query that returns one scalar value.
-    pub fn watch_scalar<T: rusqlite::types::FromSql + Clone + Send + 'static>(
-        &self,
-        sql: &str,
-        params: &[&dyn rusqlite::ToSql],
-    ) -> roomrs_core::LiveQuery<T> {
+    pub fn watch_scalar<T: rusqlite::types::FromSql + Clone + Send + 'static>(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> roomrs_core::LiveQuery<T> {
         self.inner.__watch_scalar_dyn(sql, params)
+    }
+
+    /// Creates a row-filtered live query that returns zero or more rows.
+    /// Multiple filters are OR-matched (decision 52).
+    pub fn watch_all_filtered<T: FromRow + Clone + Send + 'static>(&self, sql: &str, params: &[&dyn rusqlite::ToSql], filters: impl roomrs_core::IntoInvalidationFilters) -> roomrs_core::LiveQuery<Vec<T>> {
+        self.inner.__watch_all_filtered_dyn(sql, params, filters.into_invalidation_filters())
+    }
+
+    /// Creates a row-filtered live query that returns zero or one row.
+    /// Multiple filters are OR-matched (decision 52).
+    pub fn watch_optional_filtered<T: FromRow + Clone + Send + 'static>(&self, sql: &str, params: &[&dyn rusqlite::ToSql], filters: impl roomrs_core::IntoInvalidationFilters) -> roomrs_core::LiveQuery<Option<T>> {
+        self.inner.__watch_optional_filtered_dyn(sql, params, filters.into_invalidation_filters())
+    }
+
+    /// Creates a row-filtered live query that returns one scalar value.
+    /// Multiple filters are OR-matched (decision 52).
+    pub fn watch_scalar_filtered<T: rusqlite::types::FromSql + Clone + Send + 'static>(&self, sql: &str, params: &[&dyn rusqlite::ToSql], filters: impl roomrs_core::IntoInvalidationFilters) -> roomrs_core::LiveQuery<T> {
+        self.inner.__watch_scalar_filtered_dyn(sql, params, filters.into_invalidation_filters())
     }
 }
 
 /// Implements the watch context used by generated DAO code.
 #[cfg(feature = "live")]
 impl roomrs_core::WatchContext for AsyncHandle {
-    fn ctx_watch_all_named<T: FromRow + Clone + Send + 'static>(
-        &self,
-        sql: &'static str,
-        params: Result<Vec<(String, rusqlite::types::Value)>>,
-        tables: &[&str],
-    ) -> roomrs_core::LiveQuery<Vec<T>> {
+    fn ctx_watch_all_named<T: FromRow + Clone + Send + 'static>(&self, sql: &'static str, params: Result<Vec<(String, rusqlite::types::Value)>>, tables: &[&str]) -> roomrs_core::LiveQuery<Vec<T>> {
         self.inner.__watch_all_named(sql, params, tables)
     }
-    fn ctx_watch_optional_named<T: FromRow + Clone + Send + 'static>(
-        &self,
-        sql: &'static str,
-        params: Result<Vec<(String, rusqlite::types::Value)>>,
-        tables: &[&str],
-    ) -> roomrs_core::LiveQuery<Option<T>> {
+    fn ctx_watch_optional_named<T: FromRow + Clone + Send + 'static>(&self, sql: &'static str, params: Result<Vec<(String, rusqlite::types::Value)>>, tables: &[&str]) -> roomrs_core::LiveQuery<Option<T>> {
         self.inner.__watch_optional_named(sql, params, tables)
     }
-    fn ctx_watch_scalar_named<T: rusqlite::types::FromSql + Clone + Send + 'static>(
-        &self,
-        sql: &'static str,
-        params: Result<Vec<(String, rusqlite::types::Value)>>,
-        tables: &[&str],
-    ) -> roomrs_core::LiveQuery<T> {
+    fn ctx_watch_scalar_named<T: rusqlite::types::FromSql + Clone + Send + 'static>(&self, sql: &'static str, params: Result<Vec<(String, rusqlite::types::Value)>>, tables: &[&str]) -> roomrs_core::LiveQuery<T> {
         self.inner.__watch_scalar_named(sql, params, tables)
+    }
+    fn ctx_watch_all_named_filtered<T: FromRow + Clone + Send + 'static>(&self, sql: &'static str, params: Result<Vec<(String, rusqlite::types::Value)>>, _tables: &[&str], filters: Vec<roomrs_core::InvalidationFilter>) -> roomrs_core::LiveQuery<Vec<T>> {
+        self.inner.__watch_all_named_filtered(sql, params, filters)
+    }
+    fn ctx_watch_optional_named_filtered<T: FromRow + Clone + Send + 'static>(&self, sql: &'static str, params: Result<Vec<(String, rusqlite::types::Value)>>, _tables: &[&str], filters: Vec<roomrs_core::InvalidationFilter>) -> roomrs_core::LiveQuery<Option<T>> {
+        self.inner.__watch_optional_named_filtered(sql, params, filters)
+    }
+    fn ctx_watch_scalar_named_filtered<T: rusqlite::types::FromSql + Clone + Send + 'static>(&self, sql: &'static str, params: Result<Vec<(String, rusqlite::types::Value)>>, _tables: &[&str], filters: Vec<roomrs_core::InvalidationFilter>) -> roomrs_core::LiveQuery<T> {
+        self.inner.__watch_scalar_named_filtered(sql, params, filters)
     }
 }
 
@@ -436,28 +380,15 @@ impl roomrs_core::WatchContext for AsyncHandle {
 
 /// Provides boxed futures for generated async DAO code.
 impl roomrs_core::Execute for &AsyncHandle {
-    type Out<R: Send + 'static> =
-        std::pin::Pin<Box<dyn Future<Output = Result<R>> + Send + 'static>>;
+    type Out<R: Send + 'static> = std::pin::Pin<Box<dyn Future<Output = Result<R>> + Send + 'static>>;
 
-    fn run_all<T: FromRow + Send + 'static>(
-        self,
-        sql: String,
-        params: Vec<rusqlite::types::Value>,
-    ) -> Self::Out<Vec<T>> {
+    fn run_all<T: FromRow + Send + 'static>(self, sql: String, params: Vec<rusqlite::types::Value>) -> Self::Out<Vec<T>> {
         Box::pin(self.query_all(sql, roomrs_core::params_from_iter(params)))
     }
-    fn run_optional<T: FromRow + Send + 'static>(
-        self,
-        sql: String,
-        params: Vec<rusqlite::types::Value>,
-    ) -> Self::Out<Option<T>> {
+    fn run_optional<T: FromRow + Send + 'static>(self, sql: String, params: Vec<rusqlite::types::Value>) -> Self::Out<Option<T>> {
         Box::pin(self.query_optional(sql, roomrs_core::params_from_iter(params)))
     }
-    fn run_one<T: FromRow + Send + 'static>(
-        self,
-        sql: String,
-        params: Vec<rusqlite::types::Value>,
-    ) -> Self::Out<T> {
+    fn run_one<T: FromRow + Send + 'static>(self, sql: String, params: Vec<rusqlite::types::Value>) -> Self::Out<T> {
         Box::pin(self.query_one(sql, roomrs_core::params_from_iter(params)))
     }
     fn run_scalar(self, sql: String, params: Vec<rusqlite::types::Value>) -> Self::Out<i64> {
@@ -488,5 +419,42 @@ where
         }));
         // 송신단 drop = 작업이 결과 없이 사라짐(패닉 또는 워커 풀 소멸) → Internal (H-5, L-11)
         rx.await.map_err(|_| job_lost_error())?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::offload::pool::{MAX_WORKERS, effective_worker_count};
+
+    /// env 미설정 — 기본 max(4, parallelism)
+    #[test]
+    fn default_worker_count_is_max_of_4_and_parallelism() {
+        assert_eq!(effective_worker_count(None, 1), 4);
+        assert_eq!(effective_worker_count(None, 4), 4);
+        assert_eq!(effective_worker_count(None, 16), 16);
+    }
+
+    /// 0·비숫자·음수 값은 기본값을 사용한다.
+    #[test]
+    fn invalid_worker_count_is_ignored() {
+        assert_eq!(effective_worker_count(Some("0"), 8), 8);
+        assert_eq!(effective_worker_count(Some("abc"), 8), 8);
+        assert_eq!(effective_worker_count(Some(""), 8), 8);
+        assert_eq!(effective_worker_count(Some("-3"), 8), 8);
+    }
+
+    /// 유효 값은 앞뒤 공백을 제외하고 사용한다.
+    #[test]
+    fn valid_worker_count_is_used() {
+        assert_eq!(effective_worker_count(Some("2"), 8), 2);
+        assert_eq!(effective_worker_count(Some(" 32 "), 8), 32);
+    }
+
+    /// 1024 초과 worker 수는 상한으로 제한한다.
+    #[test]
+    fn excessive_worker_count_is_clamped() {
+        assert_eq!(effective_worker_count(Some("1024"), 8), 1024);
+        assert_eq!(effective_worker_count(Some("1025"), 8), MAX_WORKERS);
+        assert_eq!(effective_worker_count(Some("999999999"), 8), MAX_WORKERS);
     }
 }

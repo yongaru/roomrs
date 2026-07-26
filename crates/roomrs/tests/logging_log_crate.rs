@@ -4,7 +4,7 @@
 //! 전역 로거는 프로세스당 1회만 설정 가능하므로 이 파일에는 테스트를 1개만 둔다
 //! (통합 테스트 파일 = 독립 바이너리 = 독립 프로세스).
 
-use roomrs::{Migration, database, entity};
+use roomrs::{DatabaseSpec, Migration, database, diff_plan, entity};
 use std::sync::{Mutex, OnceLock};
 
 /// 캡처된 로그 레코드 버퍼 (레벨 + 메시지)
@@ -28,10 +28,7 @@ impl log::Log for CaptureLogger {
 
     /// 레벨 + 메시지를 버퍼에 축적
     fn log(&self, record: &log::Record<'_>) {
-        records()
-            .lock()
-            .unwrap()
-            .push(format!("{} {}", record.level(), record.args()));
+        records().lock().unwrap().push(format!("{} {}", record.level(), record.args()));
     }
 
     /// 버퍼링 없음
@@ -76,68 +73,47 @@ fn emits_log_records_for_open_write_migration() {
     {
         let db = LogDb1::builder().sqlite(&path).build().unwrap();
         let h = db.run_sync();
-        h.execute(
-            "INSERT INTO log_items (name) VALUES (?1)",
-            roomrs::params!["secret-value-1"],
-        )
-        .unwrap();
-        h.transaction(|tx| {
-            tx.execute(
-                "INSERT INTO log_items (name) VALUES (?1)",
-                roomrs::params!["secret-value-2"],
-            )
-            .map(|_| ())
-        })
-        .unwrap();
+        h.execute("INSERT INTO log_items (name) VALUES (?1)", roomrs::params!["secret-value-1"]).unwrap();
+        h.transaction(|tx| tx.execute("INSERT INTO log_items (name) VALUES (?1)", roomrs::params!["secret-value-2"]).map(|_| ())).unwrap();
     } // drop = close 로그
 
     // v2 마이그레이션 체인 (1→2)
-    let db2 = LogDb2::builder()
-        .sqlite(&path)
-        .migration(Migration::sql(
-            1,
-            2,
-            r#"ALTER TABLE "log_items" ADD COLUMN "note" TEXT NOT NULL DEFAULT ''"#,
-        ))
-        .build()
-        .unwrap();
+    let db2 = LogDb2::builder().sqlite(&path).migration(Migration::sql(1, 2, r#"ALTER TABLE "log_items" ADD COLUMN "note" TEXT NOT NULL DEFAULT ''"#)).build().unwrap();
     drop(db2);
+
+    // 마이그레이션 체인이 없을 때 destructive fallback 경고를 발생시킨다.
+    let fallback_path = dir.path().join("fallback.db");
+    drop(LogDb1::builder().sqlite(&fallback_path).build().unwrap());
+    drop(LogDb2::builder().sqlite(&fallback_path).fallback_to_destructive_migration(true).build().unwrap());
+
+    // 잘못된 SQL 마이그레이션으로 오류 로그를 발생시킨다.
+    let failure_path = dir.path().join("failure.db");
+    drop(LogDb1::builder().sqlite(&failure_path).build().unwrap());
+    let failure = LogDb2::builder().sqlite(&failure_path).migration(Migration::sql(1, 2, "INVALID MIGRATION SQL")).build();
+    assert!(failure.is_err());
+
+    // migrate 라이브러리의 구조화 diff 진단 로그를 발생시킨다.
+    let old = LogDb2::schema().to_snapshot();
+    let new = LogDb1::schema().to_snapshot();
+    assert!(!diff_plan(&old, &new).destructive.is_empty());
 
     let all = records().lock().unwrap().join("\n");
 
     // 느슨한 조각 매칭 — 핵심 영어 조각만 확인 (문구 전체 고정 금지)
-    assert!(
-        all.contains("database opened"),
-        "open info 로그 없음:\n{all}"
-    );
-    assert!(
-        all.contains("schema created at version 1"),
-        "신규 스키마 info 로그 없음:\n{all}"
-    );
-    assert!(
-        all.contains("migration step: v1->v2"),
-        "마이그레이션 스텝 info 로그 없음:\n{all}"
-    );
-    assert!(
-        all.contains("transaction begin"),
-        "tx begin debug 로그 없음:\n{all}"
-    );
-    assert!(
-        all.contains("transaction commit"),
-        "tx commit debug 로그 없음:\n{all}"
-    );
-    assert!(
-        all.contains("SQL: INSERT INTO log_items"),
-        "SQL trace 로그 없음:\n{all}"
-    );
-    assert!(
-        all.contains("database closed"),
-        "close info 로그 없음:\n{all}"
-    );
+    assert!(all.contains("database opened"), "open info 로그 없음:\n{all}");
+    assert!(all.contains("schema created at version 1"), "신규 스키마 info 로그 없음:\n{all}");
+    assert!(all.contains("migration step: v1->v2"), "마이그레이션 스텝 info 로그 없음:\n{all}");
+    assert!(all.contains("transaction begin"), "tx begin debug 로그 없음:\n{all}");
+    assert!(all.contains("transaction commit"), "tx commit debug 로그 없음:\n{all}");
+    assert!(all.contains("SQL: INSERT INTO log_items"), "SQL trace 로그 없음:\n{all}");
+    assert!(all.contains("database closed"), "close info 로그 없음:\n{all}");
+    assert!(all.contains("pool connection acquired"), "풀 checkout trace 로그 없음:\n{all}");
+    assert!(all.contains("migration plan prepared"), "마이그레이션 계획 debug 로그 없음:\n{all}");
+    assert!(all.contains("schema diff completed"), "스키마 diff debug 로그 없음:\n{all}");
+    for level in ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"] {
+        assert!(all.contains(level), "{level} 레벨 로그 없음:\n{all}");
+    }
 
     // 민감정보 금지 — 파라미터 값은 어떤 로그에도 나타나면 안 된다
-    assert!(
-        !all.contains("secret-value"),
-        "파라미터 값이 로그에 노출됨:\n{all}"
-    );
+    assert!(!all.contains("secret-value"), "파라미터 값이 로그에 노출됨:\n{all}");
 }

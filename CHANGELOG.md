@@ -7,9 +7,37 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-27
+
+### Added
+
+- 복합 `#[pk]`, `#[entity(primary_key(...))]`, table `UNIQUE`, 복합·정렬·partial index, 복합 foreign key, `CHECK`, custom SQL column type, trigger file hook을 포함하는 SQLite schema DSL을 제공합니다.
+- `collate`, generated column, `STRICT`, `WITHOUT ROWID`, index column `COLLATE`를 DDL·snapshot·hash·diff에 일관되게 반영합니다.
+- `#[column(default = "...")]`의 SQL을 snapshot에 보존하고, `NOT NULL DEFAULT` 신규 컬럼을 안전한 forward migration으로 분류합니다.
+- `cargo roomrs schema export`와 `cargo roomrs schema check`가 workspace의 library·binary target에서 `#[database]`를 자동 탐색합니다. 일반 `cargo build`와 `cargo test`는 schema 파일을 쓰지 않습니다.
+- `#[database(version = auto)]`가 최신 snapshot과 entity hash를 비교해 변경 시 다음 revision JSON과 검토용 forward migration SQL 초안을 생성합니다.
+- sync·async·DAO LiveQuery에 행 필터 API를 대칭 제공하며, 여러 `InvalidationFilter`를 OR 조건으로 결합할 수 있습니다.
+- LiveQuery에 DB 전역 및 observer별 debounce 설정, 기본 250ms 고정 coalesce 창, 통합 connection pool을 사용하는 bounded 재조회 worker pool을 제공합니다.
+- `Database::live_metrics()`와 filter schema 검증을 제공해 LiveQuery 수신·병합·재조회 상태와 설정 오류를 확인할 수 있습니다.
+- 모든 `roomrs::Error`에서 발생 영역 `ErrorPath`와 권장 조치 `ErrorAdvice`를 조회할 수 있습니다.
+- SQLCipher vcpkg overlay와 Windows system backend 검증·설치 스크립트를 제공합니다.
+
 ### Changed
 
-- 네 backend 조합과 여섯 충돌 조합을 CI에서 검증하고, Windows vcpkg system backend 설치·링크·배포 계약을 한영 README에 문서화했습니다.
+- 기본 feature는 bundled SQLite, async, tokio, live, time, uuid, json입니다. SQLCipher는 명시적으로 선택합니다.
+- CLI 실행파일을 `cargo-roomrs` 하나로 통합하고 schema·migration 명령을 `cargo roomrs ...` 형식으로 제공합니다.
+- 라이브러리 로그는 `log` 파사드만 사용하며, 예제와 CLI는 `RUST_LOG`를 지원하는 `tracing-log` 브리지를 사용합니다.
+- `#[pk]`를 여러 필드에 지정하면 필드 선언 순서대로 복합 PRIMARY KEY를 생성합니다. `#[pk(autoincrement)]`는 단일 정수 키에서만 허용합니다.
+- schema snapshot export는 기존 같은 revision을 덮어쓰지 않으며, hash 불일치·파손·파괴적 diff를 구조화된 오류와 수정 조언으로 보고합니다.
+- LiveQuery notifier는 이벤트 병합과 작업 제출만 담당하고, 재조회는 `roomrs-live-worker-{n}`이 통합 read/write pool에서 connection을 빌려 수행합니다.
+
+### Fixed
+
+- 비테스트 실행 경로의 panic 가능 연산을 구조화된 오류 반환 또는 안전 복구와 `log::error!` 기록으로 전환했습니다.
+- callback, `Drop`, background thread, FFI처럼 `Result`를 반환할 수 없는 경계에서 panic을 격리하고 종료·복구 정책을 명시했습니다.
+- LiveQuery callback 안에서 `Database`를 drop할 때 worker 종료 대기가 교착되는 문제를 수정했습니다.
+- trigger SQL 파일 내용 변경이 macro 재전개와 schema content hash에 반영됩니다.
+- SQLCipher overlay의 host Tcl, header 설치 경로, 정적 OpenSSL link와 Windows CRT 구성을 정합화했습니다.
 
 ## [0.2.4] - 2026-07-17
 
@@ -89,7 +117,9 @@
 - bundled SQLite를 기본 제공하고 선택적 SQLCipher(`cipher`) 및 데스크톱·모바일 크로스 빌드를 지원합니다.
 - Rust 1.85와 Edition 2024를 지원하며 MIT OR Apache-2.0 듀얼 라이선스로 배포합니다.
 
-[Unreleased]: https://github.com/yongaru/roomrs/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/yongaru/roomrs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/yongaru/roomrs/compare/v0.2.4...v0.3.0
+[0.2.4]: https://github.com/yongaru/roomrs/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/yongaru/roomrs/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/yongaru/roomrs/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/yongaru/roomrs/compare/v0.2.0...v0.2.1

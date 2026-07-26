@@ -9,24 +9,19 @@
 // 코어 표면
 pub use roomrs_core::{Col, Execute, Expr, IntoDbValue, Order, Query, SelectBuilder, col};
 pub use roomrs_core::{
-    ColumnMeta, ColumnSnapshot, Database, DatabaseBuilder, DatabaseSpec, DiffPlan, EmbeddedSchema,
-    Entity, Error, FromRow, Insertable, Migration, MigrationPolicy, MigrationStep, Params, Result,
-    SCHEMA_DIR_RELATIVE, SchemaDef, SchemaSnapshot, SqlContext, SyncHandle, TableMeta,
-    TableSnapshot, ToSql, ToSqlOutput, Tx, check_schema_snapshot, compress_snapshot,
-    decompress_snapshot, diff_plan, diff_sql, export_schema_for_test, list_snapshot_versions,
-    outputs_to_values, params, params_from_iter, resolve_schema_dir, rusqlite, snapshot_file_name,
-    snapshot_path, to_owned_value, write_schema_snapshot,
+    ColumnMeta, ColumnSnapshot, Database, DatabaseBuilder, DatabaseSpec, DiffPlan, EmbeddedSchema, Entity, Error, ErrorAdvice, ErrorPath, FromRow, GeneratedColumnMeta, GeneratedColumnSnapshot, Insertable, Migration, MigrationPolicy, MigrationStep, Params, PlannedExportAction, PlannedSnapshotWrite, Result, SCHEMA_DIR_RELATIVE, SchemaDef, SchemaExportEntry, SchemaSnapshot, SqlContext, SyncHandle,
+    TableMeta, TableSnapshot, ToSql, ToSqlOutput, TriggerMeta, TriggerSnapshot, Tx, check_export_entry, check_schema_snapshot, compress_snapshot, decompress_snapshot, diff_plan, diff_sql, export_schema_snapshot, list_snapshot_versions, outputs_to_values, params, params_from_iter, plan_export_auto, plan_export_for_entry, plan_export_snapshot, resolve_schema_dir, run_registered_schema_check,
+    run_registered_schema_export, rusqlite, snapshot_file_name, snapshot_path, to_owned_value, write_schema_snapshot,
 };
 pub use roomrs_core::{RelationView, in_placeholders, load_children, load_junction};
 
 // 라이브 쿼리 (명세 §5.6, §9)
 #[cfg(feature = "live")]
-pub use roomrs_core::{
-    InvalidationFilter, InvalidationFilterBuilder, InvalidationGroupBuilder, LiveQuery,
-    SubscriptionGuard, WatchContext,
-};
+pub use roomrs_core::{DEFAULT_DEBOUNCE, IntoInvalidationFilters, InvalidationFilter, InvalidationFilterBuilder, InvalidationGroupBuilder, LiveMetrics, LiveQuery, SubscriptionGuard, WatchContext};
 
 // 매크로
+#[doc(hidden)]
+pub use roomrs_macros::roomrs_export;
 pub use roomrs_macros::{Relation, dao, database, entity, migrations_dir};
 
 // 매크로 생성 코드 전용 — 직접 사용 금지

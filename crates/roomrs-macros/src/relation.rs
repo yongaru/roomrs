@@ -46,14 +46,7 @@ struct JunctionMeta {
 
 /// 키 문자열 → 러스트 식별자 — 무효 시 원인 속성 span에 한국어 에러 (M-13)
 fn key_ident(s: &str, what: &str, attr: &syn::Attribute) -> syn::Result<syn::Ident> {
-    syn::parse_str::<syn::Ident>(s).map_err(|_| {
-        syn::Error::new(
-            attr.span(),
-            format!(
-                "{what} \"{s}\" 는 유효한 러스트 식별자여야 합니다 — SQL 컬럼명이 필드명과 다르면 entity_column 을 사용하세요"
-            ),
-        )
-    })
+    syn::parse_str::<syn::Ident>(s).map_err(|_| syn::Error::new(attr.span(), format!("{what} \"{s}\" 는 유효한 러스트 식별자여야 합니다 — SQL 컬럼명이 필드명과 다르면 entity_column 을 사용하세요")))
 }
 
 /// 필드 타입에서 Vec/Option 내부 추출
@@ -81,23 +74,17 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     let ident = input.ident.clone();
 
     let Data::Struct(data) = &input.data else {
-        return Err(syn::Error::new(
-            input.span(),
-            "#[derive(Relation)]은 구조체 전용입니다",
-        ));
+        return Err(syn::Error::new(input.span(), "#[derive(Relation)]은 구조체 전용입니다"));
     };
     let Fields::Named(fields) = &data.fields else {
-        return Err(syn::Error::new(
-            input.span(),
-            "named 필드 구조체만 지원합니다",
-        ));
+        return Err(syn::Error::new(input.span(), "named 필드 구조체만 지원합니다"));
     };
 
     let mut embedded: Option<(syn::Ident, Type)> = None;
     let mut relations: Vec<RelationField> = Vec::new();
 
     for field in &fields.named {
-        let fident = field.ident.clone().expect("named 필드 보장");
+        let fident = field.ident.clone().ok_or_else(|| syn::Error::new(field.span(), "named struct 필드가 필요합니다"))?;
         let mut is_embedded = false;
         let mut rel: Option<RelationField> = None;
 
@@ -106,10 +93,7 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                 is_embedded = true;
             } else if attr.path().is_ident("relation") {
                 let Some((many, child_ty)) = unwrap_container(&field.ty) else {
-                    return Err(syn::Error::new(
-                        field.ty.span(),
-                        "관계 필드는 Vec<Child>(1:N/N:M) 또는 Option<Child>(1:1)여야 합니다",
-                    ));
+                    return Err(syn::Error::new(field.ty.span(), "관계 필드는 Vec<Child>(1:N/N:M) 또는 Option<Child>(1:1)여야 합니다"));
                 };
                 let mut parent_key = None;
                 let mut entity_key = None;
@@ -146,18 +130,12 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                         j_entity = Some(get(&meta)?);
                         Ok(())
                     } else {
-                        Err(meta.error(
-                            "알 수 없는 relation 인자 — entity/parent_key/entity_key/entity_column/junction/junction_parent_key/junction_entity_key",
-                        ))
+                        Err(meta.error("알 수 없는 relation 인자 — entity/parent_key/entity_key/entity_column/junction/junction_parent_key/junction_entity_key"))
                     }
                 })?;
 
-                let parent_key = parent_key.ok_or_else(|| {
-                    syn::Error::new(attr.span(), "parent_key = \"…\" 가 필요합니다")
-                })?;
-                let entity_key = entity_key.ok_or_else(|| {
-                    syn::Error::new(attr.span(), "entity_key = \"…\" 가 필요합니다")
-                })?;
+                let parent_key = parent_key.ok_or_else(|| syn::Error::new(attr.span(), "parent_key = \"…\" 가 필요합니다"))?;
+                let entity_key = entity_key.ok_or_else(|| syn::Error::new(attr.span(), "entity_key = \"…\" 가 필요합니다"))?;
                 // SQL 컬럼명 기본값 = entity_key — #[column(name)] 사용 엔티티만
                 // entity_column 으로 분리 지정 (M-14)
                 let entity_column = entity_column.unwrap_or_else(|| entity_key.clone());
@@ -167,16 +145,9 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                 let entity_key = key_ident(&entity_key, "entity_key", attr)?;
                 let junction = match (junction_table, j_parent, j_entity) {
                     (None, None, None) => None,
-                    (Some(t), Some(p), Some(e)) => Some(JunctionMeta {
-                        table: t,
-                        parent_key: p,
-                        entity_key: e,
-                    }),
+                    (Some(t), Some(p), Some(e)) => Some(JunctionMeta { table: t, parent_key: p, entity_key: e }),
                     _ => {
-                        return Err(syn::Error::new(
-                            attr.span(),
-                            "N:M은 junction/junction_parent_key/junction_entity_key 세 개가 모두 필요합니다",
-                        ));
+                        return Err(syn::Error::new(attr.span(), "N:M은 junction/junction_parent_key/junction_entity_key 세 개가 모두 필요합니다"));
                     }
                 };
                 rel = Some(RelationField {
@@ -192,34 +163,22 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         }
 
         if is_embedded && rel.is_some() {
-            return Err(syn::Error::new(
-                fident.span(),
-                "한 필드에 #[embedded]와 #[relation]을 함께 사용할 수 없습니다",
-            ));
+            return Err(syn::Error::new(fident.span(), "한 필드에 #[embedded]와 #[relation]을 함께 사용할 수 없습니다"));
         }
         if is_embedded {
             if embedded.is_some() {
-                return Err(syn::Error::new(
-                    fident.span(),
-                    "#[embedded] 필드는 1개만 허용됩니다",
-                ));
+                return Err(syn::Error::new(fident.span(), "#[embedded] 필드는 1개만 허용됩니다"));
             }
             embedded = Some((fident, field.ty.clone()));
         } else if let Some(r) = rel {
             relations.push(r);
         } else {
-            return Err(syn::Error::new(
-                fident.span(),
-                "관계 뷰의 모든 필드는 #[embedded] 또는 #[relation(...)]이어야 합니다",
-            ));
+            return Err(syn::Error::new(fident.span(), "관계 뷰의 모든 필드는 #[embedded] 또는 #[relation(...)]이어야 합니다"));
         }
     }
 
     let Some((parent_ident, parent_ty)) = embedded else {
-        return Err(syn::Error::new(
-            input.span(),
-            "#[embedded] 부모 필드가 필요합니다",
-        ));
+        return Err(syn::Error::new(input.span(), "#[embedded] 부모 필드가 필요합니다"));
     };
 
     // 관계별 로딩 코드 — 부모 키 수집 → IN 조회 → 그룹핑 맵
@@ -287,17 +246,11 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     // 아래처럼 관계마다 같은 __keys를 재사용하되, parent_key가 전 관계 동일함을 검증.
     if let Some(first) = relations.first() {
         if relations.iter().any(|r| r.parent_key != first.parent_key) {
-            return Err(syn::Error::new(
-                ident.span(),
-                "v1 제약: 모든 #[relation]의 parent_key는 동일해야 합니다",
-            ));
+            return Err(syn::Error::new(ident.span(), "v1 제약: 모든 #[relation]의 parent_key는 동일해야 합니다"));
         }
     }
     // parent_key 는 이미 검증된 Ident (M-13) — format_ident! 불필요
-    let parent_key_ident = relations
-        .first()
-        .map(|r| r.parent_key.clone())
-        .unwrap_or_else(|| format_ident!("id"));
+    let parent_key_ident = relations.first().map(|r| r.parent_key.clone()).unwrap_or_else(|| format_ident!("id"));
 
     Ok(quote! {
         impl ::roomrs::RelationView for #ident {

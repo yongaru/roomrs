@@ -1,0 +1,5 @@
+error: generated 컬럼은 PK 가 될 수 없습니다
+ --> tests/ui/fail/entity_generated_pk.rs:7:5
+  |
+7 |     id: i64,
+  |     ^^
