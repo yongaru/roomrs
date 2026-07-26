@@ -114,12 +114,51 @@ cargo run
 
 전체 과정과 실패 시 조치 방법은 [상세 사용 가이드](docs/USAGE.md#스키마를-변경할-때)를 참고하세요.
 
+## 엔티티가 아닌 SELECT 결과 구조체
+
+테이블 전체를 나타내는 `#[entity]`만 조회 결과로 사용할 수 있는 것은 아닙니다. JOIN, 집계, 일부 컬럼 projection처럼 뷰에 가까운 결과는 일반 구조체에 `FromRow`를 구현해 받을 수 있습니다.
+
+```rust
+use roomrs::dao;
+
+#[derive(Debug)]
+struct TodoListItem {
+    todo_id: i64,
+    title: String,
+    owner_name: String,
+}
+
+impl roomrs::FromRow for TodoListItem {
+    fn from_row(row: &roomrs::rusqlite::Row<'_>) -> roomrs::rusqlite::Result<Self> {
+        Ok(Self {
+            todo_id: row.get("todo_id")?,
+            title: row.get("title")?,
+            owner_name: row.get("owner_name")?,
+        })
+    }
+}
+
+#[dao]
+trait TodoViewDao {
+    #[query(
+        "SELECT t.id AS todo_id, t.title, u.name AS owner_name
+         FROM todos t
+         JOIN users u ON u.id = t.owner_id
+         ORDER BY t.id"
+    )]
+    fn list_items(&self) -> roomrs::Result<Vec<TodoListItem>>;
+}
+```
+
+`TodoListItem`에는 `#[entity]`가 필요하지 않으며 `#[database(entities(...))]`에도 등록하지 않습니다. 따라서 새 테이블이나 스키마가 생성되지 않습니다. 생성된 DAO 접근자를 사용하려면 `TodoViewDao`만 `daos(...)`에 등록합니다. 같은 구조체를 `run_sync().query_all(...)`, 비동기 직접 조회, `UPDATE`·`DELETE ... RETURNING` 결과에도 사용할 수 있습니다. 자세한 DAO·직접 조회 예제는 [임의 SELECT 결과 구조체](docs/USAGE.md#임의-select-결과-구조체)를 참고하세요.
+
 ## 주요 기능
 
 | 기능 | 설명 |
 |---|---|
 | 엔티티 DSL | 단일·복합 PK, DEFAULT, UNIQUE, CHECK, FK, 정렬·부분 index, generated column, custom SQL type, trigger file |
 | DAO | `#[query]`, `#[insert]`, `#[update]`, `#[delete]`, `#[transaction]` |
+| SELECT 결과 구조체 | `FromRow`를 구현한 일반 구조체로 JOIN·집계·projection 결과 매핑 |
 | SQL 검증 | 스키마 스냅샷 기반 테이블·컬럼 검사와 `:name` 파라미터 대조 |
 | LiveQuery | commit 이후 자동 재조회, 행 필터, observer debounce, 동기·Stream 소비 |
 | 트랜잭션 | DAO transaction, 클로저 transaction, 중첩 savepoint, RAII rollback |

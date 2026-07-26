@@ -114,12 +114,51 @@ After changing an entity, increment the version or use `version = auto`, then ru
 
 See [Changing a schema](docs/USAGE-en.md#changing-a-schema) for the complete workflow and failure recovery.
 
+## SELECT result structs without entities
+
+Query results are not limited to whole-table `#[entity]` types. For view-like results such as joins, aggregates, and partial-column projections, implement `FromRow` on an ordinary struct.
+
+```rust
+use roomrs::dao;
+
+#[derive(Debug)]
+struct TodoListItem {
+    todo_id: i64,
+    title: String,
+    owner_name: String,
+}
+
+impl roomrs::FromRow for TodoListItem {
+    fn from_row(row: &roomrs::rusqlite::Row<'_>) -> roomrs::rusqlite::Result<Self> {
+        Ok(Self {
+            todo_id: row.get("todo_id")?,
+            title: row.get("title")?,
+            owner_name: row.get("owner_name")?,
+        })
+    }
+}
+
+#[dao]
+trait TodoViewDao {
+    #[query(
+        "SELECT t.id AS todo_id, t.title, u.name AS owner_name
+         FROM todos t
+         JOIN users u ON u.id = t.owner_id
+         ORDER BY t.id"
+    )]
+    fn list_items(&self) -> roomrs::Result<Vec<TodoListItem>>;
+}
+```
+
+`TodoListItem` does not need `#[entity]` and must not be listed in `#[database(entities(...))]`. It therefore creates no table or schema object. Register only `TodoViewDao` in `daos(...)` when a generated DAO accessor is needed. The same struct works with `run_sync().query_all(...)`, direct asynchronous queries, and `UPDATE` or `DELETE ... RETURNING` results. See [arbitrary SELECT result structs](docs/USAGE-en.md#arbitrary-select-result-structs) for DAO and direct-query examples.
+
 ## Key features
 
 | Feature | Description |
 |---|---|
 | Entity DSL | Single/composite PKs, DEFAULT, UNIQUE, CHECK, FKs, ordered/partial indexes, generated columns, custom SQL types, trigger files |
 | DAO | `#[query]`, `#[insert]`, `#[update]`, `#[delete]`, `#[transaction]` |
+| SELECT result structs | Map joins, aggregates, and projections into ordinary structs implementing `FromRow` |
 | SQL validation | Snapshot-based table/column checks and `:name` parameter matching |
 | LiveQuery | Refresh after commit, row filters, observer debounce, sync and Stream consumers |
 | Transactions | DAO transactions, closure transactions, nested savepoints, RAII rollback |

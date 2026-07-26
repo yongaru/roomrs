@@ -488,6 +488,80 @@ fn custom(&self) -> roomrs::Result<Vec<String>>;
 
 `unchecked`도 SQL 파라미터와 메서드 인자의 정합성은 검사합니다. 일반 쿼리에 사용하면 컬럼 오타를 런타임까지 숨기므로 피하세요.
 
+`#[update]`와 `#[delete]`는 보통 `Result<u64>` 영향 행 수를 반환합니다. SQL에 `RETURNING`이 있으면 `Result<T>`, `Result<Option<T>>`, `Result<Vec<T>>`로 반환할 수 있으며 `T`에는 아래와 같은 `FromRow` 규칙이 적용됩니다.
+
+### 임의 SELECT 결과 구조체
+
+조회 결과 타입은 `#[entity]`일 필요가 없습니다. JOIN, 집계, 별칭을 사용한 projection처럼 독립 테이블과 일치하지 않는 결과는 일반 구조체에 `FromRow`를 직접 구현합니다.
+
+다음 예제는 기존 `todos`, `users` 엔티티를 JOIN하지만 반환값은 별도 테이블이 아닌 화면용 구조체입니다.
+
+```rust
+use roomrs::dao;
+
+#[derive(Debug, Clone)]
+struct TodoListItem {
+    todo_id: i64,
+    title: String,
+    owner_name: String,
+}
+
+impl roomrs::FromRow for TodoListItem {
+    fn from_row(row: &roomrs::rusqlite::Row<'_>) -> roomrs::rusqlite::Result<Self> {
+        Ok(Self {
+            todo_id: row.get("todo_id")?,
+            title: row.get("title")?,
+            owner_name: row.get("owner_name")?,
+        })
+    }
+}
+
+#[dao]
+trait TodoViewDao {
+    #[query(
+        "SELECT t.id AS todo_id, t.title, u.name AS owner_name
+         FROM todos t
+         JOIN users u ON u.id = t.owner_id
+         WHERE t.done = :done
+         ORDER BY t.id"
+    )]
+    fn list_items(&self, done: bool) -> roomrs::Result<Vec<TodoListItem>>;
+}
+```
+
+이 구조체에는 `#[entity]`를 붙이지 않고 `#[database(entities(...))]`에도 넣지 않습니다. 따라서 snapshot, DDL, migration 대상이 되지 않습니다. 생성된 `todo_view_dao()` 접근자를 사용하려면 `TodoViewDao`만 `#[database(..., daos(...))]`에 등록합니다. SQL이 참조하는 실제 테이블과 컬럼은 등록된 엔티티 snapshot을 기준으로 계속 검증되며, SELECT alias와 `row.get(...)` 이름은 일치해야 합니다.
+
+DAO 없이 직접 조회할 수도 있습니다.
+
+```rust
+let handle = db.run_sync();
+let items: Vec<TodoListItem> = handle.query_all(
+    "SELECT t.id AS todo_id, t.title, u.name AS owner_name
+     FROM todos t
+     JOIN users u ON u.id = t.owner_id
+     WHERE t.done = ?1
+     ORDER BY t.id",
+    roomrs::params![false],
+)?;
+```
+
+`RETURNING` 결과도 같은 방식으로 매핑합니다.
+
+```rust
+#[update(
+    "UPDATE todos SET title = :title
+     WHERE id = :id
+     RETURNING id AS todo_id, title, '' AS owner_name"
+)]
+fn rename_returning(
+    &self,
+    id: i64,
+    title: String,
+) -> roomrs::Result<TodoListItem>;
+```
+
+동기 직접 조회는 `query_one`, `query_optional`, `query_all`을 제공합니다. 비동기 handle의 같은 메서드는 `.await`하며, 반환 구조체가 `Send + 'static`이어야 합니다. `LiveQuery` 결과로 사용하려면 `Clone + Send + 'static`도 충족해야 합니다.
+
 ### insert
 
 ```rust
@@ -507,6 +581,7 @@ trait TodoDao {
 - 기본 `#[insert]`는 autoincrement PK를 제외합니다.
 - `keep_pk`는 PK를 INSERT 컬럼에 포함합니다.
 - `on_conflict` 값으로 `replace`, `abort`, `rollback`, `fail`을 사용할 수 있습니다.
+- parser는 `ignore`도 인식하지만 `#[insert]`의 필수 `Result<i64>` rowid 계약과 양립하지 않으므로 컴파일 오류입니다.
 - `#[insert]`는 항상 `Result<i64>` 새 rowid를 반환합니다. `INSERT OR IGNORE`처럼 0행 성공이 가능한 동작은 `#[insert]`로 표현할 수 없으므로 영향 행 수를 반환하는 명시적 SQL DAO 메서드를 사용하세요.
 
 ## 동적 Query Builder
@@ -1243,7 +1318,7 @@ cargo build
 - LiveQuery는 같은 프로세스의 roomrs 연결에서 발생한 변경만 관찰합니다.
 - async transaction 클로저 내부 `.await`는 지원하지 않습니다.
 - `#[embedded]`는 관계 뷰 부모 마커이며 엔티티 컬럼 평탄화 기능이 아닙니다.
-- view 전용 entity DSL은 제공하지 않습니다. 임의 SELECT 결과 구조체를 사용하려면 `FromRow`를 직접 구현합니다.
+- view 전용 entity DSL은 제공하지 않습니다. JOIN·집계·projection은 [임의 SELECT 결과 구조체](#임의-select-결과-구조체)에 설명한 일반 구조체와 `FromRow`를 사용합니다.
 - 자동 migration은 정방향 안전 연산만 실행합니다.
 - 스키마 version은 배포 후 변경 불가능한 revision으로 취급해야 합니다.
 - snapshot 모든 version이 바이너리에 내장되므로 장기 프로젝트에서는 크기가 누적됩니다.

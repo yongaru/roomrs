@@ -488,6 +488,80 @@ fn custom(&self) -> roomrs::Result<Vec<String>>;
 
 `unchecked` still validates SQL parameter names against method arguments. Avoid it for ordinary queries because it moves column typo detection to runtime.
 
+`#[update]` and `#[delete]` normally return an affected-row count as `Result<u64>`. When the SQL contains `RETURNING`, they may return `Result<T>`, `Result<Option<T>>`, or `Result<Vec<T>>`; `T` follows the same `FromRow` rules described below.
+
+### Arbitrary SELECT result structs
+
+A query result type does not need to be an `#[entity]`. For joins, aggregates, and aliased projections that do not match a standalone table, implement `FromRow` directly on an ordinary struct.
+
+The following query joins existing `todos` and `users` entities but returns a screen-specific struct rather than another table.
+
+```rust
+use roomrs::dao;
+
+#[derive(Debug, Clone)]
+struct TodoListItem {
+    todo_id: i64,
+    title: String,
+    owner_name: String,
+}
+
+impl roomrs::FromRow for TodoListItem {
+    fn from_row(row: &roomrs::rusqlite::Row<'_>) -> roomrs::rusqlite::Result<Self> {
+        Ok(Self {
+            todo_id: row.get("todo_id")?,
+            title: row.get("title")?,
+            owner_name: row.get("owner_name")?,
+        })
+    }
+}
+
+#[dao]
+trait TodoViewDao {
+    #[query(
+        "SELECT t.id AS todo_id, t.title, u.name AS owner_name
+         FROM todos t
+         JOIN users u ON u.id = t.owner_id
+         WHERE t.done = :done
+         ORDER BY t.id"
+    )]
+    fn list_items(&self, done: bool) -> roomrs::Result<Vec<TodoListItem>>;
+}
+```
+
+Do not add `#[entity]` to this struct or list it in `#[database(entities(...))]`. It is therefore not part of snapshots, DDL, or migrations. Register only `TodoViewDao` in `#[database(..., daos(...))]` when the generated `todo_view_dao()` accessor is needed. The actual tables and columns referenced by the SQL are still checked against registered entity snapshots. SELECT aliases must match the names passed to `row.get(...)`.
+
+The same type also works without a DAO:
+
+```rust
+let handle = db.run_sync();
+let items: Vec<TodoListItem> = handle.query_all(
+    "SELECT t.id AS todo_id, t.title, u.name AS owner_name
+     FROM todos t
+     JOIN users u ON u.id = t.owner_id
+     WHERE t.done = ?1
+     ORDER BY t.id",
+    roomrs::params![false],
+)?;
+```
+
+Map `RETURNING` results in the same way:
+
+```rust
+#[update(
+    "UPDATE todos SET title = :title
+     WHERE id = :id
+     RETURNING id AS todo_id, title, '' AS owner_name"
+)]
+fn rename_returning(
+    &self,
+    id: i64,
+    title: String,
+) -> roomrs::Result<TodoListItem>;
+```
+
+Synchronous direct queries provide `query_one`, `query_optional`, and `query_all`. The corresponding asynchronous handle methods are awaited and require the result struct to be `Send + 'static`. Using it as a `LiveQuery` result additionally requires `Clone + Send + 'static`.
+
 ### insert
 
 ```rust
@@ -507,6 +581,7 @@ trait TodoDao {
 - Plain `#[insert]` excludes an autoincrement PK.
 - `keep_pk` includes PK columns in the INSERT.
 - `on_conflict` accepts `replace`, `abort`, `rollback`, and `fail`.
+- The parser also recognizes `ignore`, but it is incompatible with the mandatory `Result<i64>` rowid contract of `#[insert]` and is rejected at compile time.
 - `#[insert]` always returns a new rowid as `Result<i64>`. For an operation such as `INSERT OR IGNORE` that may succeed with zero rows, use an explicit SQL DAO method returning an affected-row count.
 
 ## Dynamic Query Builder
@@ -1245,7 +1320,7 @@ Another connection or process holds a write lock for too long. Keep transactions
 - LiveQuery observes changes only from roomrs connections in the same process.
 - `.await` inside an async transaction closure is not supported.
 - `#[embedded]` marks a relation view parent and does not flatten entity columns.
-- There is no view-specific entity DSL. Implement `FromRow` manually for arbitrary SELECT result structs.
+- There is no view-specific entity DSL. Use an ordinary struct and `FromRow` for joins, aggregates, and projections as described in [arbitrary SELECT result structs](#arbitrary-select-result-structs).
 - Automatic migration executes only safe forward operations.
 - Treat every deployed schema version as an immutable revision.
 - Every snapshot version is embedded, so binary size accumulates in long-lived projects.

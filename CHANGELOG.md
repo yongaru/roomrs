@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- README와 상세 사용 가이드에 `#[entity]` 없이 일반 구조체와 `FromRow`로 JOIN·집계·projection SELECT 결과를 받는 DAO·직접 조회 예제를 추가했습니다.
+
 ## [0.3.0] - 2026-07-27
 
 ### Added
