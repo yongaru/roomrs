@@ -7,9 +7,18 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-27
+
 ### Changed
 
 - README, 상세 사용 가이드, 동기 Todo 예제에 `query_one`, `query_optional`, `query_all`, `query_scalar`, `execute`와 `UPDATE ... RETURNING`으로 SQL 문자열을 직접 실행하는 방법을 추가했습니다.
+
+### Fixed
+
+- trigger SQL 파일의 CRLF/CR 줄바꿈을 LF로 정규화해 Windows와 Unix 계열 환경에서 동일한 schema snapshot hash를 사용합니다.
+- schema export registry 테스트의 전역 환경변수 경합을 제거했습니다.
+- LiveQuery worker 병렬성 테스트의 800만 행 재귀 SQL을 결정적 채널 동기화로 교체해 CPU 성능에 따른 타임아웃을 제거했습니다.
+- fixed debounce 테스트의 scheduler 허용 범위를 넓혀 macOS CI의 시간 경합을 제거했습니다.
 
 ## [0.4.0] - 2026-07-27
 

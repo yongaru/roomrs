@@ -16,11 +16,6 @@ struct ExportDb;
 #[test]
 fn plan_export_creates_missing_and_noops_same_hash() {
     let dir = tempfile::tempdir().unwrap();
-    let schema_dir = dir.path().join("migrations/schema");
-    // SAFETY: 테스트 격리용 ROOMRS_SCHEMA_DIR
-    unsafe {
-        std::env::set_var("ROOMRS_SCHEMA_DIR", &schema_dir);
-    }
     let manifest = dir.path().to_str().expect("utf8 path");
 
     let plan = plan_export_snapshot(ExportDb::DB_NAME, ExportDb::VERSION, &ExportDb::schema(), manifest).expect("plan");
@@ -37,10 +32,6 @@ fn plan_export_creates_missing_and_noops_same_hash() {
     let err = plan_export_snapshot(ExportDb::DB_NAME, ExportDb::VERSION, &ExportDb::schema(), manifest).expect_err("drift");
     let msg = err.to_string();
     assert!(msg.contains("스테일") || msg.contains("stale") || msg.contains("덮어쓰지"), "{msg}");
-
-    unsafe {
-        std::env::remove_var("ROOMRS_SCHEMA_DIR");
-    }
 }
 
 /// inventory 등록 — ExportDb 가 링크되면 엔트리 존재
@@ -55,10 +46,6 @@ fn inventory_registers_export_db() {
 #[test]
 fn auto_export_noop_and_safe_forward() {
     let dir = tempfile::tempdir().unwrap();
-    let schema_dir = dir.path().join("migrations/schema");
-    unsafe {
-        std::env::set_var("ROOMRS_SCHEMA_DIR", &schema_dir);
-    }
     let manifest = dir.path().to_str().expect("utf8");
 
     // 최초: v1 생성, SQL 없음
@@ -71,8 +58,4 @@ fn auto_export_noop_and_safe_forward() {
     // 동일 엔티티 = no-op
     let actions = plan_export_auto("export_db", &ExportDb::schema(), manifest).expect("noop");
     assert!(matches!(actions.as_slice(), [PlannedExportAction::Snapshot(p)] if p.is_noop()));
-
-    unsafe {
-        std::env::remove_var("ROOMRS_SCHEMA_DIR");
-    }
 }

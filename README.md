@@ -49,7 +49,7 @@ PostgreSQL·MySQL 같은 서버 DB, Active Record, 다중 DB 추상화가 필요
 ```sh
 cargo new roomrs-example
 cd roomrs-example
-cargo add roomrs@0.4.0
+cargo add roomrs@0.4.1
 cargo install roomrs-cli
 ```
 
@@ -224,7 +224,7 @@ Android Room 사용자라면 [Room과 roomrs 대응표](docs/USAGE.md#android-ro
 기본 구성:
 
 ```toml
-roomrs = "0.4.0"
+roomrs = "0.4.1"
 ```
 
 기본 feature는 `sqlite-bundled`, `async`, `tokio`, `live`, `time`, `uuid`, `json`입니다.
@@ -233,7 +233,7 @@ roomrs = "0.4.0"
 
 ```toml
 roomrs = {
-    version = "0.4.0",
+    version = "0.4.1",
     default-features = false,
     features = ["sqlite-bundled"]
 }
@@ -243,7 +243,7 @@ SQLCipher:
 
 ```toml
 roomrs = {
-    version = "0.4.0",
+    version = "0.4.1",
     default-features = false,
     features = ["sqlcipher-bundled", "async", "tokio", "live", "time", "uuid", "json"]
 }

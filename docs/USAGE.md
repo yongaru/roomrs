@@ -47,7 +47,7 @@ roomrs 프로젝트의 반복 작업은 다음 네 단계입니다.
 
 ```toml
 [dependencies]
-roomrs = "0.4.0"
+roomrs = "0.4.1"
 ```
 
 ```sh
@@ -77,7 +77,7 @@ cargo roomrs --help
 ```toml
 [dependencies]
 roomrs = {
-    version = "0.4.0",
+    version = "0.4.1",
     default-features = false,
     features = ["sqlite-bundled"]
 }
@@ -98,7 +98,7 @@ SQLCipher bundled 예:
 
 ```toml
 roomrs = {
-    version = "0.4.0",
+    version = "0.4.1",
     default-features = false,
     features = [
         "sqlcipher-bundled",
@@ -130,7 +130,7 @@ Windows system backend는 저장소의 [`vcpkg/build-sqlcipher-system.cmd`](../v
 ```sh
 cargo new roomrs-example
 cd roomrs-example
-cargo add roomrs@0.4.0
+cargo add roomrs@0.4.1
 cargo install roomrs-cli
 ```
 
@@ -445,7 +445,7 @@ struct AppDb;
 
 trigger는 테이블 부속 속성이 아니라 DB schema 객체입니다. 선언마다 `name`과 `sql` 또는 `file` 중 하나를 지정합니다. 파일 경로는 package의 `CARGO_MANIFEST_DIR` 기준입니다. SQL은 non-TEMP `CREATE TRIGGER` 문을 정확히 하나 포함해야 하며 선언 이름과 SQL 이름이 같아야 합니다. 한 connection에만 존재하는 TEMP trigger는 지원하지 않습니다.
 
-이름·전체 SQL·선언 source가 snapshot과 hash에 포함됩니다. 신규 DB는 table과 index를 만든 뒤 trigger를 생성합니다. trigger 추가·삭제는 `CREATE TRIGGER`·`DROP TRIGGER`, 내용 변경은 drop 후 재생성하는 안전한 forward migration으로 자동 합성됩니다.
+이름·전체 SQL·선언 source가 snapshot과 hash에 포함됩니다. 파일 SQL의 CRLF/CR 줄바꿈은 읽을 때 LF로 정규화되므로 Windows와 Unix 계열 환경이 같은 hash를 사용합니다. 신규 DB는 table과 index를 만든 뒤 trigger를 생성합니다. trigger 추가·삭제는 `CREATE TRIGGER`·`DROP TRIGGER`, 내용 변경은 drop 후 재생성하는 안전한 forward migration으로 자동 합성됩니다.
 
 ## DAO 정의
 

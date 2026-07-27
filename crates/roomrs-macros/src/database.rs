@@ -136,7 +136,12 @@ fn load_trigger_file(file: &LitStr) -> syn::Result<(String, std::path::PathBuf)>
     let manifest = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| syn::Error::new(file.span(), "CARGO_MANIFEST_DIR 없음 — trigger file은 cargo 빌드에서만 사용할 수 있습니다"))?;
     let path = std::path::Path::new(&manifest).join(file.value());
     let sql = std::fs::read_to_string(&path).map_err(|error| syn::Error::new(file.span(), format!("trigger SQL 파일 읽기 실패: {} — {error}", path.display())))?;
-    Ok((sql, path))
+    Ok((normalize_trigger_sql(&sql), path))
+}
+
+/// 파일 trigger의 플랫폼별 줄바꿈을 snapshot 기준 LF로 정규화한다.
+fn normalize_trigger_sql(sql: &str) -> String {
+    sql.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// trigger SQL 개수와 선언 이름을 검증한다.
@@ -584,5 +589,11 @@ mod tests {
         assert!(parsed.triggers[0].file.is_none());
         assert_eq!(parsed.triggers[1].file.as_ref().map(LitStr::value).as_deref(), Some("fixtures/sample_trigger.sql"));
         assert!(parsed.triggers[1].sql.value().contains("CREATE TRIGGER sample"));
+    }
+
+    /// trigger 파일 줄바꿈은 플랫폼과 무관하게 LF로 정규화한다.
+    #[test]
+    fn normalizes_trigger_file_line_endings() {
+        assert_eq!(normalize_trigger_sql("CREATE TRIGGER t\r\nBEGIN\rSELECT 1;\r\nEND;\r\n"), "CREATE TRIGGER t\nBEGIN\nSELECT 1;\nEND;\n");
     }
 }

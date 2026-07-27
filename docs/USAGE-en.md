@@ -47,7 +47,7 @@ change entities
 
 ```toml
 [dependencies]
-roomrs = "0.4.0"
+roomrs = "0.4.1"
 ```
 
 ```sh
@@ -77,7 +77,7 @@ Default features:
 ```toml
 [dependencies]
 roomrs = {
-    version = "0.4.0",
+    version = "0.4.1",
     default-features = false,
     features = ["sqlite-bundled"]
 }
@@ -98,7 +98,7 @@ Bundled SQLCipher example:
 
 ```toml
 roomrs = {
-    version = "0.4.0",
+    version = "0.4.1",
     default-features = false,
     features = [
         "sqlcipher-bundled",
@@ -130,7 +130,7 @@ For a Windows system backend, the repository provides [`vcpkg/build-sqlcipher-sy
 ```sh
 cargo new roomrs-example
 cd roomrs-example
-cargo add roomrs@0.4.0
+cargo add roomrs@0.4.1
 cargo install roomrs-cli
 ```
 
@@ -445,7 +445,7 @@ struct AppDb;
 
 A trigger is a database schema object rather than an entity attribute. Each declaration requires `name` and exactly one of `sql` or `file`. File paths are relative to the package's `CARGO_MANIFEST_DIR`. The SQL must contain exactly one non-TEMP `CREATE TRIGGER` statement, and its name must match the declared name. TEMP triggers are connection-local and therefore unsupported.
 
-The name, complete SQL, and declaration source are included in the snapshot and hash. A new database creates triggers after tables and indexes. Trigger additions and removals become `CREATE TRIGGER` and `DROP TRIGGER`; definition changes become drop-and-recreate safe forward migrations.
+The name, complete SQL, and declaration source are included in the snapshot and hash. CRLF and CR line endings in SQL files are normalized to LF when read, so Windows and Unix-like environments use the same hash. A new database creates triggers after tables and indexes. Trigger additions and removals become `CREATE TRIGGER` and `DROP TRIGGER`; definition changes become drop-and-recreate safe forward migrations.
 
 ## Defining DAOs
 

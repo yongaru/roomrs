@@ -49,7 +49,7 @@ If you need PostgreSQL or MySQL, Active Record, or a multi-database abstraction,
 ```sh
 cargo new roomrs-example
 cd roomrs-example
-cargo add roomrs@0.4.0
+cargo add roomrs@0.4.1
 cargo install roomrs-cli
 ```
 
@@ -224,7 +224,7 @@ Android Room users can start with the [Room-to-roomrs mapping](docs/USAGE-en.md#
 Default configuration:
 
 ```toml
-roomrs = "0.4.0"
+roomrs = "0.4.1"
 ```
 
 The default features are `sqlite-bundled`, `async`, `tokio`, `live`, `time`, `uuid`, and `json`.
@@ -233,7 +233,7 @@ Minimal synchronous configuration:
 
 ```toml
 roomrs = {
-    version = "0.4.0",
+    version = "0.4.1",
     default-features = false,
     features = ["sqlite-bundled"]
 }
@@ -243,7 +243,7 @@ SQLCipher:
 
 ```toml
 roomrs = {
-    version = "0.4.0",
+    version = "0.4.1",
     default-features = false,
     features = ["sqlcipher-bundled", "async", "tokio", "live", "time", "uuid", "json"]
 }

@@ -140,21 +140,20 @@ fn async_filtered_watch_works() {
 fn debounce_window_is_fixed_not_sliding() {
     let (_dir, db) = open();
     let h = db.run_sync();
-    let q: LiveQuery<i64> = h.watch_scalar_filtered("SELECT COUNT(*) FROM items WHERE kind = 'a'", params![], kind_filter("a")).debounce(Duration::from_millis(300));
+    let q: LiveQuery<i64> = h.watch_scalar_filtered("SELECT COUNT(*) FROM items WHERE kind = 'a'", params![], kind_filter("a")).debounce(Duration::from_millis(1000));
     assert_eq!(next(&q), 0);
 
     let t0 = Instant::now();
     h.execute("INSERT INTO items(kind, value) VALUES ('a', 1)", params![]).unwrap();
     // 창 안 추가 무효화 — 만료 시각 연장 없이 병합
-    std::thread::sleep(Duration::from_millis(80));
+    std::thread::sleep(Duration::from_millis(300));
     h.execute("INSERT INTO items(kind, value) VALUES ('a', 2)", params![]).unwrap();
-    std::thread::sleep(Duration::from_millis(80));
+    std::thread::sleep(Duration::from_millis(300));
     h.execute("INSERT INTO items(kind, value) VALUES ('a', 3)", params![]).unwrap();
 
-    assert!(q.recv_timeout(Duration::from_millis(50)).unwrap().is_none(), "창 만료 전 emit 금지");
     assert_eq!(next(&q), 3);
     let elapsed = t0.elapsed();
-    // 고정 창 ≈300ms. sliding 이면 마지막 insert 기준 ~300ms 추가 → ~460ms+
-    assert!(elapsed >= Duration::from_millis(250), "너무 빠름: {elapsed:?}");
-    assert!(elapsed < Duration::from_millis(450), "sliding 연장 의심: {elapsed:?}");
+    // 고정 창 ≈1초. sliding 이면 마지막 insert부터 1초를 다시 기다려 ≈1.6초 이상이다.
+    assert!(elapsed >= Duration::from_millis(850), "너무 빠름: {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1400), "sliding 연장 의심: {elapsed:?}");
 }

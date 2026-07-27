@@ -3,7 +3,10 @@
 // drop 후 emit 0 · rebind 스테일 폐기 · subscribe/into_stream
 #![cfg(feature = "live")]
 
-use roomrs::{LiveQuery, dao, database, entity, params};
+use roomrs::{FromRow, LiveQuery, dao, database, entity, params};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 #[entity(table = "items")]
@@ -68,6 +71,57 @@ fn open() -> (tempfile::TempDir, Db) {
     (dir, db)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct BlockingCount(i64);
+
+static BLOCKING_ROW_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+struct BlockingRowGate {
+    entered: Mutex<Option<Sender<()>>>,
+    release: Mutex<Option<Receiver<()>>>,
+}
+
+static BLOCKING_ROW_GATE: OnceLock<BlockingRowGate> = OnceLock::new();
+
+/// worker 점유 테스트용 채널 상태를 반환한다.
+fn blocking_row_gate() -> &'static BlockingRowGate {
+    BLOCKING_ROW_GATE.get_or_init(|| BlockingRowGate { entered: Mutex::new(None), release: Mutex::new(None) })
+}
+
+impl FromRow for BlockingCount {
+    /// 두 번째 조회만 동기화 지점에서 정지해 worker 점유를 결정적으로 만든다.
+    fn from_row(row: &roomrs::rusqlite::Row<'_>) -> roomrs::rusqlite::Result<Self> {
+        let value = row.get(0)?;
+        if BLOCKING_ROW_CALLS.fetch_add(1, Ordering::SeqCst) == 1 {
+            let entered = blocking_row_gate().entered.lock().map_err(|_| roomrs::rusqlite::Error::InvalidQuery)?.take().ok_or(roomrs::rusqlite::Error::InvalidQuery)?;
+            let release = blocking_row_gate().release.lock().map_err(|_| roomrs::rusqlite::Error::InvalidQuery)?.take().ok_or(roomrs::rusqlite::Error::InvalidQuery)?;
+            entered.send(()).map_err(|_| roomrs::rusqlite::Error::InvalidQuery)?;
+            release.recv_timeout(Duration::from_secs(5)).map_err(|_| roomrs::rusqlite::Error::InvalidQuery)?;
+        }
+        Ok(Self(value))
+    }
+}
+
+struct BlockingWorkerRelease(Option<Sender<()>>);
+
+impl BlockingWorkerRelease {
+    /// 느린 worker를 해제하고 Drop의 중복 해제를 막는다.
+    fn release(mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl Drop for BlockingWorkerRelease {
+    /// assertion 실패에도 worker를 해제해 DB 종료 교착을 막는다.
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
 /// 구독 즉시 1회 emit + write 후 재조회 emit (명세 §9.1)
 #[test]
 fn initial_and_write_emit() {
@@ -112,34 +166,34 @@ fn live_refresh_uses_unified_pool_on_open_state() {
 /// 느린 LiveQuery 가 다른 observer 재조회를 막지 않는다 (결정 51 worker pool)
 #[test]
 fn slow_live_query_does_not_block_other_observer() {
+    BLOCKING_ROW_CALLS.store(0, Ordering::SeqCst);
+    let (entered_tx, entered_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    *blocking_row_gate().entered.lock().unwrap() = Some(entered_tx);
+    *blocking_row_gate().release.lock().unwrap() = Some(release_rx);
+
     let dir = tempfile::tempdir().unwrap();
     let db = Db::builder().sqlite(dir.path().join("slow.db")).connections(3).notifier_readers(2).build().unwrap();
     let h = db.run_sync();
     h.execute("INSERT INTO items(name, done) VALUES ('seed', 0)", params![]).unwrap();
 
-    // 느린 재조회 — busy-wait 로 worker 를 점유
-    let slow: LiveQuery<i64> = h
-        .watch_scalar(
-            "WITH RECURSIVE t(x) AS ( \
-               SELECT 1 \
-               UNION ALL \
-               SELECT x+1 FROM t WHERE x < 8000000 \
-             ) \
-             SELECT COUNT(*) FROM t, items",
-            &[],
-        )
-        .watching(&["items"])
-        .debounce(Duration::ZERO);
-    let _ = next(&slow); // 초기 emit (느릴 수 있음)
+    let slow: LiveQuery<Option<BlockingCount>> = h.watch_optional("SELECT COUNT(*) FROM items", &[]).watching(&["items"]).debounce(Duration::ZERO);
+    assert_eq!(next(&slow), Some(BlockingCount(1)));
 
-    let fast: LiveQuery<i64> = h.watch_scalar("SELECT COUNT(*) FROM items", &[]).debounce(Duration::ZERO);
-    assert_eq!(next(&fast), 1);
+    let fast: LiveQuery<i64> = h.watch_scalar("SELECT COUNT(*) FROM audit", &[]).debounce(Duration::ZERO);
+    assert_eq!(next(&fast), 0);
 
-    // 느린 쿼리 무효화 후 즉시 빠른 쿼리 write — 빠른 쪽이 먼저 emit 되어야 함
+    // items observer worker가 재조회 도중 정지한 상태를 확정한다.
     h.execute("INSERT INTO items(name, done) VALUES ('a', 0)", params![]).unwrap();
-    let t0 = std::time::Instant::now();
-    assert_eq!(next(&fast), 2, "느린 재조회와 병렬로 빠른 LiveQuery emit");
-    assert!(t0.elapsed() < Duration::from_secs(2), "빠른 observer 가 느린 쿼리에 막히면 안 됨: {:?}", t0.elapsed());
+    entered_rx.recv_timeout(Duration::from_secs(2)).expect("느린 worker 진입 타임아웃");
+    let release = BlockingWorkerRelease(Some(release_tx));
+
+    // 다른 테이블 observer는 남은 worker에서 재조회되어야 한다.
+    h.execute("INSERT INTO audit(note) VALUES ('fast')", params![]).unwrap();
+    assert_eq!(next(&fast), 1, "점유된 worker와 병렬로 빠른 LiveQuery emit");
+
+    release.release();
+    assert_eq!(next(&slow), Some(BlockingCount(2)));
 }
 
 /// WHERE 없는 DELETE(truncate 최적화) — 문장 기반 주 경로가 잡는다 (명세 §9.2)

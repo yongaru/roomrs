@@ -1,10 +1,10 @@
-# roomrs — 0.4.0 기능 명세 (Agent Spec) · **SQLite 전용 · 동기+비동기**
+# roomrs — 0.4.1 기능 명세 (Agent Spec) · **SQLite 전용 · 동기+비동기**
 
 > Android **Room** 과 동일한 개발 경험을 목표로 하는 Rust용 **로컬 SQLite 퍼시스턴스** 라이브러리.
 > 백엔드: **SQLite 전용 — SQLite/SQLCipher bundled/system 링크 선택, 기본은 bundled SQLite**. 다른 DB 지원 없음. API: **동기 1급 + 비동기(런타임 무관 std Future + tokio 통합)**. 기반: **rusqlite** 동기 코어 + **자체 통합 미니 풀(N)**.
 >
 > 본 문서는 **에이전트/구현자 실행용 명세**다. 사람용 개요는 `README.md` 참조.
-> 제품 버전: **0.4.0**.
+> 제품 버전: **0.4.1**.
 >
 > **범위 확정**: roomrs는 **SQLite만** 지원한다. 다른 DB 백엔드는 지원하지 않으며 계획에도 없다.
 >
@@ -80,7 +80,7 @@
 | 43 | 복합 FOREIGN KEY | `#[entity(foreign_key(columns(…), references="t(c…)", on_delete=…, on_update=…))]` | 기존 table 추가는 대개 재작성 → 수동 migration |
 | 44 | CHECK 제약 | `#[entity(check = "expr")]` 반복 가능 | SQL 식 원문. 변경 시 수동 migration |
 | 45 | custom SQL type | `#[column(sql_type = "…")]` — DDL type name 오버라이드 | ToSql/FromSql은 사용자 책임. `"` 금지 |
-| 46 | DB-level trigger | `#[database(trigger(name="…", sql="…"), trigger(name="…", file="…"))]` 반복 가능 | 이름+SQL 원문+선언 소스를 DB snapshot에 포함. 신규 DB는 table/index 뒤 생성. 추가·변경·삭제는 `CREATE TRIGGER` 또는 `DROP TRIGGER`+재생성 forward migration 대상. 기존 `#[entity(trigger="path.sql")]`과 table-level trigger snapshot 모델은 제거 |
+| 46 | DB-level trigger | `#[database(trigger(name="…", sql="…"), trigger(name="…", file="…"))]` 반복 가능 | 이름+SQL 원문+선언 소스를 DB snapshot에 포함. 파일 SQL의 CRLF/CR 줄바꿈은 읽을 때 LF로 정규화해 플랫폼별 hash drift를 막는다. 신규 DB는 table/index 뒤 생성. 추가·변경·삭제는 `CREATE TRIGGER` 또는 `DROP TRIGGER`+재생성 forward migration 대상. 기존 `#[entity(trigger="path.sql")]`과 table-level trigger snapshot 모델은 제거 |
 | 47 | 프로젝트 schema export 진입점 | 설치형 Cargo subcommand `cargo roomrs schema export` | 소비자 package의 schema target을 자동 준비·실행해 등록된 모든 `#[database]`를 export. build.rs 호출 금지. §7.4 |
 | 48 | `version = auto` | export 명령이 DB별 최신 snapshot hash와 엔티티 hash를 비교해 revision을 결정 | 일치면 no-op, 변경이면 다음 정수 version snapshot과 `{from}_{to}_roomrs_auto.sql` forward migration 초안을 함께 생성. 수동 `version = N`은 유지. §7.4 |
 | 49 | LiveQuery debounce | DB 전역 `live_debounce(Duration)` 기본값은 **250ms**. observer는 `.debounce(Duration)`로 개별 override 가능 | observer에 개별값이 없으면 DB 전역값을 복사한다. 첫 무효화가 고정 coalesce 창을 시작하며, 창 안의 추가 무효화는 만료를 연장하지 않고 병합만 한다. 초기 emit·rebind·watching은 즉시. §9.3 |
