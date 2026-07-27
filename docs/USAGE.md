@@ -11,6 +11,7 @@
 | 처음 설치하고 실행하기 | [첫 데이터베이스 만들기](#첫-데이터베이스-만들기) |
 | 엔티티와 컬럼 설정하기 | [엔티티 정의](#엔티티-정의) |
 | CRUD DAO 만들기 | [DAO 정의](#dao-정의) |
+| SQL 문자열을 바로 실행하기 | [SQL 문자열 직접 조회](#sql-문자열-직접-조회) |
 | 비동기로 호출하기 | [비동기 API](#비동기-api) |
 | 변경을 자동으로 관찰하기 | [LiveQuery](#livequery) |
 | 여러 작업을 원자적으로 처리하기 | [트랜잭션](#트랜잭션) |
@@ -496,6 +497,73 @@ fn custom(&self) -> roomrs::Result<Vec<String>>;
 
 `#[update]`와 `#[delete]`는 보통 `Result<u64>` 영향 행 수를 반환합니다. SQL에 `RETURNING`이 있으면 `Result<T>`, `Result<Option<T>>`, `Result<Vec<T>>`로 반환할 수 있으며 `T`에는 아래와 같은 `FromRow` 규칙이 적용됩니다.
 
+### SQL 문자열 직접 조회
+
+고정 DAO 메서드가 필요하지 않은 쿼리는 동기 또는 비동기 handle에서 SQL 문자열로 바로 실행할 수 있습니다. `#[entity]` 타입은 `FromRow`가 자동 구현되므로 별도 변환 코드를 작성하지 않습니다.
+
+```rust
+let handle = db.run_sync();
+
+let todo: Todo = handle.query_one::<Todo, _>(
+    "SELECT id, title, done FROM todos WHERE id = ?1",
+    roomrs::params![1_i64],
+)?;
+
+let maybe_todo: Option<Todo> = handle.query_optional::<Todo, _>(
+    "SELECT id, title, done FROM todos WHERE id = ?1",
+    roomrs::params![-1_i64],
+)?;
+
+let todos: Vec<Todo> = handle.query_all::<Todo, _>(
+    "SELECT id, title, done
+     FROM todos
+     WHERE done = ?1
+     ORDER BY id",
+    roomrs::params![false],
+)?;
+
+let count: i64 = handle.query_scalar::<i64, _>("SELECT COUNT(*) FROM todos", ())?;
+
+let updated: Todo = handle.query_one::<Todo, _>(
+    "UPDATE todos SET title = ?1 WHERE id = ?2
+     RETURNING id, title, done",
+    roomrs::params!["문서 읽기", 1_i64],
+)?;
+
+let changed: u64 = handle.execute(
+    "UPDATE todos SET done = ?1 WHERE id = ?2",
+    roomrs::params![true, 1_i64],
+)?;
+```
+
+| 메서드 | 반환 타입 | 용도 |
+|---|---|---|
+| `query_one::<T, _>` | `T` | SELECT 또는 `... RETURNING` 한 행. 없으면 `roomrs::Error::NotFound` |
+| `query_optional::<T, _>` | `Option<T>` | 0행 또는 한 행 |
+| `query_all::<T, _>` | `Vec<T>` | 모든 행 |
+| `query_scalar::<T, _>` | `T` | 첫 행의 단일 컬럼 |
+| `execute` | `u64` | INSERT·UPDATE·DELETE 등으로 변경된 행 수 |
+
+`Row<T>` wrapper는 없습니다. `::<Todo, _>`의 `_`는 `params![...]`의 파라미터 타입을 Rust가 추론하도록 둡니다. 파라미터가 없으면 `()`를 전달합니다. `query_scalar`의 `T`는 `FromSql`, 나머지 조회 메서드의 `T`는 `FromRow`를 구현해야 합니다.
+
+비동기 handle은 SQL 문자열 타입 generic이 앞에 있어 turbofish 순서가 `::<_, Todo, _>`입니다.
+
+```rust
+let todo: Todo = db
+    .run_async()
+    .query_one::<_, Todo, _>(
+        "SELECT id, title, done FROM todos WHERE id = ?1",
+        roomrs::params![1_i64],
+    )
+    .await?;
+```
+
+SQL 문자열 직접 조회는 DAO 매크로의 snapshot 기반 컴파일 타임 SQL 검증을 거치지 않으므로, 반복 사용하는 고정 SQL은 `#[query]` DAO 메서드가 더 안전합니다.
+
+`INSERT`, `UPDATE`, `DELETE ... RETURNING`은 결과 행 수에 맞춰 `query_one`, `query_optional`, `query_all`로 받을 수 있습니다. `RETURNING` 없는 쓰기는 `execute`를 사용합니다.
+
+내부 매핑에 쓰이는 `roomrs::rusqlite::Row<'_>`는 `serde_json::Value`가 아닙니다. SQLite statement에서 현재 한 행을 빌린 타입이며 `FromRow`가 각 컬럼을 Rust 결과 타입으로 변환합니다. `query_one::<Todo, _>`의 실제 반환값은 `Row`가 아니라 `Todo`입니다.
+
 ### 임의 SELECT 결과 구조체
 
 조회 결과 타입은 `#[entity]`일 필요가 없습니다. JOIN, 집계, 별칭을 사용한 projection처럼 독립 테이블과 일치하지 않는 결과는 일반 구조체에 `FromRow`를 직접 구현합니다.
@@ -541,7 +609,7 @@ DAO 없이 직접 조회할 수도 있습니다.
 
 ```rust
 let handle = db.run_sync();
-let items: Vec<TodoListItem> = handle.query_all(
+let items: Vec<TodoListItem> = handle.query_all::<TodoListItem, _>(
     "SELECT t.id AS todo_id, t.title, u.name AS owner_name
      FROM todos t
      JOIN users u ON u.id = t.owner_id

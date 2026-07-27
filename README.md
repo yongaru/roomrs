@@ -114,6 +114,44 @@ cargo run
 
 전체 과정과 실패 시 조치 방법은 [상세 사용 가이드](docs/USAGE.md#스키마를-변경할-때)를 참고하세요.
 
+## SQL 문자열로 바로 조회
+
+DAO 메서드를 선언하지 않고 SQL 문자열을 바로 실행할 수도 있습니다. `#[entity]`가 `FromRow` 구현을 자동 생성하므로 엔티티 타입만 지정하면 됩니다.
+
+```rust
+let handle = db.run_sync();
+
+let todo: Todo = handle.query_one::<Todo, _>(
+    "SELECT id, title, done FROM todos WHERE id = ?1",
+    roomrs::params![1_i64],
+)?;
+
+let maybe_todo: Option<Todo> = handle.query_optional::<Todo, _>(
+    "SELECT id, title, done FROM todos WHERE id = ?1",
+    roomrs::params![-1_i64],
+)?;
+
+let todos: Vec<Todo> = handle.query_all::<Todo, _>(
+    "SELECT id, title, done FROM todos WHERE done = ?1 ORDER BY id",
+    roomrs::params![false],
+)?;
+
+let count: i64 = handle.query_scalar::<i64, _>("SELECT COUNT(*) FROM todos", ())?;
+
+let updated: Todo = handle.query_one::<Todo, _>(
+    "UPDATE todos SET title = ?1 WHERE id = ?2
+     RETURNING id, title, done",
+    roomrs::params!["문서 읽기", 1_i64],
+)?;
+
+let changed: u64 = handle.execute(
+    "UPDATE todos SET done = ?1 WHERE id = ?2",
+    roomrs::params![true, 1_i64],
+)?;
+```
+
+`query_one`은 `SELECT`뿐 아니라 `INSERT`, `UPDATE`, `DELETE ... RETURNING` 한 행도 `Todo`로 반환합니다. `query_optional`은 `Option<Todo>`, `query_all`은 `Vec<Todo>`, `query_scalar`는 단일 컬럼 값, `execute`는 변경된 행 수를 반환합니다. `Row<Todo>` 같은 wrapper를 반환하지 않습니다. generic 인자 `_`는 SQL 파라미터 타입을 Rust가 추론하도록 둔 것입니다.
+
 ## 엔티티가 아닌 SELECT 결과 구조체
 
 테이블 전체를 나타내는 `#[entity]`만 조회 결과로 사용할 수 있는 것은 아닙니다. JOIN, 집계, 일부 컬럼 projection처럼 뷰에 가까운 결과는 일반 구조체에 `FromRow`를 구현해 받을 수 있습니다.

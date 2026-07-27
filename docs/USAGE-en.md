@@ -11,6 +11,7 @@ This guide follows the actual workflow from first installation through schema ch
 | Install and run for the first time | [Creating your first database](#creating-your-first-database) |
 | Configure entities and columns | [Defining entities](#defining-entities) |
 | Create CRUD DAOs | [Defining DAOs](#defining-daos) |
+| Execute a SQL string directly | [Direct SQL string queries](#direct-sql-string-queries) |
 | Call APIs asynchronously | [Asynchronous API](#asynchronous-api) |
 | Observe data changes | [LiveQuery](#livequery) |
 | Perform atomic work | [Transactions](#transactions) |
@@ -496,6 +497,73 @@ fn custom(&self) -> roomrs::Result<Vec<String>>;
 
 `#[update]` and `#[delete]` normally return an affected-row count as `Result<u64>`. When the SQL contains `RETURNING`, they may return `Result<T>`, `Result<Option<T>>`, or `Result<Vec<T>>`; `T` follows the same `FromRow` rules described below.
 
+### Direct SQL string queries
+
+Queries that do not need a fixed DAO method can run directly on a synchronous or asynchronous handle. An `#[entity]` type already has an automatically generated `FromRow` implementation, so no separate mapping code is required.
+
+```rust
+let handle = db.run_sync();
+
+let todo: Todo = handle.query_one::<Todo, _>(
+    "SELECT id, title, done FROM todos WHERE id = ?1",
+    roomrs::params![1_i64],
+)?;
+
+let maybe_todo: Option<Todo> = handle.query_optional::<Todo, _>(
+    "SELECT id, title, done FROM todos WHERE id = ?1",
+    roomrs::params![-1_i64],
+)?;
+
+let todos: Vec<Todo> = handle.query_all::<Todo, _>(
+    "SELECT id, title, done
+     FROM todos
+     WHERE done = ?1
+     ORDER BY id",
+    roomrs::params![false],
+)?;
+
+let count: i64 = handle.query_scalar::<i64, _>("SELECT COUNT(*) FROM todos", ())?;
+
+let updated: Todo = handle.query_one::<Todo, _>(
+    "UPDATE todos SET title = ?1 WHERE id = ?2
+     RETURNING id, title, done",
+    roomrs::params!["Read the manual", 1_i64],
+)?;
+
+let changed: u64 = handle.execute(
+    "UPDATE todos SET done = ?1 WHERE id = ?2",
+    roomrs::params![true, 1_i64],
+)?;
+```
+
+| Method | Return type | Purpose |
+|---|---|---|
+| `query_one::<T, _>` | `T` | One row from SELECT or `... RETURNING`; returns `roomrs::Error::NotFound` when absent |
+| `query_optional::<T, _>` | `Option<T>` | Zero or one row |
+| `query_all::<T, _>` | `Vec<T>` | All rows |
+| `query_scalar::<T, _>` | `T` | One column from the first row |
+| `execute` | `u64` | Number of rows changed by INSERT, UPDATE, DELETE, and similar statements |
+
+There is no `Row<T>` wrapper. In `::<Todo, _>`, `_` lets Rust infer the type of `params![...]`. Pass `()` when the SQL has no parameters. `T` must implement `FromSql` for `query_scalar` and `FromRow` for the other query methods.
+
+On an asynchronous handle, the SQL string type is the first generic argument, so the turbofish order is `::<_, Todo, _>`.
+
+```rust
+let todo: Todo = db
+    .run_async()
+    .query_one::<_, Todo, _>(
+        "SELECT id, title, done FROM todos WHERE id = ?1",
+        roomrs::params![1_i64],
+    )
+    .await?;
+```
+
+Direct SQL strings do not receive the DAO macro's snapshot-based compile-time SQL validation, so prefer a `#[query]` DAO method for fixed SQL used repeatedly.
+
+Use `query_one`, `query_optional`, or `query_all` for `INSERT`, `UPDATE`, or `DELETE ... RETURNING`, depending on the result cardinality. Use `execute` for writes without `RETURNING`.
+
+The internal `roomrs::rusqlite::Row<'_>` used for mapping is not a `serde_json::Value`. It borrows the current row from a SQLite statement, and `FromRow` converts its columns into the Rust result type. The actual return value of `query_one::<Todo, _>` is `Todo`, not `Row`.
+
 ### Arbitrary SELECT result structs
 
 A query result type does not need to be an `#[entity]`. For joins, aggregates, and aliased projections that do not match a standalone table, implement `FromRow` directly on an ordinary struct.
@@ -541,7 +609,7 @@ The same type also works without a DAO:
 
 ```rust
 let handle = db.run_sync();
-let items: Vec<TodoListItem> = handle.query_all(
+let items: Vec<TodoListItem> = handle.query_all::<TodoListItem, _>(
     "SELECT t.id AS todo_id, t.title, u.name AS owner_name
      FROM todos t
      JOIN users u ON u.id = t.owner_id

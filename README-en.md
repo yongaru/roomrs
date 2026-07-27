@@ -114,6 +114,44 @@ After changing an entity, increment the version or use `version = auto`, then ru
 
 See [Changing a schema](docs/USAGE-en.md#changing-a-schema) for the complete workflow and failure recovery.
 
+## Query SQL strings directly
+
+You can execute a SQL string without declaring a DAO method. Because `#[entity]` generates the `FromRow` implementation, you only need to specify the entity type.
+
+```rust
+let handle = db.run_sync();
+
+let todo: Todo = handle.query_one::<Todo, _>(
+    "SELECT id, title, done FROM todos WHERE id = ?1",
+    roomrs::params![1_i64],
+)?;
+
+let maybe_todo: Option<Todo> = handle.query_optional::<Todo, _>(
+    "SELECT id, title, done FROM todos WHERE id = ?1",
+    roomrs::params![-1_i64],
+)?;
+
+let todos: Vec<Todo> = handle.query_all::<Todo, _>(
+    "SELECT id, title, done FROM todos WHERE done = ?1 ORDER BY id",
+    roomrs::params![false],
+)?;
+
+let count: i64 = handle.query_scalar::<i64, _>("SELECT COUNT(*) FROM todos", ())?;
+
+let updated: Todo = handle.query_one::<Todo, _>(
+    "UPDATE todos SET title = ?1 WHERE id = ?2
+     RETURNING id, title, done",
+    roomrs::params!["Read the manual", 1_i64],
+)?;
+
+let changed: u64 = handle.execute(
+    "UPDATE todos SET done = ?1 WHERE id = ?2",
+    roomrs::params![true, 1_i64],
+)?;
+```
+
+`query_one` maps one row from either `SELECT` or `INSERT`, `UPDATE`, or `DELETE ... RETURNING` into `Todo`. `query_optional` returns `Option<Todo>`, `query_all` returns `Vec<Todo>`, `query_scalar` returns one column value, and `execute` returns the affected-row count. None returns a wrapper such as `Row<Todo>`. A generic argument written as `_` lets Rust infer the SQL parameter type.
+
 ## SELECT result structs without entities
 
 Query results are not limited to whole-table `#[entity]` types. For view-like results such as joins, aggregates, and partial-column projections, implement `FromRow` on an ordinary struct.

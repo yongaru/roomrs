@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- README, 상세 사용 가이드, 동기 Todo 예제에 `query_one`, `query_optional`, `query_all`, `query_scalar`, `execute`와 `UPDATE ... RETURNING`으로 SQL 문자열을 직접 실행하는 방법을 추가했습니다.
+
 ## [0.4.0] - 2026-07-27
 
 ### Added
