@@ -49,7 +49,7 @@ If you need PostgreSQL or MySQL, Active Record, or a multi-database abstraction,
 ```sh
 cargo new roomrs-example
 cd roomrs-example
-cargo add roomrs@0.3.0
+cargo add roomrs@0.4.0
 cargo install roomrs-cli
 ```
 
@@ -156,7 +156,7 @@ trait TodoViewDao {
 
 | Feature | Description |
 |---|---|
-| Entity DSL | Single/composite PKs, DEFAULT, UNIQUE, CHECK, FKs, ordered/partial indexes, generated columns, custom SQL types, trigger files |
+| Schema DSL | Single/composite PKs, DEFAULT, UNIQUE, CHECK, FKs, ordered/partial indexes, generated columns, custom SQL types, DB-level inline/file triggers |
 | DAO | `#[query]`, `#[insert]`, `#[update]`, `#[delete]`, `#[transaction]` |
 | SELECT result structs | Map joins, aggregates, and projections into ordinary structs implementing `FromRow` |
 | SQL validation | Snapshot-based table/column checks and `:name` parameter matching |
@@ -186,7 +186,7 @@ Android Room users can start with the [Room-to-roomrs mapping](docs/USAGE-en.md#
 Default configuration:
 
 ```toml
-roomrs = "0.3.0"
+roomrs = "0.4.0"
 ```
 
 The default features are `sqlite-bundled`, `async`, `tokio`, `live`, `time`, `uuid`, and `json`.
@@ -195,7 +195,7 @@ Minimal synchronous configuration:
 
 ```toml
 roomrs = {
-    version = "0.3.0",
+    version = "0.4.0",
     default-features = false,
     features = ["sqlite-bundled"]
 }
@@ -205,7 +205,7 @@ SQLCipher:
 
 ```toml
 roomrs = {
-    version = "0.3.0",
+    version = "0.4.0",
     default-features = false,
     features = ["sqlcipher-bundled", "async", "tokio", "live", "time", "uuid", "json"]
 }

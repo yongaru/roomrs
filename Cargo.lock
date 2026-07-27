@@ -751,7 +751,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "roomrs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures",
  "log",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "roomrs-async"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures-channel",
  "log",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "roomrs-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "log",
  "roomrs-migrate",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "roomrs-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures-core",
  "inventory",
@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "roomrs-macros"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "roomrs-migrate"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "log",
  "miniz_oxide",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "roomrs-mobile-ffi-example"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "log",
  "roomrs",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "roomrs-schema-export"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "log",
  "roomrs",
@@ -1387,7 +1387,7 @@ checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "zmij"

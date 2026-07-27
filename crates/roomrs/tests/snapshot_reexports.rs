@@ -20,10 +20,10 @@ fn snapshot_model_is_available_from_facade() {
                 generated: None,
             }],
             ddl: vec!["CREATE TABLE items(id INTEGER PRIMARY KEY)".into()],
-            triggers: vec![],
             strict: false,
             without_rowid: false,
         }],
+        triggers: vec![],
     };
     assert_eq!(snapshot.tables[0].columns[0].name, "id");
 }

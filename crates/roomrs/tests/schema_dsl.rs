@@ -132,10 +132,10 @@ fn advanced_schema_dsl_pipeline() {
             name: AdvancedEntity::TABLE,
             columns: AdvancedEntity::COLUMNS_META,
             ddl: AdvancedEntity::DDL,
-            triggers: AdvancedEntity::TRIGGERS,
             strict: AdvancedEntity::STRICT,
             without_rowid: AdvancedEntity::WITHOUT_ROWID,
         }],
+        triggers: vec![],
     }
     .to_snapshot();
     assert!(snap.tables[0].strict);
@@ -171,10 +171,10 @@ fn advanced_schema_dsl_pipeline() {
                 generated: None,
             }],
             ddl: vec![r#"CREATE TABLE "t_advanced" ("id" TEXT PRIMARY KEY) STRICT WITHOUT ROWID"#.into()],
-            triggers: vec![],
             strict: true,
             without_rowid: true,
         }],
+        triggers: vec![],
     };
     let plan3 = diff_plan(&base, &snap);
     assert!(plan3.destructive.iter().any(|d| d.contains("generated")), "{plan3:?}");
@@ -206,10 +206,10 @@ fn default_sql_pipeline_consistency() {
             name: WithDefault::TABLE,
             columns: WithDefault::COLUMNS_META,
             ddl: WithDefault::DDL,
-            triggers: WithDefault::TRIGGERS,
             strict: false,
             without_rowid: false,
         }],
+        triggers: vec![],
     }
     .to_snapshot();
     let status_col = snap.tables[0].columns.iter().find(|c| c.name == "status").expect("status col");
@@ -236,10 +236,10 @@ fn default_sql_pipeline_consistency() {
                 generated: None,
             }],
             ddl: vec![r#"CREATE TABLE "t_with_default" ("id" INTEGER PRIMARY KEY AUTOINCREMENT)"#.into()],
-            triggers: vec![],
             strict: false,
             without_rowid: false,
         }],
+        triggers: vec![],
     };
     let plan = diff_plan(&old, &snap);
     assert!(plan.safe.iter().any(|s| s.contains(r#"ADD COLUMN "status""#) && s.contains("NOT NULL DEFAULT 'active'")), "{plan:?}");
@@ -260,10 +260,10 @@ fn snapshot_hash_tracks_dsl() {
             name: Payment::TABLE,
             columns: Payment::COLUMNS_META,
             ddl: Payment::DDL,
-            triggers: Payment::TRIGGERS,
             strict: false,
             without_rowid: false,
         }],
+        triggers: vec![],
     }
     .to_snapshot();
     let json = snap.to_json().unwrap();
@@ -297,10 +297,10 @@ fn diff_classifies_unique_index_manual() {
             name: "t".into(),
             columns: vec![col.clone()],
             ddl: vec![base_ddl.into()],
-            triggers: vec![],
             strict: false,
             without_rowid: false,
         }],
+        triggers: vec![],
     };
     let new_normal = roomrs::SchemaSnapshot {
         version: 2,
@@ -308,10 +308,10 @@ fn diff_classifies_unique_index_manual() {
             name: "t".into(),
             columns: vec![col.clone()],
             ddl: vec![base_ddl.into(), normal.into()],
-            triggers: vec![],
             strict: false,
             without_rowid: false,
         }],
+        triggers: vec![],
     };
     let new_unique = roomrs::SchemaSnapshot {
         version: 2,
@@ -319,101 +319,16 @@ fn diff_classifies_unique_index_manual() {
             name: "t".into(),
             columns: vec![col],
             ddl: vec![base_ddl.into(), unique.into()],
-            triggers: vec![],
             strict: false,
             without_rowid: false,
         }],
+        triggers: vec![],
     };
     let plan_n: DiffPlan = diff_plan(&old, &new_normal);
     assert_eq!(plan_n.safe, vec![normal.to_string()], "{plan_n:?}");
     let plan_u = diff_plan(&old, &new_unique);
     assert!(plan_u.safe.is_empty(), "{plan_u:?}");
     assert!(plan_u.destructive.iter().any(|d| d.contains("UNIQUE INDEX")), "{plan_u:?}");
-}
-
-/// 실제 trigger 파일 훅 — 매크로가 경로·hash 를 Entity/스냅샷에 심고 파일 bytes 와 일치 (결정 46)
-#[entity(table = "audit_notes", trigger = "migrations/triggers/t_payment_audit.sql")]
-struct AuditNote {
-    #[pk(autoincrement)]
-    id: i64,
-    body: String,
-}
-
-/// FNV-1a 64 — roomrs-migrate / macros 와 동일 상수
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// 매크로 expand 가 trigger 파일을 읽어 content_hash 를 박고 스냅샷에 올린다
-#[test]
-fn trigger_entity_embeds_file_path_and_hash() {
-    assert_eq!(AuditNote::TRIGGERS.len(), 1, "trigger 훅 1개");
-    assert_eq!(AuditNote::TRIGGERS[0].path, "migrations/triggers/t_payment_audit.sql");
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/triggers/t_payment_audit.sql");
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("trigger 파일 읽기 실패 {}: {e}", path.display()));
-    let expected = fnv1a64(&bytes);
-    assert_eq!(AuditNote::TRIGGERS[0].content_hash, expected, "매크로 hash = 파일 bytes FNV");
-
-    let snap = SchemaDef {
-        version: 1,
-        ddl: AuditNote::DDL.to_vec(),
-        tables: vec![TableMeta {
-            name: AuditNote::TABLE,
-            columns: AuditNote::COLUMNS_META,
-            ddl: AuditNote::DDL,
-            triggers: AuditNote::TRIGGERS,
-            strict: false,
-            without_rowid: false,
-        }],
-    }
-    .to_snapshot();
-    assert_eq!(snap.tables[0].triggers.len(), 1);
-    assert_eq!(snap.tables[0].triggers[0].path, "migrations/triggers/t_payment_audit.sql");
-    assert_eq!(snap.tables[0].triggers[0].content_hash, expected);
-    // hash 에 trigger 반영 — 내용 변경 시 스냅샷 hash 도 변해야 한다
-    let mut other = snap.clone();
-    other.tables[0].triggers[0].content_hash = expected.wrapping_add(1);
-    assert_ne!(snap.hash(), other.hash(), "trigger content_hash 변경 = snapshot hash 변경");
-}
-
-/// trigger 훅 — 경로·hash 스냅샷, 내용 변경/삭제 = 수동
-#[test]
-fn trigger_hook_snapshot_and_diff() {
-    // 실제 매크로 메타를 옛/새 스냅샷에 넣어 diff 분류 검증
-    let live_hash = AuditNote::TRIGGERS[0].content_hash;
-    let old = roomrs::TableSnapshot {
-        name: "audit_notes".into(),
-        columns: vec![],
-        ddl: vec![],
-        triggers: vec![roomrs::TriggerSnapshot { path: AuditNote::TRIGGERS[0].path.into(), content_hash: live_hash }],
-        strict: false,
-        without_rowid: false,
-    };
-    let mut new = old.clone();
-    new.triggers[0].content_hash = live_hash.wrapping_add(1);
-    let plan = diff_plan(&roomrs::SchemaSnapshot { version: 1, tables: vec![old.clone()] }, &roomrs::SchemaSnapshot { version: 2, tables: vec![new] });
-    assert!(plan.destructive.iter().any(|d| d.contains("trigger") && d.contains("t_payment_audit.sql")), "{plan:?}");
-
-    let plan2 = diff_plan(
-        &roomrs::SchemaSnapshot { version: 1, tables: vec![old] },
-        &roomrs::SchemaSnapshot {
-            version: 2,
-            tables: vec![roomrs::TableSnapshot {
-                name: "audit_notes".into(),
-                columns: vec![],
-                ddl: vec![],
-                triggers: vec![],
-                strict: false,
-                without_rowid: false,
-            }],
-        },
-    );
-    assert!(plan2.destructive.iter().any(|d| d.contains("trigger 삭제")), "{plan2:?}");
 }
 
 /// SNAPSHOT_FILE_SEEN=false 이고 허용 env 없으면 build 실패 (결정 39)
@@ -436,10 +351,10 @@ fn build_fails_when_snapshot_missing_without_allow() {
                     name: Customer::TABLE,
                     columns: Customer::COLUMNS_META,
                     ddl: Customer::DDL,
-                    triggers: Customer::TRIGGERS,
                     strict: false,
                     without_rowid: false,
                 }],
+                triggers: vec![],
             }
         }
 

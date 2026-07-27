@@ -1,4 +1,4 @@
-//! `#[entity]` 전개 (명세 §5.1, §12b/§12c, 결정 40–46)
+//! `#[entity]` 전개 (명세 §5.1, §12b/§12c, 결정 40–45)
 //!
 //! 생성물: 보조 속성이 제거된 구조체 + `Entity`/`Insertable`/`FromRow` impl.
 //! 생성 코드는 `::roomrs` 파사드 경로를 참조한다 — roomrs-macros 단독 사용 불가.
@@ -66,7 +66,6 @@ struct EntityArgs {
     indexes: Vec<IndexDef>,
     foreign_keys: Vec<ForeignKeyDef>,
     checks: Vec<String>,
-    triggers: Vec<String>,
     /// `#[entity(strict)]` (결정 54)
     strict: bool,
     /// `#[entity(without_rowid)]` (결정 54)
@@ -83,7 +82,6 @@ impl Default for EntityArgs {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             checks: Vec::new(),
-            triggers: Vec::new(),
             strict: false,
             without_rowid: false,
         }
@@ -274,14 +272,7 @@ fn parse_args(args: TokenStream) -> syn::Result<EntityArgs> {
                 out.checks.push(lit.value());
             }
             syn::Meta::NameValue(nv) if nv.path.is_ident("trigger") => {
-                let lit = match nv.value {
-                    syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => s,
-                    other => return Err(syn::Error::new(other.span(), "trigger 는 경로 문자열이어야 합니다")),
-                };
-                if lit.value().trim().is_empty() {
-                    return Err(syn::Error::new(lit.span(), "trigger 경로가 비어 있습니다"));
-                }
-                out.triggers.push(lit.value());
+                return Err(syn::Error::new(nv.path.span(), "#[entity(trigger = ...)]은 제거되었습니다 — #[database(trigger(name = \"...\", file = \"...\"))]를 사용하세요"));
             }
             syn::Meta::List(list) if list.path.is_ident("unique") => {
                 // Meta::List 토큰은 괄호 안 내용만 — bare `a, b` 파스
@@ -336,7 +327,7 @@ fn parse_args(args: TokenStream) -> syn::Result<EntityArgs> {
                 out.without_rowid = true;
             }
             other => {
-                return Err(syn::Error::new(other.span(), "알 수 없는 entity 인자 — table/primary_key/unique/index/foreign_key/check/trigger/strict/without_rowid 만 지원"));
+                return Err(syn::Error::new(other.span(), "알 수 없는 entity 인자 — table/primary_key/unique/index/foreign_key/check/strict/without_rowid 만 지원"));
             }
         }
     }
@@ -771,41 +762,6 @@ fn validate_refs(cols: &[Column], args: &EntityArgs, span: proc_macro2::Span) ->
     Ok(())
 }
 
-/// trigger 파일 로드 결과 — 선언 경로·절대 경로(include 의존성)·내용 hash
-struct LoadedTrigger {
-    /// `#[entity(trigger = "…")]` 에 쓴 상대 경로
-    rel_path: String,
-    /// `include_bytes!` 용 절대 경로 (슬래시 정규화)
-    abs_path: String,
-    /// FNV-1a 64 of file bytes
-    content_hash: u64,
-}
-
-/// trigger 파일 읽기. 경로 = CARGO_MANIFEST_DIR 기준.
-/// 절대 경로는 `include_bytes!` 의존성 등록에 쓴다 — 파일 변경 = 매크로 재전개 (결정 46).
-fn load_triggers(paths: &[String], span: proc_macro2::Span) -> syn::Result<Vec<LoadedTrigger>> {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| syn::Error::new(span, "CARGO_MANIFEST_DIR 없음 — #[entity(trigger=…)] 는 cargo 빌드에서만 사용할 수 있습니다"))?;
-    let mut out = Vec::new();
-    for rel in paths {
-        let full = std::path::Path::new(&manifest).join(rel);
-        let bytes = std::fs::read(&full).map_err(|e| syn::Error::new(span, format!("trigger 파일을 읽을 수 없습니다 (\"{rel}\"): {e}")))?;
-        // rustc include_bytes! 는 슬래시 경로를 안정적으로 처리한다 (database 스냅샷 의존성과 동일, M-8)
-        let abs_path = full.canonicalize().unwrap_or(full).to_string_lossy().replace('\\', "/");
-        out.push(LoadedTrigger { rel_path: rel.clone(), abs_path, content_hash: fnv1a64(&bytes) });
-    }
-    Ok(out)
-}
-
-/// FNV-1a 64 — roomrs-migrate 와 동일 상수 (결정 46 hash 일치)
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 /// 바인딩 값 추출 식 생성 — json 필드는 직렬화, 일반 필드는 ToSql 위임
 fn param_expr(c: &Column) -> TokenStream {
     let ident = &c.ident;
@@ -942,7 +898,6 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
     }
 
     validate_refs(&cols, &args, struct_ident.span())?;
-    let triggers = load_triggers(&args.triggers, struct_ident.span())?;
 
     // WITHOUT ROWID + INTEGER PRIMARY KEY autoincrement 는 SQLite 비호환
     if args.without_rowid {
@@ -1038,33 +993,8 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         })
         .collect();
 
-    let trigger_metas: Vec<TokenStream> = triggers
-        .iter()
-        .map(|t| {
-            let path = &t.rel_path;
-            let hash = t.content_hash;
-            quote! {
-                ::roomrs::TriggerMeta {
-                    path: #path,
-                    content_hash: #hash,
-                }
-            }
-        })
-        .collect();
-
-    // trigger 파일 변경 → rustc 재전개 (결정 46). 사장 상수는 링커가 제거.
-    let trigger_deps: Vec<TokenStream> = triggers
-        .iter()
-        .map(|t| {
-            let abs = &t.abs_path;
-            quote! { const _: &[u8] = ::core::include_bytes!(#abs); }
-        })
-        .collect();
-
     Ok(quote! {
         #item
-
-        #(#trigger_deps)*
 
         impl ::roomrs::FromRow for #struct_ident {
             /// 컬럼명 기반 행 매핑 — #[entity] 생성
@@ -1081,7 +1011,6 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             const DDL: &'static [&'static str] = &[#(#ddl_lits),*];
             const COLUMNS: &'static str = #columns_joined;
             const COLUMNS_META: &'static [::roomrs::ColumnMeta] = &[#(#column_metas),*];
-            const TRIGGERS: &'static [::roomrs::TriggerMeta] = &[#(#trigger_metas),*];
             const STRICT: bool = #strict;
             const WITHOUT_ROWID: bool = #without_rowid;
             const SCHEMA_VALIDATION_ERROR: Option<&'static str> = #primary_key_error;
@@ -1147,29 +1076,6 @@ mod tests {
         assert_eq!(rd("abc").unwrap(), "'abc'");
         assert_eq!(rd("o'clock").unwrap(), "'o''clock'");
         assert!(rd("nan").is_err());
-    }
-
-    /// trigger expand — include_bytes! 의존성 방출 + content_hash 일치 (결정 46)
-    #[test]
-    fn trigger_expand_emits_include_bytes_dep() {
-        let input = quote::quote! {
-            struct T {
-                #[pk]
-                id: i64,
-            }
-        };
-        let args = quote::quote! {
-            table = "t",
-            trigger = "fixtures/sample_trigger.sql"
-        };
-        let out = expand(args, input).expect("expand");
-        let s = out.to_string();
-        assert!(s.contains("include_bytes"), "trigger 파일 의존성 등록 필수: {s}");
-        assert!(s.contains("content_hash"), "hash 메타 방출: {s}");
-        // 파일 bytes 와 동일 hash 가 리터럴로 박혀 있는지
-        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/sample_trigger.sql")).unwrap();
-        let h = fnv1a64(&bytes);
-        assert!(s.contains(&h.to_string()), "content_hash={h} 리터럴 포함: {s}");
     }
 
     /// 복합 PK DDL — table-level PRIMARY KEY

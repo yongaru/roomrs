@@ -1,10 +1,10 @@
-# roomrs — 0.3.0 기능 명세 (Agent Spec) · **SQLite 전용 · 동기+비동기**
+# roomrs — 0.4.0 기능 명세 (Agent Spec) · **SQLite 전용 · 동기+비동기**
 
 > Android **Room** 과 동일한 개발 경험을 목표로 하는 Rust용 **로컬 SQLite 퍼시스턴스** 라이브러리.
 > 백엔드: **SQLite 전용 — SQLite/SQLCipher bundled/system 링크 선택, 기본은 bundled SQLite**. 다른 DB 지원 없음. API: **동기 1급 + 비동기(런타임 무관 std Future + tokio 통합)**. 기반: **rusqlite** 동기 코어 + **자체 통합 미니 풀(N)**.
 >
 > 본 문서는 **에이전트/구현자 실행용 명세**다. 사람용 개요는 `README.md` 참조.
-> 제품 버전: **0.3.0**.
+> 제품 버전: **0.4.0**.
 >
 > **범위 확정**: roomrs는 **SQLite만** 지원한다. 다른 DB 백엔드는 지원하지 않으며 계획에도 없다.
 >
@@ -80,7 +80,7 @@
 | 43 | 복합 FOREIGN KEY | `#[entity(foreign_key(columns(…), references="t(c…)", on_delete=…, on_update=…))]` | 기존 table 추가는 대개 재작성 → 수동 migration |
 | 44 | CHECK 제약 | `#[entity(check = "expr")]` 반복 가능 | SQL 식 원문. 변경 시 수동 migration |
 | 45 | custom SQL type | `#[column(sql_type = "…")]` — DDL type name 오버라이드 | ToSql/FromSql은 사용자 책임. `"` 금지 |
-| 46 | trigger SQL file 훅 | `#[entity(trigger = "path.sql")]` 반복 가능 | 경로+내용 hash를 snapshot에 포함. 적용은 수동 forward migration만 |
+| 46 | DB-level trigger | `#[database(trigger(name="…", sql="…"), trigger(name="…", file="…"))]` 반복 가능 | 이름+SQL 원문+선언 소스를 DB snapshot에 포함. 신규 DB는 table/index 뒤 생성. 추가·변경·삭제는 `CREATE TRIGGER` 또는 `DROP TRIGGER`+재생성 forward migration 대상. 기존 `#[entity(trigger="path.sql")]`과 table-level trigger snapshot 모델은 제거 |
 | 47 | 프로젝트 schema export 진입점 | 설치형 Cargo subcommand `cargo roomrs schema export` | 소비자 package의 schema target을 자동 준비·실행해 등록된 모든 `#[database]`를 export. build.rs 호출 금지. §7.4 |
 | 48 | `version = auto` | export 명령이 DB별 최신 snapshot hash와 엔티티 hash를 비교해 revision을 결정 | 일치면 no-op, 변경이면 다음 정수 version snapshot과 `{from}_{to}_roomrs_auto.sql` forward migration 초안을 함께 생성. 수동 `version = N`은 유지. §7.4 |
 | 49 | LiveQuery debounce | DB 전역 `live_debounce(Duration)` 기본값은 **250ms**. observer는 `.debounce(Duration)`로 개별 override 가능 | observer에 개별값이 없으면 DB 전역값을 복사한다. 첫 무효화가 고정 coalesce 창을 시작하며, 창 안의 추가 무효화는 만료를 연장하지 않고 병합만 한다. 초기 emit·rebind·watching은 즉시. §9.3 |
@@ -229,7 +229,7 @@ pub struct User {
     pub transient: Option<String>,
 }
 
-// 복합 PK · table UNIQUE · index · FK · CHECK · sql_type · trigger (결정 40–46)
+// 복합 PK · table UNIQUE · index · FK · CHECK · sql_type (결정 40–45)
 #[entity(
     table = "t_payment",
     unique(store_id, external_payment_id),
@@ -242,7 +242,6 @@ pub struct User {
         on_update = "NO ACTION"
     ),
     check = "amount >= 0",
-    trigger = "migrations/triggers/t_payment_audit.sql",
 )]
 struct Payment {
     #[pk]
@@ -259,12 +258,43 @@ struct Payment {
 ```
 - **속성 표기 규칙**: 무시 필드는 `#[column(ignore)]`로 표기한다. `#[pk]`/`#[json]`은 짧은 표기를 유지한다.
 - **PRIMARY KEY[결정 40·56]**: 필드 `#[pk]` 또는 `#[entity(primary_key(field, ...))]`로 선언한다. 복수 필드 PK는 선언 목록 순서 table-level `PRIMARY KEY`, 단일 PK는 컬럼-level이다. 두 표기를 함께 쓰면 필드 선언 순서의 `#[pk]` 목록과 entity-level 목록이 정확히 같아야 하며, 다르면 `schema export/check`에서 오류를 반환한다. `#[pk(autoincrement)]`와 다른 PK 동시 = 컴파일 에러.
-- **table UNIQUE / INDEX / FK / CHECK / trigger[결정 41–44,46]**: 엔티티 수준 속성. UNIQUE·FK·CHECK·trigger 변경 및 UNIQUE INDEX = 수동 migration. 일반 CREATE INDEX = auto 후보.
+- **table UNIQUE / INDEX / FK / CHECK[결정 41–44]**: 엔티티 수준 속성. UNIQUE·FK·CHECK 변경 및 UNIQUE INDEX = 수동 migration. 일반 CREATE INDEX = auto 후보.
 - **custom sql_type[결정 45]**: DDL type name만 오버라이드. 직렬화는 `ToSql`/`FromSql`.
 - **autoincrement PK 의미론**: `#[pk(autoincrement)]` 필드는 생성 SQL에서 항상 생략되고 새 rowid가 반환된다. PK를 명시 삽입해야 하면 `#[insert(keep_pk)]`를 사용한다.
 - **0행 insert 반환**: 0행 성공이 가능한 충돌 정책과 `Result<i64>` 반환을 함께 선언하면 컴파일 에러다.
 - **JSON Option**: `#[json] Option<T>`의 `None`은 SQL NULL로 저장한다. JSON text `null`도 읽을 때 `None`으로 해석한다. 따라서 `T = ()`처럼 JSON 표현 자체가 `null`인 `Some(T)`는 `None`으로 읽힌다.
 - **collate / generated / STRICT / WITHOUT ROWID / index COLLATE[결정 54]**: `#[column(collate)]`, `#[column(generated, stored)]`, `#[entity(strict)]`, `#[entity(without_rowid)]`, index `columns(name collate nocase)`. generated 는 DEFAULT·PK·autoincrement 와 비호환. 기존 테이블의 advanced 기능 변경은 자동 migration 금지·수동 안내.
+
+Trigger는 여러 테이블을 참조·변경할 수 있으므로 DB schema 객체로 선언한다(결정 46).
+
+```rust
+#[database(
+    entities(Payment, PaymentAudit),
+    version = 2,
+    trigger(
+        name = "trg_payment_audit",
+        sql = r#"
+            CREATE TRIGGER trg_payment_audit
+            AFTER INSERT ON t_payment
+            BEGIN
+                INSERT INTO payment_audit(payment_id) VALUES (NEW.payment_id);
+            END;
+        "#
+    ),
+    trigger(
+        name = "trg_payment_cleanup",
+        file = "migrations/triggers/t_payment_cleanup.sql"
+    )
+)]
+struct AppDb;
+```
+
+- `sql`과 `file` 중 정확히 하나만 지정한다. 파일 경로는 `CARGO_MANIFEST_DIR` 기준이다.
+- 선언 하나는 non-TEMP `CREATE TRIGGER` 하나만 포함하며, `name`과 SQL 안 trigger 이름이 SQLite ASCII 대소문자 무시 기준으로 같아야 한다. 단일 connection에만 존재하는 `CREATE TEMP TRIGGER`는 pool schema가 아니므로 금지한다.
+- 같은 DB에서 trigger 이름 중복을 금지한다.
+- snapshot은 이름·SQL 원문·선언 소스를 보존한다. 신규 DB와 destructive fallback은 table/index 뒤 trigger를 생성한다.
+- trigger 추가·변경·삭제는 transaction 안에서 실행 가능한 forward migration이다. 변경은 `DROP TRIGGER` 후 새 SQL, 삭제는 `DROP TRIGGER`로 합성한다.
+- 기존 `#[entity(trigger = "path.sql")]`과 table-level trigger snapshot 모델은 제거한다. DB-level `trigger(name, file|sql)`로 이전해야 한다.
 
 ### 5.2 DAO — 매크로가 동기/비동기 둘 다 생성
 
@@ -524,7 +554,7 @@ pub trait Migration {
   각 원본 파일은 `include_bytes!`로 의존성 등록(§7.2) — 사장 상수는 링커가 제거.
 - **자동 마이그레이션(옵트인)**: builder `.auto_migrate(true)`.
   `plan_chain`에 갭이 있는 구간을 내장 스냅샷의 연속 버전 diff로 메운다.
-  - **안전 연산만 자동 실행**: CREATE TABLE · ADD COLUMN(nullable, 또는 NOT NULL + `default_sql` 보유) · CREATE INDEX · 유효 rename 힌트.
+  - **안전 연산만 자동 실행**: CREATE TABLE · ADD COLUMN(nullable, 또는 NOT NULL + `default_sql` 보유) · CREATE INDEX · 유효 rename 힌트 · DB-level trigger CREATE/DROP/재생성.
   - 컬럼 `default_sql`은 스냅샷·hash에 보존된다(결정 53). DEFAULT 변경·제약 변경·삭제·타입 변경·추정 rename은 자동 실행 금지.
   - 파괴적 연산(DROP/타입·DEFAULT 변경/제약 재작성/이름 추정 rename)이 필요한 구간 = **명확한 에러**
     (수동 스텝 등록 또는 `fallback_to_destructive_migration` 유도). 자동 실행 금지 원칙(§1.2) 유지.

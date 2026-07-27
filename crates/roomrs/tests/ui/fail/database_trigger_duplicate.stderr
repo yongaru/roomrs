@@ -1,0 +1,5 @@
+error: database trigger 이름 중복: TRG_ITEM
+  --> tests/ui/fail/database_trigger_duplicate.rs:17:16
+   |
+17 |         name = "TRG_ITEM",
+   |                ^^^^^^^^^^

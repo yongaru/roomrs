@@ -35,8 +35,6 @@ pub trait Entity: FromRow {
     const COLUMNS: &'static str;
     /// 컬럼 메타 — 스냅샷 생성·해시 대조용 (명세 §7)
     const COLUMNS_META: &'static [crate::database::ColumnMeta];
-    /// Trigger SQL file hooks (path + content hash, decision 46).
-    const TRIGGERS: &'static [crate::database::TriggerMeta] = &[];
     /// `#[entity(strict)]` — STRICT tables (decision 54).
     const STRICT: bool = false;
     /// `#[entity(without_rowid)]` (decision 54).

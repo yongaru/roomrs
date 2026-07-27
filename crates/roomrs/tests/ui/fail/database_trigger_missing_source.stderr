@@ -1,0 +1,5 @@
+error: trigger에는 sql = "..." 또는 file = "..." 이 필요합니다
+  --> tests/ui/fail/database_trigger_missing_source.rs:12:5
+   |
+12 |     trigger(name = "item_trigger")
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

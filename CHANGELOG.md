@@ -7,9 +7,21 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-27
+
+### Added
+
+- `#[database]`에서 DB-level SQLite trigger를 inline SQL 또는 package 기준 SQL 파일로 선언할 수 있습니다.
+- trigger 이름·전체 SQL·source를 schema snapshot에 보존하고, 추가·수정·삭제를 안전한 forward migration으로 자동 합성합니다.
+
 ### Changed
 
 - README와 상세 사용 가이드에 `#[entity]` 없이 일반 구조체와 `FromRow`로 JOIN·집계·projection SELECT 결과를 받는 DAO·직접 조회 예제를 추가했습니다.
+- 신규 DB와 파괴적 fallback은 table·index 생성 뒤 DB-level trigger를 생성합니다.
+
+### Removed
+
+- 미공개 `#[entity(trigger = "path")]`, `TriggerMeta`, `TriggerSnapshot` API를 제거했습니다. DB-level `#[database(trigger(name = "...", sql = "..." | file = "..."))]`를 사용해야 합니다.
 
 ## [0.3.0] - 2026-07-27
 

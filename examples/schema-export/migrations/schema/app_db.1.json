@@ -19,13 +19,14 @@
       ],
       "ddl": [
         "CREATE TABLE IF NOT EXISTS \"notes\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"body\" TEXT NOT NULL)"
-      ],
-      "triggers": [
-        {
-          "path": "migrations/triggers/note_audit.sql",
-          "content_hash": 11017437502583785110
-        }
       ]
+    }
+  ],
+  "triggers": [
+    {
+      "name": "note_audit",
+      "sql": "CREATE TRIGGER note_audit\nAFTER INSERT ON notes\nBEGIN\n    SELECT NEW.id;\nEND;\n",
+      "file": "migrations/triggers/note_audit.sql"
     }
   ]
 }

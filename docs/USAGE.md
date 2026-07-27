@@ -46,7 +46,7 @@ roomrs 프로젝트의 반복 작업은 다음 네 단계입니다.
 
 ```toml
 [dependencies]
-roomrs = "0.3.0"
+roomrs = "0.4.0"
 ```
 
 ```sh
@@ -76,7 +76,7 @@ cargo roomrs --help
 ```toml
 [dependencies]
 roomrs = {
-    version = "0.3.0",
+    version = "0.4.0",
     default-features = false,
     features = ["sqlite-bundled"]
 }
@@ -97,7 +97,7 @@ SQLCipher bundled 예:
 
 ```toml
 roomrs = {
-    version = "0.3.0",
+    version = "0.4.0",
     default-features = false,
     features = [
         "sqlcipher-bundled",
@@ -129,7 +129,7 @@ Windows system backend는 저장소의 [`vcpkg/build-sqlcipher-system.cmd`](../v
 ```sh
 cargo new roomrs-example
 cd roomrs-example
-cargo add roomrs@0.3.0
+cargo add roomrs@0.4.0
 cargo install roomrs-cli
 ```
 
@@ -424,21 +424,27 @@ struct LineItem {
 
 generated column에는 `default`, PK, autoincrement를 함께 사용할 수 없습니다. 기존 테이블의 STRICT·WITHOUT ROWID·generated 정의 변경은 보통 테이블 재작성이 필요하므로 수동 migration으로 처리합니다.
 
-### trigger file hook
+### DB-level trigger
 
 ```rust
-#[entity(
-    table = "notes",
-    trigger = "migrations/triggers/note_audit.sql"
+#[database(
+    entities(Note, NoteAudit),
+    version = auto,
+    trigger(
+        name = "trg_note_audit",
+        sql = "CREATE TRIGGER trg_note_audit AFTER INSERT ON notes BEGIN INSERT INTO note_audit(note_id) VALUES (NEW.id); END"
+    ),
+    trigger(
+        name = "trg_note_cleanup",
+        file = "migrations/triggers/note_cleanup.sql"
+    )
 )]
-struct Note {
-    #[pk(autoincrement)]
-    id: i64,
-    body: String,
-}
+struct AppDb;
 ```
 
-파일 경로와 내용 hash가 snapshot에 포함됩니다. trigger 추가·수정·삭제는 자동 실행하지 않고 수동 migration 검토 대상으로 분류합니다.
+trigger는 테이블 부속 속성이 아니라 DB schema 객체입니다. 선언마다 `name`과 `sql` 또는 `file` 중 하나를 지정합니다. 파일 경로는 package의 `CARGO_MANIFEST_DIR` 기준입니다. SQL은 non-TEMP `CREATE TRIGGER` 문을 정확히 하나 포함해야 하며 선언 이름과 SQL 이름이 같아야 합니다. 한 connection에만 존재하는 TEMP trigger는 지원하지 않습니다.
+
+이름·전체 SQL·선언 source가 snapshot과 hash에 포함됩니다. 신규 DB는 table과 index를 만든 뒤 trigger를 생성합니다. trigger 추가·삭제는 `CREATE TRIGGER`·`DROP TRIGGER`, 내용 변경은 drop 후 재생성하는 안전한 forward migration으로 자동 합성됩니다.
 
 ## DAO 정의
 
@@ -1125,6 +1131,7 @@ let db = AppDb::builder()
 - DEFAULT가 있는 NOT NULL ADD COLUMN
 - 유효한 rename hint의 RENAME COLUMN
 - 일반 CREATE INDEX
+- DB-level trigger 추가·수정·삭제
 
 수동 검토가 필요한 변경:
 
@@ -1132,7 +1139,6 @@ let db = AppDb::builder()
 - 타입·DEFAULT·collation 변경
 - PK·FK·CHECK·UNIQUE 변경
 - UNIQUE INDEX
-- trigger 추가·수정·삭제
 - generated column과 STRICT·WITHOUT ROWID 변경
 - 데이터 변환
 

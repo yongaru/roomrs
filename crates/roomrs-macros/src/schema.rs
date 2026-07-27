@@ -384,10 +384,10 @@ mod tests {
                 name: table.into(),
                 columns: cols.iter().map(|c| col(c)).collect(),
                 ddl: vec![],
-                triggers: vec![],
                 strict: false,
                 without_rowid: false,
             }],
+            triggers: vec![],
         }
     }
 

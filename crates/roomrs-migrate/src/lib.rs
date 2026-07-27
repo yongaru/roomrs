@@ -14,17 +14,21 @@ pub struct SchemaSnapshot {
     pub version: u32,
     /// 테이블 목록
     pub tables: Vec<TableSnapshot>,
+    /// Database-level triggers declared by `#[database]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<DatabaseTriggerSnapshot>,
 }
 
-/// Trigger SQL file hook recorded in the snapshot (decision 46).
-///
-/// The SQL body is not auto-applied; only path + content hash track drift.
+/// Database-level SQLite trigger recorded in a schema snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TriggerSnapshot {
-    /// Path relative to the crate manifest (as declared on `#[entity]`).
-    pub path: String,
-    /// FNV-1a 64 of the file bytes at snapshot export/macro expand time.
-    pub content_hash: u64,
+pub struct DatabaseTriggerSnapshot {
+    /// SQLite trigger name.
+    pub name: String,
+    /// Complete `CREATE TRIGGER` SQL.
+    pub sql: String,
+    /// Manifest-relative source file, or `None` for inline SQL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// Generated column meta in a snapshot (decision 54).
@@ -44,9 +48,6 @@ pub struct TableSnapshot {
     /// 테이블·인덱스 DDL — diff 초안·해시에 사용 (M3)
     #[serde(default)]
     pub ddl: Vec<String>,
-    /// Trigger file hooks — path + content hash (결정 46)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub triggers: Vec<TriggerSnapshot>,
     /// `#[entity(strict)]` — STRICT 테이블 (결정 54). 구형 스냅샷 = false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strict: bool,
@@ -174,15 +175,17 @@ impl SchemaSnapshot {
                 push_field(&mut out, d);
                 out.push(';');
             }
-            // trigger 훅 경로·내용 hash (결정 46)
-            let mut triggers: Vec<&TriggerSnapshot> = t.triggers.iter().collect();
-            triggers.sort_by(|a, b| a.path.cmp(&b.path));
-            for tr in triggers {
-                out.push('g');
-                push_field(&mut out, &tr.path);
-                out.push('h');
-                out.push_str(&format!("{};", tr.content_hash));
-            }
+        }
+        let mut triggers: Vec<&DatabaseTriggerSnapshot> = self.triggers.iter().collect();
+        triggers.sort_by_key(|trigger| trigger.name.to_ascii_lowercase());
+        for trigger in triggers {
+            out.push('D');
+            push_field(&mut out, &trigger.name);
+            out.push('q');
+            push_field(&mut out, &trigger.sql);
+            out.push('f');
+            push_field(&mut out, trigger.file.as_deref().unwrap_or(""));
+            out.push(';');
         }
         out
     }
@@ -344,7 +347,8 @@ fn parse_snapshot_version(name: &str, prefix: &str) -> std::io::Result<Option<u3
 /// Structured migration plan between two snapshots (spec §8.1/§8.4).
 ///
 /// `safe` holds executable SQL statements (CREATE TABLE, nullable ADD
-/// COLUMN, `NOT NULL DEFAULT` ADD COLUMN, valid RENAME COLUMN, CREATE INDEX).
+/// COLUMN, `NOT NULL DEFAULT` ADD COLUMN, valid RENAME COLUMN, CREATE INDEX,
+/// and database-level trigger create/drop/recreate).
 /// `destructive` holds human-review items that roomrs never runs automatically
 /// (DROP TABLE, DROP COLUMN, column definition/DEFAULT changes, NOT NULL ADD
 /// COLUMN without a default, DROP INDEX). `warnings` reports ignored or
@@ -403,6 +407,7 @@ pub fn diff_plan(old: &SchemaSnapshot, new: &SchemaSnapshot) -> DiffPlan {
         diff_indexes(ot, nt, &mut plan);
         diff_table_constraints(ot, nt, &mut plan);
     }
+    diff_database_triggers(old, new, &mut plan);
 
     log::debug!("schema diff completed: from={}, to={}, safe={}, destructive={}, warnings={}", old.version, new.version, plan.safe.len(), plan.destructive.len(), plan.warnings.len());
     if !plan.destructive.is_empty() {
@@ -412,6 +417,30 @@ pub fn diff_plan(old: &SchemaSnapshot, new: &SchemaSnapshot) -> DiffPlan {
         log::warn!("schema diff contains warnings: from={}, to={}, count={}", old.version, new.version, plan.warnings.len());
     }
     plan
+}
+
+/// DB-level trigger diff를 실행 가능한 forward SQL로 변환한다.
+fn diff_database_triggers(old: &SchemaSnapshot, new: &SchemaSnapshot, plan: &mut DiffPlan) {
+    for old_trigger in &old.triggers {
+        if !new.triggers.iter().any(|new_trigger| new_trigger.name.eq_ignore_ascii_case(&old_trigger.name)) {
+            plan.safe.push(format!("DROP TRIGGER {}", quote_identifier(&old_trigger.name)));
+        }
+    }
+    for new_trigger in &new.triggers {
+        match old.triggers.iter().find(|old_trigger| old_trigger.name.eq_ignore_ascii_case(&new_trigger.name)) {
+            None => plan.safe.push(new_trigger.sql.clone()),
+            Some(old_trigger) if normalize_ws_outside_quotes(&old_trigger.sql) != normalize_ws_outside_quotes(&new_trigger.sql) => {
+                plan.safe.push(format!("DROP TRIGGER {}", quote_identifier(&old_trigger.name)));
+                plan.safe.push(new_trigger.sql.clone());
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// SQLite 식별자를 큰따옴표로 감싸고 내부 큰따옴표를 배증한다.
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// 동일 이름 테이블의 CREATE TABLE 문 비교 — table-level 제약(UNIQUE/CHECK/FK 등)
@@ -611,24 +640,6 @@ fn diff_indexes(ot: &TableSnapshot, nt: &TableSnapshot, plan: &mut DiffPlan) {
             plan.destructive.push(format!("DROP INDEX \"{name}\""));
         }
     }
-    // trigger 훅 변경 = 수동 (결정 46)
-    diff_triggers(ot, nt, plan);
-}
-
-/// trigger 경로·내용 hash diff — 생성·변경·삭제는 자동 실행 금지 (결정 46)
-fn diff_triggers(ot: &TableSnapshot, nt: &TableSnapshot, plan: &mut DiffPlan) {
-    for tr in &nt.triggers {
-        match ot.triggers.iter().find(|o| o.path == tr.path) {
-            None => plan.destructive.push(format!("수동 migration 필요(trigger 추가): {}", tr.path)),
-            Some(old) if old.content_hash != tr.content_hash => plan.destructive.push(format!("수동 migration 필요(trigger 내용 변경): {}", tr.path)),
-            Some(_) => {}
-        }
-    }
-    for old in &ot.triggers {
-        if !nt.triggers.iter().any(|n| n.path == old.path) {
-            plan.destructive.push(format!("수동 migration 필요(trigger 삭제): {}", old.path));
-        }
-    }
 }
 
 /// `CREATE UNIQUE INDEX …` 여부 (대소문자 무시)
@@ -710,6 +721,145 @@ fn parse_leading_identifier(s: &str) -> Option<String> {
     }
 }
 
+/// Extracts the trigger name from a SQLite `CREATE TRIGGER` statement.
+///
+/// Leading whitespace and line or block comments are accepted.
+pub fn parse_create_trigger_name(sql: &str) -> Option<String> {
+    let mut rest = strip_leading_comments(sql)?;
+    rest = strip_keyword(rest, "CREATE")?;
+    rest = strip_keyword(rest, "TRIGGER")?;
+    if let Some(next) = strip_keyword(rest, "IF") {
+        rest = strip_keyword(strip_keyword(next, "NOT")?, "EXISTS")?;
+    }
+    parse_leading_identifier(rest).map(|name| name.rsplit('.').next().unwrap_or(&name).trim_matches(['"', '`', '[', ']']).to_string())
+}
+
+/// Counts `CREATE TRIGGER` sequences outside comments and quoted literals.
+///
+/// TEMP triggers are intentionally excluded because they belong to one
+/// SQLite connection instead of the database schema shared by the pool.
+pub fn count_create_trigger_statements(sql: &str) -> usize {
+    let words = sql_words(sql);
+    words
+        .iter()
+        .enumerate()
+        .filter(|(index, word)| {
+            if !word.eq_ignore_ascii_case("CREATE") {
+                return false;
+            }
+            let Some(next) = words.get(index + 1) else {
+                return false;
+            };
+            next.eq_ignore_ascii_case("TRIGGER")
+        })
+        .count()
+}
+
+/// 선두 공백·SQL 주석을 제거한다.
+fn strip_leading_comments(mut sql: &str) -> Option<&str> {
+    loop {
+        sql = sql.trim_start();
+        if let Some(rest) = sql.strip_prefix("--") {
+            sql = rest.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(rest) = sql.strip_prefix("/*") {
+            let (_, tail) = rest.split_once("*/")?;
+            sql = tail;
+        } else {
+            return Some(sql);
+        }
+    }
+}
+
+/// 주석·인용부 밖 SQL 단어를 추출한다.
+fn sql_words(sql: &str) -> Vec<String> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        Single,
+        Double,
+        Backtick,
+        Bracket,
+        LineComment,
+        BlockComment,
+    }
+
+    let mut state = State::Normal;
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match state {
+            State::Normal => match ch {
+                '\'' => {
+                    push_sql_word(&mut words, &mut word);
+                    state = State::Single;
+                }
+                '"' => {
+                    push_sql_word(&mut words, &mut word);
+                    state = State::Double;
+                }
+                '`' => {
+                    push_sql_word(&mut words, &mut word);
+                    state = State::Backtick;
+                }
+                '[' => {
+                    push_sql_word(&mut words, &mut word);
+                    state = State::Bracket;
+                }
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    push_sql_word(&mut words, &mut word);
+                    state = State::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    push_sql_word(&mut words, &mut word);
+                    state = State::BlockComment;
+                }
+                c if c.is_ascii_alphanumeric() || c == '_' => word.push(c),
+                _ => push_sql_word(&mut words, &mut word),
+            },
+            State::Single if ch == '\'' => {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    state = State::Normal;
+                }
+            }
+            State::Double if ch == '"' => {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                } else {
+                    state = State::Normal;
+                }
+            }
+            State::Backtick if ch == '`' => {
+                if chars.peek() == Some(&'`') {
+                    chars.next();
+                } else {
+                    state = State::Normal;
+                }
+            }
+            State::Bracket if ch == ']' => state = State::Normal,
+            State::LineComment if ch == '\n' => state = State::Normal,
+            State::BlockComment if ch == '*' && chars.peek() == Some(&'/') => {
+                chars.next();
+                state = State::Normal;
+            }
+            _ => {}
+        }
+    }
+    push_sql_word(&mut words, &mut word);
+    words
+}
+
+/// 완성된 SQL 단어를 결과에 이동한다.
+fn push_sql_word(words: &mut Vec<String>, word: &mut String) {
+    if !word.is_empty() {
+        words.push(std::mem::take(word));
+    }
+}
+
 /// 자동 diff **초안** SQL 생성 (명세 §8.1) — 절대 자동 실행하지 않는다(비목표).
 /// [`diff_plan`] 위에 렌더: 안전 연산은 실행문, 파괴적 항목은 `-- TODO(파괴적)`
 /// 주석, 경고는 `-- 경고` 주석으로 출력한다.
@@ -767,7 +917,6 @@ mod tests {
             name: name.into(),
             columns,
             ddl: ddl.into_iter().map(String::from).collect(),
-            triggers: vec![],
             strict: false,
             without_rowid: false,
         }
@@ -775,7 +924,7 @@ mod tests {
 
     /// 단일 테이블 스냅샷 생성 헬퍼
     fn snap(version: u32, tables: Vec<TableSnapshot>) -> SchemaSnapshot {
-        SchemaSnapshot { version, tables }
+        SchemaSnapshot { version, tables, triggers: vec![] }
     }
 
     /// 정준 문자열이 테이블 순서에 불변인지
@@ -931,28 +1080,6 @@ mod tests {
         assert!(plan.destructive.iter().any(|d| d.contains("UNIQUE INDEX") && d.contains("idx_t_u")), "UNIQUE INDEX = 수동: {plan:?}");
     }
 
-    /// trigger 훅 추가 = 수동 migration (결정 46)
-    #[test]
-    fn diff_plan_trigger_add_is_manual() {
-        let mut new_t = table("t", vec![col("id", "INTEGER", true, true)], vec![]);
-        new_t.triggers.push(TriggerSnapshot { path: "migrations/triggers/a.sql".into(), content_hash: 1 });
-        let old = snap(1, vec![table("t", vec![col("id", "INTEGER", true, true)], vec![])]);
-        let new = snap(2, vec![new_t]);
-        let plan = diff_plan(&old, &new);
-        assert!(plan.safe.is_empty(), "{plan:?}");
-        assert!(plan.destructive.iter().any(|d| d.contains("trigger") && d.contains("a.sql")), "{plan:?}");
-    }
-
-    /// trigger content_hash 변경 = hash 변경
-    #[test]
-    fn hash_changes_on_trigger() {
-        let mut a = table("t", vec![], vec![]);
-        a.triggers.push(TriggerSnapshot { path: "t.sql".into(), content_hash: 1 });
-        let mut b = a.clone();
-        b.triggers[0].content_hash = 2;
-        assert_ne!(snap(1, vec![a]).hash(), snap(1, vec![b]).hash());
-    }
-
     /// diff_plan — NOT NULL ADD COLUMN(DEFAULT 정보 없음) = 파괴적
     #[test]
     fn diff_plan_not_null_add_is_destructive() {
@@ -1002,6 +1129,7 @@ mod tests {
         let new = SchemaSnapshot {
             version: 2,
             tables: vec![table("t", vec![col("id", "INTEGER", true, true), col("note", "TEXT", true, false)], vec![])],
+            triggers: vec![],
         };
         let plan = diff_plan(&old, &new);
         assert!(plan.destructive.iter().any(|d| d.contains("DEFAULT 필요")), "{plan:?}");

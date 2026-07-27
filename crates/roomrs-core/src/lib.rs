@@ -28,7 +28,7 @@ mod relation;
 mod row;
 
 pub use database::{
-    ColumnMeta, Database, DatabaseBuilder, DatabaseInner, DatabaseSpec, EmbeddedSchema, GeneratedColumnMeta, MigrationPolicy, PlannedExportAction, PlannedSnapshotWrite, SchemaDef, SchemaExportEntry, TableMeta, TriggerMeta, check_export_entry, check_schema_snapshot, export_schema_snapshot, plan_export_auto, plan_export_for_entry, plan_export_snapshot, run_registered_schema_check,
+    ColumnMeta, Database, DatabaseBuilder, DatabaseInner, DatabaseSpec, DatabaseTriggerMeta, EmbeddedSchema, GeneratedColumnMeta, MigrationPolicy, PlannedExportAction, PlannedSnapshotWrite, SchemaDef, SchemaExportEntry, TableMeta, check_export_entry, check_schema_snapshot, export_schema_snapshot, plan_export_auto, plan_export_for_entry, plan_export_snapshot, run_registered_schema_check,
     run_registered_schema_export, write_schema_snapshot,
 };
 pub use entity::{Entity, Insertable, outputs_to_values, to_owned_value};
@@ -41,7 +41,7 @@ pub use live::{DEFAULT_DEBOUNCE, IntoInvalidationFilters, InvalidationFilter, In
 pub use migration::{Migration, MigrationStep};
 pub use query::{Col, Execute, Expr, IntoDbValue, Order, Query, SelectBuilder, col};
 pub use relation::{RelationView, in_placeholders, load_children, load_junction};
-pub use roomrs_migrate::{ColumnSnapshot, DiffPlan, GeneratedColumnSnapshot, SCHEMA_DIR_RELATIVE, SchemaSnapshot, TableSnapshot, TriggerSnapshot, compress_snapshot, decompress_snapshot, diff_plan, diff_sql, list_snapshot_versions, resolve_schema_dir, snapshot_file_name, snapshot_path};
+pub use roomrs_migrate::{ColumnSnapshot, DatabaseTriggerSnapshot, DiffPlan, GeneratedColumnSnapshot, SCHEMA_DIR_RELATIVE, SchemaSnapshot, TableSnapshot, compress_snapshot, decompress_snapshot, diff_plan, diff_sql, list_snapshot_versions, resolve_schema_dir, snapshot_file_name, snapshot_path};
 pub use row::FromRow;
 
 // 매크로 생성 코드·사용자 코드가 쓰는 rusqlite 표면 재수출

@@ -1,1 +1,5 @@
--- manual trigger body
+CREATE TRIGGER note_audit
+AFTER INSERT ON notes
+BEGIN
+    SELECT NEW.id;
+END;

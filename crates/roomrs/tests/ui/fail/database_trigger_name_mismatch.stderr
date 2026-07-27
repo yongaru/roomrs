@@ -1,0 +1,5 @@
+error: trigger name과 SQL 이름이 다릅니다: 선언=trg_declared, SQL=trg_actual
+  --> tests/ui/fail/database_trigger_name_mismatch.rs:13:16
+   |
+13 |         name = "trg_declared",
+   |                ^^^^^^^^^^^^^^

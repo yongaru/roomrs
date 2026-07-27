@@ -26,10 +26,10 @@ impl DatabaseSpec for Db {
                 name: <Note as Entity>::TABLE,
                 columns: <Note as Entity>::COLUMNS_META,
                 ddl: <Note as Entity>::DDL,
-                triggers: <Note as Entity>::TRIGGERS,
                 strict: false,
                 without_rowid: false,
             }],
+            triggers: vec![],
         }
     }
 
@@ -82,10 +82,10 @@ fn snapshot_write_check_and_explicit_export() {
             name: <Note as Entity>::TABLE,
             columns: <Note as Entity>::COLUMNS_META,
             ddl: <Note as Entity>::DDL,
-            triggers: <Note as Entity>::TRIGGERS,
             strict: false,
             without_rowid: false,
         }],
+        triggers: vec![],
     }
     .to_snapshot()
     .write_to(&written)

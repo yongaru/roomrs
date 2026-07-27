@@ -46,7 +46,7 @@ change entities
 
 ```toml
 [dependencies]
-roomrs = "0.3.0"
+roomrs = "0.4.0"
 ```
 
 ```sh
@@ -76,7 +76,7 @@ Default features:
 ```toml
 [dependencies]
 roomrs = {
-    version = "0.3.0",
+    version = "0.4.0",
     default-features = false,
     features = ["sqlite-bundled"]
 }
@@ -97,7 +97,7 @@ Bundled SQLCipher example:
 
 ```toml
 roomrs = {
-    version = "0.3.0",
+    version = "0.4.0",
     default-features = false,
     features = [
         "sqlcipher-bundled",
@@ -129,7 +129,7 @@ For a Windows system backend, the repository provides [`vcpkg/build-sqlcipher-sy
 ```sh
 cargo new roomrs-example
 cd roomrs-example
-cargo add roomrs@0.3.0
+cargo add roomrs@0.4.0
 cargo install roomrs-cli
 ```
 
@@ -424,21 +424,27 @@ struct LineItem {
 
 A generated column cannot also have a default, be a PK, or use autoincrement. Changing generated definitions, STRICT, or WITHOUT ROWID on an existing table normally requires a table rebuild and therefore a manual migration.
 
-### Trigger file hooks
+### Database-level triggers
 
 ```rust
-#[entity(
-    table = "notes",
-    trigger = "migrations/triggers/note_audit.sql"
+#[database(
+    entities(Note, NoteAudit),
+    version = auto,
+    trigger(
+        name = "trg_note_audit",
+        sql = "CREATE TRIGGER trg_note_audit AFTER INSERT ON notes BEGIN INSERT INTO note_audit(note_id) VALUES (NEW.id); END"
+    ),
+    trigger(
+        name = "trg_note_cleanup",
+        file = "migrations/triggers/note_cleanup.sql"
+    )
 )]
-struct Note {
-    #[pk(autoincrement)]
-    id: i64,
-    body: String,
-}
+struct AppDb;
 ```
 
-The trigger file path and content hash are part of the snapshot. Adding, changing, or deleting a trigger is classified for manual migration review and is never executed automatically.
+A trigger is a database schema object rather than an entity attribute. Each declaration requires `name` and exactly one of `sql` or `file`. File paths are relative to the package's `CARGO_MANIFEST_DIR`. The SQL must contain exactly one non-TEMP `CREATE TRIGGER` statement, and its name must match the declared name. TEMP triggers are connection-local and therefore unsupported.
+
+The name, complete SQL, and declaration source are included in the snapshot and hash. A new database creates triggers after tables and indexes. Trigger additions and removals become `CREATE TRIGGER` and `DROP TRIGGER`; definition changes become drop-and-recreate safe forward migrations.
 
 ## Defining DAOs
 
@@ -1127,6 +1133,7 @@ Automatically executable changes:
 - NOT NULL ADD COLUMN with DEFAULT
 - RENAME COLUMN with a valid rename hint
 - ordinary CREATE INDEX
+- adding, changing, or deleting database-level triggers
 
 Changes requiring manual review:
 
@@ -1134,7 +1141,6 @@ Changes requiring manual review:
 - type, DEFAULT, or collation changes
 - PK, FK, CHECK, or UNIQUE changes
 - UNIQUE INDEX
-- adding, changing, or deleting triggers
 - generated columns and STRICT/WITHOUT ROWID changes
 - data transformations
 

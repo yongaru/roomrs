@@ -1,0 +1,5 @@
+error: #[entity(trigger = ...)]은 제거되었습니다 — #[database(trigger(name = "...", file = "..."))]를 사용하세요
+ --> tests/ui/fail/entity_trigger_removed.rs:3:10
+  |
+3 | #[entity(trigger = "migrations/triggers/t_payment_audit.sql")]
+  |          ^^^^^^^

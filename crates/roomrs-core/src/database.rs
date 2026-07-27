@@ -186,13 +186,15 @@ pub struct ColumnMeta {
     pub generated: Option<GeneratedColumnMeta>,
 }
 
-/// Trigger SQL file hook meta from `#[entity(trigger = "…")]` (decision 46).
+/// Database-level SQLite trigger from `#[database(trigger(...))]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TriggerMeta {
-    /// Path relative to the crate manifest.
-    pub path: &'static str,
-    /// FNV-1a 64 of file bytes at macro expansion time.
-    pub content_hash: u64,
+pub struct DatabaseTriggerMeta {
+    /// SQLite trigger name.
+    pub name: &'static str,
+    /// Complete `CREATE TRIGGER` SQL.
+    pub sql: &'static str,
+    /// Manifest-relative source file, or `None` for inline SQL.
+    pub file: Option<&'static str>,
 }
 
 /// 테이블 메타 — `#[database]`가 엔티티에서 수집
@@ -201,8 +203,6 @@ pub struct TableMeta {
     pub columns: &'static [ColumnMeta],
     /// 테이블·인덱스 DDL
     pub ddl: &'static [&'static str],
-    /// Trigger file hooks (decision 46)
-    pub triggers: &'static [TriggerMeta],
     /// `#[entity(strict)]` (decision 54)
     pub strict: bool,
     /// `#[entity(without_rowid)]` (decision 54)
@@ -217,14 +217,28 @@ pub struct SchemaDef {
     pub ddl: Vec<&'static str>,
     /// 테이블·컬럼 메타 — 스냅샷 생성·해시 대조용 (명세 §7.4)
     pub tables: Vec<TableMeta>,
+    /// DB-level trigger — table/index DDL 뒤 실행한다.
+    pub triggers: Vec<DatabaseTriggerMeta>,
 }
 
 impl SchemaDef {
-    /// 같은 SQLite 테이블 이름을 가리키는 엔티티 중복을 검증한다.
-    fn validate_unique_tables(&self) -> Result<()> {
+    /// 같은 SQLite schema 객체 이름 중복을 검증한다.
+    fn validate_unique_objects(&self) -> Result<()> {
         for (index, table) in self.tables.iter().enumerate() {
             if self.tables[..index].iter().any(|previous| previous.name.eq_ignore_ascii_case(table.name)) {
                 return Err(Error::Config(format!("database entities에 SQLite 테이블 이름 중복: {}", table.name)));
+            }
+        }
+        for (index, trigger) in self.triggers.iter().enumerate() {
+            if self.triggers[..index].iter().any(|previous| previous.name.eq_ignore_ascii_case(trigger.name)) {
+                return Err(Error::Config(format!("database trigger 이름 중복: {}", trigger.name)));
+            }
+            if roomrs_migrate::count_create_trigger_statements(trigger.sql) != 1 {
+                return Err(Error::Config(format!("database trigger `{}` SQL은 non-TEMP CREATE TRIGGER 문을 정확히 하나 포함해야 합니다", trigger.name)));
+            }
+            let actual = roomrs_migrate::parse_create_trigger_name(trigger.sql).ok_or_else(|| Error::Config(format!("database trigger `{}` SQL은 non-TEMP CREATE TRIGGER 문으로 시작해야 합니다", trigger.name)))?;
+            if !actual.eq_ignore_ascii_case(trigger.name) {
+                return Err(Error::Config(format!("database trigger 이름과 SQL 이름 불일치: 선언={}, SQL={actual}", trigger.name)));
             }
         }
         Ok(())
@@ -254,9 +268,17 @@ impl SchemaDef {
                         })
                         .collect(),
                     ddl: t.ddl.iter().map(|d| d.to_string()).collect(),
-                    triggers: t.triggers.iter().map(|tr| roomrs_migrate::TriggerSnapshot { path: tr.path.to_string(), content_hash: tr.content_hash }).collect(),
                     strict: t.strict,
                     without_rowid: t.without_rowid,
+                })
+                .collect(),
+            triggers: self
+                .triggers
+                .iter()
+                .map(|trigger| roomrs_migrate::DatabaseTriggerSnapshot {
+                    name: trigger.name.to_string(),
+                    sql: trigger.sql.to_string(),
+                    file: trigger.file.map(str::to_string),
                 })
                 .collect(),
         }
@@ -378,7 +400,7 @@ impl PlannedSnapshotWrite {
 
 /// Preflight one manual-version snapshot export without writing (decision 47).
 pub fn plan_export_snapshot(db_name: &'static str, version: u32, schema: &SchemaDef, manifest_dir: &str) -> Result<PlannedSnapshotWrite> {
-    schema.validate_unique_tables()?;
+    schema.validate_unique_objects()?;
     let code = schema.to_snapshot();
     let dir = roomrs_migrate::resolve_schema_dir(manifest_dir);
     let path = roomrs_migrate::snapshot_path(&dir, db_name, version);
@@ -454,7 +476,7 @@ pub fn plan_export_for_entry(db_name: &'static str, compile_version: u32, auto: 
 
 /// `version = auto` export plan: no-op / create v1 / next revision + safe SQL draft.
 pub fn plan_export_auto(db_name: &'static str, schema: &SchemaDef, manifest_dir: &str) -> Result<Vec<PlannedExportAction>> {
-    schema.validate_unique_tables()?;
+    schema.validate_unique_objects()?;
     let mut entity_snap = schema.to_snapshot();
     let dir = roomrs_migrate::resolve_schema_dir(manifest_dir);
     let files = roomrs_migrate::list_snapshot_versions(&dir, db_name).map_err(|e| Error::Config(format!("스냅샷 스캔 실패: {e}")))?;
@@ -528,7 +550,7 @@ pub fn run_registered_schema_export(manifest_dir: &str) -> Result<Vec<std::path:
 /// 스냅샷 ↔ 엔티티 메타 일치 검사 — CI/check용 (명세 §7.4a)
 pub fn check_schema_snapshot<T: DatabaseSpec>(manifest_dir: &str) -> Result<()> {
     let schema = T::schema();
-    schema.validate_unique_tables()?;
+    schema.validate_unique_objects()?;
     let dir = roomrs_migrate::resolve_schema_dir(manifest_dir);
     let path = roomrs_migrate::snapshot_path(&dir, T::DB_NAME, T::VERSION);
     let file = roomrs_migrate::SchemaSnapshot::read_from(&path).map_err(|e| Error::SnapshotStale(format!("스냅샷 파일을 읽을 수 없습니다: {e}")))?;
@@ -541,7 +563,7 @@ pub fn check_schema_snapshot<T: DatabaseSpec>(manifest_dir: &str) -> Result<()> 
 
 /// Read-only check of one registry entry against on-disk snapshots (decision 48, no file writes).
 pub fn check_export_entry(db_name: &str, version: u32, auto: bool, schema: &SchemaDef, manifest_dir: &str) -> Result<()> {
-    schema.validate_unique_tables()?;
+    schema.validate_unique_objects()?;
     let dir = roomrs_migrate::resolve_schema_dir(manifest_dir);
     let files = roomrs_migrate::list_snapshot_versions(&dir, db_name).map_err(|e| Error::Config(format!("스냅샷 스캔 실패: {e}")))?;
     if files.is_empty() {
@@ -965,7 +987,7 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
     /// DB 오픈 — PRAGMA 초기화 · 스냅샷 스테일 검증 · 마이그레이션 · 풀 구성 (명세 §5.4)
     pub fn build(mut self) -> Result<T> {
         let schema = T::schema();
-        schema.validate_unique_tables()?;
+        schema.validate_unique_objects()?;
 
         // shared-cache 인메모리의 동시 BEGIN IMMEDIATE는 busy_timeout이 처리하지 못하는
         // SQLITE_LOCKED를 반환하므로 일반 풀을 하나로 고정한다.
@@ -1177,6 +1199,9 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
                     // 스테일 전체 무효화가 첫 구독과 경합하지 않게 한다 (H-1 회귀 방지)
                     tx.raw_conn()?.execute_batch(ddl)?;
                 }
+                for trigger in &schema.triggers {
+                    tx.raw_conn()?.execute_batch(trigger.sql)?;
+                }
                 // on_create를 생성 트랜잭션 안에서 실행 — 실패 시 스키마와
                 // user_version이 함께 롤백돼 다음 오픈이 생성을 재시도한다 (L-5)
                 if let Some(cb) = &self.on_create {
@@ -1282,6 +1307,9 @@ impl<T: DatabaseSpec> DatabaseBuilder<T> {
                     for ddl in &schema.ddl {
                         c.execute_batch(ddl)?;
                     }
+                    for trigger in &schema.triggers {
+                        c.execute_batch(trigger.sql)?;
+                    }
                     c.execute_batch(&format!("PRAGMA user_version = {}", schema.version))?;
                     Ok(())
                 })();
@@ -1379,7 +1407,7 @@ fn check_destructive_gap(steps: &[&crate::migration::Migration], synthesized: &S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roomrs_migrate::{ColumnSnapshot, SchemaSnapshot, TableSnapshot};
+    use roomrs_migrate::{ColumnSnapshot, DatabaseTriggerSnapshot, SchemaSnapshot, TableSnapshot};
 
     /// 인메모리 DB는 builder 호출 순서와 무관하게 일반 커넥션 하나만 만든다.
     #[test]
@@ -1434,6 +1462,7 @@ mod tests {
                 version: 1,
                 ddl: vec!["CREATE TABLE parents(id INTEGER PRIMARY KEY)", "CREATE TABLE children(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parents(id))"],
                 tables: Vec::new(),
+                triggers: vec![],
             }
         }
 
@@ -1455,6 +1484,7 @@ mod tests {
             version: 2,
             ddl: vec!["CREATE TABLE replacements(id INTEGER PRIMARY KEY)"],
             tables: Vec::new(),
+            triggers: vec![],
         };
         DatabaseBuilder::<DestructiveFkDb>::default().run_destructive(&db.run_sync(), &target).unwrap();
 
@@ -1468,7 +1498,12 @@ mod tests {
             })
             .unwrap();
 
-        let invalid_target = SchemaDef { version: 3, ddl: vec!["CREATE TABLE invalid("], tables: Vec::new() };
+        let invalid_target = SchemaDef {
+            version: 3,
+            ddl: vec!["CREATE TABLE invalid("],
+            tables: Vec::new(),
+            triggers: vec![],
+        };
         assert!(DatabaseBuilder::<DestructiveFkDb>::default().run_destructive(&db.run_sync(), &invalid_target).is_err());
         db.inner
             .pool
@@ -1494,7 +1529,6 @@ mod tests {
                     name: "items",
                     columns: &[],
                     ddl: &[],
-                    triggers: &[],
                     strict: false,
                     without_rowid: false,
                 },
@@ -1502,13 +1536,39 @@ mod tests {
                     name: "ITEMS",
                     columns: &[],
                     ddl: &[],
-                    triggers: &[],
                     strict: false,
                     without_rowid: false,
                 },
             ],
+            triggers: vec![],
         };
-        assert!(matches!(schema.validate_unique_tables(), Err(Error::Config(_))));
+        assert!(matches!(schema.validate_unique_objects(), Err(Error::Config(_))));
+    }
+
+    /// 수동 DatabaseSpec도 TEMP 또는 이름 불일치 trigger 메타를 거부한다.
+    #[test]
+    fn invalid_database_trigger_metadata_is_rejected() {
+        let schema = SchemaDef {
+            version: 1,
+            ddl: Vec::new(),
+            tables: Vec::new(),
+            triggers: vec![DatabaseTriggerMeta {
+                name: "trg_items",
+                sql: "CREATE TEMP TRIGGER trg_items AFTER INSERT ON items BEGIN SELECT 1; END",
+                file: None,
+            }],
+        };
+        assert!(matches!(schema.validate_unique_objects(), Err(Error::Config(_))));
+
+        let schema = SchemaDef {
+            triggers: vec![DatabaseTriggerMeta {
+                name: "trg_items",
+                sql: "CREATE TRIGGER another AFTER INSERT ON items BEGIN SELECT 1; END",
+                file: None,
+            }],
+            ..schema
+        };
+        assert!(matches!(schema.validate_unique_objects(), Err(Error::Config(_))));
     }
 
     /// 단일 테이블 스냅샷 생성 헬퍼
@@ -1531,10 +1591,10 @@ mod tests {
                     })
                     .collect(),
                 ddl: vec![],
-                triggers: vec![],
                 strict: false,
                 without_rowid: false,
             }],
+            triggers: vec![],
         }
     }
 
@@ -1555,6 +1615,26 @@ mod tests {
         assert!(s.refused.is_empty());
         let spans: Vec<(u32, u32)> = s.steps.iter().map(|m| (m.from_version(), m.to_version())).collect();
         assert_eq!(spans, vec![(1, 3), (3, 4)], "인접 가용 쌍으로 합성");
+    }
+
+    /// DB-level trigger 변경은 안전한 자동 migration 스텝으로 합성된다.
+    #[test]
+    fn synthesize_database_trigger_change() {
+        let mut v1 = snap(1, vec![("id", "INTEGER", true)]);
+        v1.triggers.push(DatabaseTriggerSnapshot {
+            name: "trg_t".into(),
+            sql: "CREATE TRIGGER trg_t AFTER INSERT ON t BEGIN SELECT 1; END".into(),
+            file: None,
+        });
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.triggers[0].sql = "CREATE TRIGGER trg_t AFTER INSERT ON t BEGIN SELECT 2; END".into();
+
+        let synthesized = synthesize_embedded_steps(&[embed(&v1), embed(&v2)], &[], 1).unwrap();
+        assert!(synthesized.refused.is_empty(), "{:?}", synthesized.refused);
+        assert_eq!(synthesized.steps.len(), 1);
+        assert_eq!(synthesized.steps[0].from_version(), 1);
+        assert_eq!(synthesized.steps[0].to_version(), 2);
     }
 
     /// 등록 스텝이 있는 from 구간은 합성하지 않는다 (등록 스텝 우선)

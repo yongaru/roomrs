@@ -7,12 +7,12 @@
 //!   - `DbSync<'a>` — SyncHandle Deref + DAO 접근자
 //!   - `DbTxDaos` — Tx용 DAO 접근자 확장 trait
 
-use crate::util::to_snake_case;
+use crate::util::{to_snake_case, validate_sql_identifier};
 use proc_macro2::TokenStream;
 use quote::{ToTokens, format_ident, quote};
 use syn::parse::Parser;
 use syn::spanned::Spanned;
-use syn::{Fields, ItemStruct, Path};
+use syn::{Fields, ItemStruct, LitStr, Path};
 
 /// version 모드 — 수동 N 또는 auto (결정 48)
 enum VersionMode {
@@ -25,13 +25,23 @@ struct DatabaseArgs {
     entities: Vec<Path>,
     daos: Vec<Path>,
     version: VersionMode,
+    triggers: Vec<DatabaseTrigger>,
 }
 
-/// 인자 파싱 — entities(...), daos(...), version = N|auto
+/// DB-level trigger 선언.
+struct DatabaseTrigger {
+    name: LitStr,
+    sql: LitStr,
+    file: Option<LitStr>,
+    dependency_path: Option<LitStr>,
+}
+
+/// 인자 파싱 — entities(...), daos(...), version = N|auto, trigger(...)
 fn parse_args(args: TokenStream, span: proc_macro2::Span) -> syn::Result<DatabaseArgs> {
     let mut entities = Vec::new();
     let mut daos = Vec::new();
     let mut version: Option<VersionMode> = None;
+    let mut triggers = Vec::new();
 
     let parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("entities") {
@@ -64,8 +74,39 @@ fn parse_args(args: TokenStream, span: proc_macro2::Span) -> syn::Result<Databas
                 return Err(meta.error("version 은 정수 N 또는 auto 만 지원"));
             }
             Ok(())
+        } else if meta.path.is_ident("trigger") {
+            let mut name: Option<LitStr> = None;
+            let mut sql: Option<LitStr> = None;
+            let mut file: Option<LitStr> = None;
+            meta.parse_nested_meta(|inner| {
+                if inner.path.is_ident("name") {
+                    name = Some(inner.value()?.parse()?);
+                } else if inner.path.is_ident("sql") {
+                    sql = Some(inner.value()?.parse()?);
+                } else if inner.path.is_ident("file") {
+                    file = Some(inner.value()?.parse()?);
+                } else {
+                    return Err(inner.error("알 수 없는 trigger 인자 — name/sql/file 만 지원"));
+                }
+                Ok(())
+            })?;
+            let name = name.ok_or_else(|| meta.error("trigger에 name = \"...\" 이 필요합니다"))?;
+            validate_sql_identifier(&name.value(), name.span())?;
+            let (sql, file, dependency_path) = match (sql, file) {
+                (Some(sql), None) => (sql, None, None),
+                (None, Some(file)) => {
+                    let (sql, path) = load_trigger_file(&file)?;
+                    let dependency_path = LitStr::new(&path.to_string_lossy().replace('\\', "/"), file.span());
+                    (LitStr::new(&sql, file.span()), Some(file), Some(dependency_path))
+                }
+                (Some(_), Some(_)) => return Err(meta.error("trigger에는 sql 또는 file 중 하나만 지정해야 합니다")),
+                (None, None) => return Err(meta.error("trigger에는 sql = \"...\" 또는 file = \"...\" 이 필요합니다")),
+            };
+            validate_trigger(&name, &sql)?;
+            triggers.push(DatabaseTrigger { name, sql, file, dependency_path });
+            Ok(())
         } else {
-            Err(meta.error("알 수 없는 database 인자 — entities/daos/version 만 지원"))
+            Err(meta.error("알 수 없는 database 인자 — entities/daos/version/trigger 만 지원"))
         }
     });
     parser.parse2(args)?;
@@ -79,10 +120,35 @@ fn parse_args(args: TokenStream, span: proc_macro2::Span) -> syn::Result<Databas
             return Err(syn::Error::new(entity.span(), "entities(...)에 같은 엔티티를 중복 지정할 수 없습니다"));
         }
     }
+    for (index, trigger) in triggers.iter().enumerate() {
+        if triggers[..index].iter().any(|previous| previous.name.value().eq_ignore_ascii_case(&trigger.name.value())) {
+            return Err(syn::Error::new(trigger.name.span(), format!("database trigger 이름 중복: {}", trigger.name.value())));
+        }
+    }
     let Some(version) = version else {
         return Err(syn::Error::new(span, "version = N 또는 version = auto 가 필요합니다"));
     };
-    Ok(DatabaseArgs { entities, daos, version })
+    Ok(DatabaseArgs { entities, daos, version, triggers })
+}
+
+/// manifest 기준 trigger SQL 파일을 읽는다.
+fn load_trigger_file(file: &LitStr) -> syn::Result<(String, std::path::PathBuf)> {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| syn::Error::new(file.span(), "CARGO_MANIFEST_DIR 없음 — trigger file은 cargo 빌드에서만 사용할 수 있습니다"))?;
+    let path = std::path::Path::new(&manifest).join(file.value());
+    let sql = std::fs::read_to_string(&path).map_err(|error| syn::Error::new(file.span(), format!("trigger SQL 파일 읽기 실패: {} — {error}", path.display())))?;
+    Ok((sql, path))
+}
+
+/// trigger SQL 개수와 선언 이름을 검증한다.
+fn validate_trigger(name: &LitStr, sql: &LitStr) -> syn::Result<()> {
+    if roomrs_migrate::count_create_trigger_statements(&sql.value()) != 1 {
+        return Err(syn::Error::new(sql.span(), "trigger sql/file은 non-TEMP CREATE TRIGGER 문을 정확히 하나 포함해야 합니다"));
+    }
+    let actual = roomrs_migrate::parse_create_trigger_name(&sql.value()).ok_or_else(|| syn::Error::new(sql.span(), "trigger SQL은 CREATE TRIGGER 문으로 시작해야 합니다"))?;
+    if !actual.eq_ignore_ascii_case(&name.value()) {
+        return Err(syn::Error::new(name.span(), format!("trigger name과 SQL 이름이 다릅니다: 선언={}, SQL={actual}", name.value())));
+    }
+    Ok(())
 }
 
 /// 스냅샷 스캔 결과 — 현재 버전 해시 · 압축 임베드 · 파일 의존성 토큰
@@ -213,6 +279,19 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
     let embedded_entries = snap_meta.embedded_entries;
     let dep_consts = snap_meta.dep_consts;
     let file_seen = snap_meta.file_seen;
+    let trigger_meta = args.triggers.iter().map(|trigger| {
+        let name = &trigger.name;
+        let sql = &trigger.sql;
+        let file = trigger.file.as_ref().map_or_else(|| quote! { None }, |file| quote! { Some(#file) });
+        quote! {
+            ::roomrs::DatabaseTriggerMeta {
+                name: #name,
+                sql: #sql,
+                file: #file,
+            }
+        }
+    });
+    let trigger_dep_consts = args.triggers.iter().filter_map(|trigger| trigger.dependency_path.as_ref().map(|path| quote! { const _: &str = ::core::include_str!(#path); }));
 
     // DAO 접근자 — TodoDao → fn todo_dao()
     let mut sync_accessors: Vec<TokenStream> = Vec::new();
@@ -269,6 +348,7 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         // 스냅샷 파일 의존성 등록 (리뷰 C-1) — 파일 갱신 = 매크로 재전개 보장.
         // 사장 상수는 링커가 제거한다 (명세 §8.4)
         #(#dep_consts)*
+        #(#trigger_dep_consts)*
 
         impl ::roomrs::DatabaseSpec for #db_ident {
             const VERSION: u32 = #version;
@@ -288,12 +368,16 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                         name: <#entities as ::roomrs::Entity>::TABLE,
                         columns: <#entities as ::roomrs::Entity>::COLUMNS_META,
                         ddl: <#entities as ::roomrs::Entity>::DDL,
-                        triggers: <#entities as ::roomrs::Entity>::TRIGGERS,
                         strict: <#entities as ::roomrs::Entity>::STRICT,
                         without_rowid: <#entities as ::roomrs::Entity>::WITHOUT_ROWID,
                     },)*
                 ];
-                ::roomrs::SchemaDef { version: #version, ddl, tables }
+                ::roomrs::SchemaDef {
+                    version: #version,
+                    ddl,
+                    tables,
+                    triggers: vec![#(#trigger_meta,)*],
+                }
             }
 
             /// core Database 래핑
@@ -474,4 +558,31 @@ pub fn expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DB trigger inline SQL과 file 입력을 같은 모델로 파싱한다.
+    #[test]
+    fn parses_inline_and_file_triggers() {
+        let args = quote! {
+            entities(Item),
+            version = 1,
+            trigger(
+                name = "inline_trigger",
+                sql = "CREATE TRIGGER inline_trigger AFTER INSERT ON items BEGIN SELECT 1; END"
+            ),
+            trigger(
+                name = "sample",
+                file = "fixtures/sample_trigger.sql"
+            )
+        };
+        let parsed = parse_args(args, proc_macro2::Span::call_site()).expect("database trigger 파스");
+        assert_eq!(parsed.triggers.len(), 2);
+        assert!(parsed.triggers[0].file.is_none());
+        assert_eq!(parsed.triggers[1].file.as_ref().map(LitStr::value).as_deref(), Some("fixtures/sample_trigger.sql"));
+        assert!(parsed.triggers[1].sql.value().contains("CREATE TRIGGER sample"));
+    }
 }

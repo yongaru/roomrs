@@ -49,7 +49,7 @@ PostgreSQL·MySQL 같은 서버 DB, Active Record, 다중 DB 추상화가 필요
 ```sh
 cargo new roomrs-example
 cd roomrs-example
-cargo add roomrs@0.3.0
+cargo add roomrs@0.4.0
 cargo install roomrs-cli
 ```
 
@@ -156,7 +156,7 @@ trait TodoViewDao {
 
 | 기능 | 설명 |
 |---|---|
-| 엔티티 DSL | 단일·복합 PK, DEFAULT, UNIQUE, CHECK, FK, 정렬·부분 index, generated column, custom SQL type, trigger file |
+| 스키마 DSL | 단일·복합 PK, DEFAULT, UNIQUE, CHECK, FK, 정렬·부분 index, generated column, custom SQL type, DB-level inline/file trigger |
 | DAO | `#[query]`, `#[insert]`, `#[update]`, `#[delete]`, `#[transaction]` |
 | SELECT 결과 구조체 | `FromRow`를 구현한 일반 구조체로 JOIN·집계·projection 결과 매핑 |
 | SQL 검증 | 스키마 스냅샷 기반 테이블·컬럼 검사와 `:name` 파라미터 대조 |
@@ -186,7 +186,7 @@ Android Room 사용자라면 [Room과 roomrs 대응표](docs/USAGE.md#android-ro
 기본 구성:
 
 ```toml
-roomrs = "0.3.0"
+roomrs = "0.4.0"
 ```
 
 기본 feature는 `sqlite-bundled`, `async`, `tokio`, `live`, `time`, `uuid`, `json`입니다.
@@ -195,7 +195,7 @@ roomrs = "0.3.0"
 
 ```toml
 roomrs = {
-    version = "0.3.0",
+    version = "0.4.0",
     default-features = false,
     features = ["sqlite-bundled"]
 }
@@ -205,7 +205,7 @@ SQLCipher:
 
 ```toml
 roomrs = {
-    version = "0.3.0",
+    version = "0.4.0",
     default-features = false,
     features = ["sqlcipher-bundled", "async", "tokio", "live", "time", "uuid", "json"]
 }

@@ -8,14 +8,14 @@
 
 use roomrs::{database, entity, run_registered_schema_export};
 
-#[entity(table = "notes", trigger = "migrations/triggers/note_audit.sql")]
+#[entity(table = "notes")]
 struct Note {
     #[pk(autoincrement)]
     id: i64,
     body: String,
 }
 
-#[database(entities(Note), version = 1)]
+#[database(entities(Note), version = 1, trigger(name = "note_audit", file = "migrations/triggers/note_audit.sql"))]
 struct AppDb;
 
 fn main() {

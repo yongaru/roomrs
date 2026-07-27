@@ -1,0 +1,5 @@
+error: trigger sql/file은 non-TEMP CREATE TRIGGER 문을 정확히 하나 포함해야 합니다
+  --> tests/ui/fail/database_trigger_multiple_statements.rs:14:15
+   |
+14 | ... = "CREATE TRIGGER item_trigger AFTER INSERT ON item BEGIN SELECT 1; END; CREATE TRIGGER another AFTER INSERT ON item BEGIN SELECT 2; END"
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,9 @@
+error: trigger에는 sql 또는 file 중 하나만 지정해야 합니다
+  --> tests/ui/fail/database_trigger_both_sources.rs:12:5
+   |
+12 | /     trigger(
+13 | |         name = "trg_item",
+14 | |         sql = "CREATE TRIGGER trg_item AFTER INSERT ON item BEGIN SELECT 1; END",
+15 | |         file = "migrations/triggers/t_payment_audit.sql"
+16 | |     )
+   | |_____^

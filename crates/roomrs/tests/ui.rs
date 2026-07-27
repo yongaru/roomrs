@@ -68,10 +68,10 @@ fn snap_of<E: Entity>(version: u32) -> roomrs::SchemaSnapshot {
             name: E::TABLE,
             columns: E::COLUMNS_META,
             ddl: E::DDL,
-            triggers: E::TRIGGERS,
             strict: E::STRICT,
             without_rowid: E::WITHOUT_ROWID,
         }],
+        triggers: vec![],
     }
     .to_snapshot()
 }
@@ -128,10 +128,19 @@ fn ui() {
     t.compile_fail("tests/ui/fail/entity_default_nan.rs");
     // [결정 54] advanced schema DSL
     t.pass("tests/ui/pass/entity_advanced_dsl.rs");
+    // [결정 46] DB-level inline/file trigger
+    t.pass("tests/ui/pass/database_triggers.rs");
+    t.compile_fail("tests/ui/fail/database_trigger_both_sources.rs");
+    t.compile_fail("tests/ui/fail/database_trigger_duplicate.rs");
+    t.compile_fail("tests/ui/fail/database_trigger_missing_source.rs");
+    t.compile_fail("tests/ui/fail/database_trigger_multiple_statements.rs");
+    t.compile_fail("tests/ui/fail/database_trigger_name_mismatch.rs");
+    t.compile_fail("tests/ui/fail/database_trigger_temp.rs");
     t.compile_fail("tests/ui/fail/entity_generated_with_default.rs");
     t.compile_fail("tests/ui/fail/entity_generated_pk.rs");
     t.compile_fail("tests/ui/fail/entity_bad_collate.rs");
     t.compile_fail("tests/ui/fail/entity_without_rowid_no_pk.rs");
+    t.compile_fail("tests/ui/fail/entity_trigger_removed.rs");
     // [M-17] SQL 속성 2개 = 침묵 승자 대신 에러
     t.compile_fail("tests/ui/fail/dao_two_sql_attrs.rs");
     // [§12c] #[insert] 시그니처 위반

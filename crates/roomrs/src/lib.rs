@@ -9,9 +9,9 @@
 // 코어 표면
 pub use roomrs_core::{Col, Execute, Expr, IntoDbValue, Order, Query, SelectBuilder, col};
 pub use roomrs_core::{
-    ColumnMeta, ColumnSnapshot, Database, DatabaseBuilder, DatabaseSpec, DiffPlan, EmbeddedSchema, Entity, Error, ErrorAdvice, ErrorPath, FromRow, GeneratedColumnMeta, GeneratedColumnSnapshot, Insertable, Migration, MigrationPolicy, MigrationStep, Params, PlannedExportAction, PlannedSnapshotWrite, Result, SCHEMA_DIR_RELATIVE, SchemaDef, SchemaExportEntry, SchemaSnapshot, SqlContext, SyncHandle,
-    TableMeta, TableSnapshot, ToSql, ToSqlOutput, TriggerMeta, TriggerSnapshot, Tx, check_export_entry, check_schema_snapshot, compress_snapshot, decompress_snapshot, diff_plan, diff_sql, export_schema_snapshot, list_snapshot_versions, outputs_to_values, params, params_from_iter, plan_export_auto, plan_export_for_entry, plan_export_snapshot, resolve_schema_dir, run_registered_schema_check,
-    run_registered_schema_export, rusqlite, snapshot_file_name, snapshot_path, to_owned_value, write_schema_snapshot,
+    ColumnMeta, ColumnSnapshot, Database, DatabaseBuilder, DatabaseSpec, DatabaseTriggerMeta, DatabaseTriggerSnapshot, DiffPlan, EmbeddedSchema, Entity, Error, ErrorAdvice, ErrorPath, FromRow, GeneratedColumnMeta, GeneratedColumnSnapshot, Insertable, Migration, MigrationPolicy, MigrationStep, Params, PlannedExportAction, PlannedSnapshotWrite, Result, SCHEMA_DIR_RELATIVE, SchemaDef,
+    SchemaExportEntry, SchemaSnapshot, SqlContext, SyncHandle, TableMeta, TableSnapshot, ToSql, ToSqlOutput, Tx, check_export_entry, check_schema_snapshot, compress_snapshot, decompress_snapshot, diff_plan, diff_sql, export_schema_snapshot, list_snapshot_versions, outputs_to_values, params, params_from_iter, plan_export_auto, plan_export_for_entry, plan_export_snapshot, resolve_schema_dir,
+    run_registered_schema_check, run_registered_schema_export, rusqlite, snapshot_file_name, snapshot_path, to_owned_value, write_schema_snapshot,
 };
 pub use roomrs_core::{RelationView, in_placeholders, load_children, load_junction};
 
